@@ -1,0 +1,20 @@
+apiVersion: armada.ai/v1
+kind: ConfigBundle
+metadata:
+  name: colo-galleon
+  namespace: configbundle-system
+spec:
+  datacenter: colo
+  servers:
+    - serviceTag: 3RK3V64
+      hostname: colo-r740-01
+      oobIP: 10.10.1.45
+      idrac:
+        firmwareVersion: "7.20.10.05"
+        sshEnabled: false
+        ipmiEnabled: false
+        lockdownModeEnabled: false
+        osToIdracPassThroughEnabled: false
+        usbManagementPortEnabled: true
+        dhcpEnabled: false
+        racadmEnabled: true

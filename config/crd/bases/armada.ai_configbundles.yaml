@@ -1,0 +1,209 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: configbundles.armada.ai
+spec:
+  group: armada.ai
+  names:
+    kind: ConfigBundle
+    listKind: ConfigBundleList
+    plural: configbundles
+    shortNames:
+    - cb
+    singular: configbundle
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.datacenter
+      name: Datacenter
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ConfigBundle is the top-level CR for a datacenter's intended configuration.
+          The ConfigBundle controller decomposes its spec into domain child CRs (ServerConfig, etc.)
+          using Server-Side Apply with field manager "configbundle-controller".
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ConfigBundleSpec holds the full intended configuration for a datacenter.
+              The ConfigBundle controller decomposes this into domain child CRs via SSA.
+            properties:
+              datacenter:
+                description: Datacenter is the identifier of the target datacenter
+                  (matches Orbital namespace name).
+                type: string
+              servers:
+                description: Servers is the list of server configurations for this
+                  datacenter.
+                items:
+                  description: ServerSpec describes one server's desired configuration
+                    within a ConfigBundle.
+                  properties:
+                    hostname:
+                      description: Hostname is the server's hostname. Mandatory —
+                        the bundler skips servers without one.
+                      type: string
+                    idrac:
+                      description: Idrac holds desired iDRAC configuration.
+                      properties:
+                        dhcpEnabled:
+                          type: boolean
+                        firmwareVersion:
+                          description: |-
+                            FirmwareVersion is the desired iDRAC firmware version (e.g. "7.20.10.05").
+                            Controller reads current version via Redfish GET and upgrades/downgrades to match.
+                          type: string
+                        ipmiEnabled:
+                          type: boolean
+                        lockdownModeEnabled:
+                          type: boolean
+                        osToIdracPassThroughEnabled:
+                          type: boolean
+                        racadmEnabled:
+                          type: boolean
+                        sshEnabled:
+                          type: boolean
+                        usbManagementPortEnabled:
+                          type: boolean
+                      required:
+                      - dhcpEnabled
+                      - ipmiEnabled
+                      - lockdownModeEnabled
+                      - osToIdracPassThroughEnabled
+                      - sshEnabled
+                      - usbManagementPortEnabled
+                      type: object
+                    oobIP:
+                      description: |-
+                        OobIP is the out-of-band management (iDRAC) IP address.
+                        The ServerConfig controller sends Redfish calls here. Mandatory for actuation.
+                      type: string
+                    serviceTag:
+                      description: |-
+                        ServiceTag is the Dell hardware service tag (e.g. "3RK3V64").
+                        Used as the identity key. The child ServerConfig CR is named strings.ToLower(ServiceTag).
+                      type: string
+                  required:
+                  - hostname
+                  - oobIP
+                  - serviceTag
+                  type: object
+                type: array
+            required:
+            - datacenter
+            type: object
+          status:
+            description: ConfigBundleStatus records the controller's observed state.
+            properties:
+              conditions:
+                description: Conditions records detailed status conditions using the
+                  standard K8s convention.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastAppliedAt:
+                description: LastAppliedAt is the time the last successful apply completed.
+                format: date-time
+                type: string
+              lastAppliedDigest:
+                description: |-
+                  LastAppliedDigest is the OCI artifact digest last successfully applied.
+                  The controller skips re-processing when the current artifact digest matches this value.
+                type: string
+              phase:
+                description: Phase is the current lifecycle phase.
+                enum:
+                - Pending
+                - Applying
+                - Applied
+                - Failed
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

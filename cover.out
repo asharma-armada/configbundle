@@ -1,0 +1,12 @@
+mode: set
+github.com/armada/configbundle/internal/controller/configbundle_controller.go:43.104,47.60 3 1
+github.com/armada/configbundle/internal/controller/configbundle_controller.go:47.60,49.3 1 0
+github.com/armada/configbundle/internal/controller/configbundle_controller.go:51.2,53.41 2 1
+github.com/armada/configbundle/internal/controller/configbundle_controller.go:53.41,54.63 1 1
+github.com/armada/configbundle/internal/controller/configbundle_controller.go:54.63,57.4 2 0
+github.com/armada/configbundle/internal/controller/configbundle_controller.go:58.3,58.79 1 1
+github.com/armada/configbundle/internal/controller/configbundle_controller.go:61.2,61.27 1 1
+github.com/armada/configbundle/internal/controller/configbundle_controller.go:66.134,84.70 2 1
+github.com/armada/configbundle/internal/controller/configbundle_controller.go:84.70,86.3 1 0
+github.com/armada/configbundle/internal/controller/configbundle_controller.go:88.2,91.3 1 1
+github.com/armada/configbundle/internal/controller/configbundle_controller.go:96.75,102.2 1 1

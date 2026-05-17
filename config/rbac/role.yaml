@@ -1,0 +1,33 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - armada.ai
+  resources:
+  - configbundles
+  - serverconfigs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - armada.ai
+  resources:
+  - configbundles/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - armada.ai
+  resources:
+  - configbundles/status
+  verbs:
+  - get
+  - patch
+  - update

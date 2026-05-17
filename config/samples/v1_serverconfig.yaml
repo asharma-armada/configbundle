@@ -1,0 +1,9 @@
+apiVersion: armada.ai/v1
+kind: ServerConfig
+metadata:
+  labels:
+    app.kubernetes.io/name: configbundle
+    app.kubernetes.io/managed-by: kustomize
+  name: serverconfig-sample
+spec:
+  # TODO(user): Add fields here

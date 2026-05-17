@@ -1,0 +1,26 @@
+# Personal Claude overrides — each developer maintains their own, never committed
+CLAUDE.local.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Dependencies (add language-specific entries after setup)
+node_modules/
+vendor/
+
+# Build output (add language-specific entries after setup)
+dist/
+build/
+bin/
