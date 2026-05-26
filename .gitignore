@@ -20,7 +20,18 @@ Thumbs.db
 node_modules/
 vendor/
 
-# Build output (add language-specific entries after setup)
+# Build output
 dist/
 build/
 bin/
+
+# Go test / coverage artifacts
+cover.out
+coverage.out
+*.test
+
+# Large binary assets — design docs live in Confluence/SharePoint, not the repo
+*.pdf
+*.docx
+*.xlsx
+*.pptx
