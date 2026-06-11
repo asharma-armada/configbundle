@@ -123,7 +123,7 @@ Register `POST /consume` in your HTTP router/mux. No auth required for local net
 ### Step 3 — Add env var for the consume endpoint
 
 ```
-CB_CONTROLLER_PORT=8030  (or whatever port)
+CB_CONTROLLER_PORT=8095  (configurable; 8095 default avoids conflict with dgraph-alpha on :8080)
 ```
 
 ### Step 4 — Remove OCI pull logic
@@ -173,23 +173,36 @@ Remove from config, manifests, and secrets:
 ## What Does NOT Change
 
 - ConfigBundle CR structure and schema — unchanged
-- Reconciliation / apply logic — unchanged (just called from `Consume` handler instead of after a pull)
-- The bundler (`POST /enrich`) — completely unchanged, still produces the same layer bytes
+- Reconciliation / apply logic — unchanged. The `Consume` handler is a new *trigger* for the existing apply pipeline, not a replacement. All managedFields inspection, `omitAdminOwnedServers` logic, and SSA conflict avoidance runs exactly as before — just initiated by a POST to `/consume` instead of a Zot poll. Anyone implementing the handler cold must understand: receiving the layer bytes is only the first step; the existing apply pipeline with its admin-override handling is mandatory before touching any CR.
+- The bundler (`POST /bundle`) — completely unchanged, still produces the same layer bytes
 - Existing cluster RBAC for applying CRs — unchanged
 
 ---
 
-## Orb Side (for reference — already implemented in orbital repo)
+## Orb Side (to be implemented in orbital repo — not yet live)
 
-`POST /import/artifact` — full pipeline endpoint. Accepts a zip of the full OCI artifact. Decomposes layers, dispatches to `ORB_CONSUMERS`, imports graph layers to DGraph.
+`POST /import/artifact` — full pipeline endpoint. To be built in orb. Accepts a zip of the full OCI artifact. Pipeline:
+1. **Cosign verify** — orb holds `ORB_OCI_PUBLIC_KEY_PATH` and verifies the artifact signature before any decomposition. Verification failure = reject, 400.
+2. **Decompose** — split layers by media type.
+3. **DGraph import** — always. `data.json.gz` + `schema.gz` → `drop_all` + `dgraph live`.
+4. **Dispatch** — POST each non-graph layer to its registered consumer URL (`ORB_CONSUMERS`). Best-effort.
+5. **Record** — write import history entry with per-consumer dispatch result (HTTP status + error if any).
 
 Dispatch request headers orb sends:
 - `Content-Type` = layer media type
-- `X-Orb-Tag` = OCI tag imported
+- `X-Orb-Tag` = OCI tag imported (empty for courier uploads)
 - `X-Orb-Digest` = artifact manifest digest
 - `X-Orb-Import-ID` = orb import UUID
 
 Dispatch is best-effort — DGraph import completes regardless of CB Controller response.
+
+**What triggers `POST /import/artifact`:**
+- **OCI source enabled** (`ORB_ENABLE_OCI_REGISTRY=true`): orb's poller discovers a new tag, pulls the artifact, feeds it through this pipeline internally. Same trigger as today.
+- **OCI source disabled**: an external caller (admin, courier, deploy script) POSTs directly to `/import/artifact`. No automatic trigger — imports are on-demand.
+
+**What orb records in import history:**
+- Dispatch HTTP status per consumer (200 = accepted, 5xx = failed)
+- Orb does NOT track whether the downstream apply succeeded — that is CB Controller's observability concern (CR conditions, controller logs). Import history is a dispatch receipt, not an end-to-end apply confirmation.
 
 ---
 

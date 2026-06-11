@@ -1,5 +1,11 @@
-# Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+# Registry and versioning
+ACR     := armadaeksatest.azurecr.io
+VERSION := $(shell git describe --tags --dirty 2>/dev/null || echo "v0.0.0-dev")
+
+# Image URLs
+IMG         ?= $(ACR)/configbundle-controller:$(VERSION)
+BUNDLER_IMG ?= $(ACR)/configbundle-bundler:$(VERSION)
+
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -121,16 +127,20 @@ build: manifests generate fmt vet ## Build manager binary.
 run: ## Run a controller from your host.
 	go run ./cmd/main.go
 
+.PHONY: run-bundler
+run-bundler: ## Run the bundler enricher service locally (defaults: BUNDLER_PORT=8020, ORBITAL_GRAPHQL_URL=http://localhost:8001/graphql).
+	go run ./cmd/bundler/main.go
+
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
-docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+docker-build: ## Build controller image (requires: az acr login --name armadaeksatest).
+	docker buildx build --platform linux/amd64 --target controller -t $(IMG) --push .
 
-.PHONY: docker-push
-docker-push: ## Push docker image with the manager.
-	$(CONTAINER_TOOL) push ${IMG}
+.PHONY: docker-build-bundler
+docker-build-bundler: ## Build and push bundler image (requires: az acr login --name armadaeksatest).
+	docker buildx build --platform linux/amd64 --target bundler -t $(BUNDLER_IMG) --push .
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:

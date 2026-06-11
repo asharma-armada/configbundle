@@ -65,6 +65,23 @@ type ServerSpec struct {
 	Idrac IdracSpec `json:"idrac,omitempty"`
 }
 
+// TakeoverEntry represents a cloud admin's "force" resolution: reclaim ownership
+// of a specific field from local:admin. The consume handler processes these by
+// running a per-field SSA apply with ForceOwnership after the normal apply pass.
+type TakeoverEntry struct {
+	// OrbID is the Orbital ConfigItem identifier (e.g. "colo:srv-001-idrac").
+	// Informational — the controller does not use this for apply logic.
+	OrbID string `json:"orbId"`
+
+	// ServiceTag identifies which server entry the field belongs to.
+	// The bundler resolves this from the orbId→server mapping.
+	ServiceTag string `json:"serviceTag"`
+
+	// Field is the leaf field name to reclaim (e.g. "sshEnabled").
+	// Must match the JSON tag name on IdracSpec (or ServerSpec for top-level fields).
+	Field string `json:"field"`
+}
+
 // ConfigBundleSpec holds the full intended configuration for a datacenter.
 // The ConfigBundle controller decomposes this into domain child CRs via SSA.
 type ConfigBundleSpec struct {
@@ -77,6 +94,13 @@ type ConfigBundleSpec struct {
 	// +listType=map
 	// +listMapKey=serviceTag
 	Servers []ServerSpec `json:"servers,omitempty"`
+
+	// Takeover contains force-resolution directives from the cloud admin.
+	// Each entry triggers a ForceOwnership SSA apply to reclaim the field from local:admin.
+	// Entries persist until the next bundle replaces the spec (cb-bundler omits consumed entries).
+	// +optional
+	// +listType=atomic
+	Takeover []TakeoverEntry `json:"takeover,omitempty"`
 }
 
 // ConfigBundlePhase represents the current lifecycle phase.
@@ -92,12 +116,6 @@ const (
 
 // Condition type constants for ConfigBundleStatus.Conditions.
 const (
-	// ConditionArtifactFetched is set when the OCI artifact has been pulled from Zot.
-	ConditionArtifactFetched = "ArtifactFetched"
-	// ConditionSignatureVerified is set when the cosign signature has been verified.
-	ConditionSignatureVerified = "SignatureVerified"
-	// ConditionGraphImported is set when orb's POST /api/v1/import/subgraph returned 2xx.
-	ConditionGraphImported = "GraphImported"
 	// ConditionReconciled is set by the Decomposition Reconciler when all child CRs are in sync.
 	ConditionReconciled = "Reconciled"
 )
@@ -114,10 +132,15 @@ type ConfigBundleStatus struct {
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// LastAppliedDigest is the OCI artifact digest last successfully applied.
-	// The controller skips re-processing when the current artifact digest matches this value.
+	// LastAppliedDigest is the artifact manifest digest (X-Orb-Digest) from the most
+	// recent successful consume dispatch.
 	// +optional
 	LastAppliedDigest string `json:"lastAppliedDigest,omitempty"`
+
+	// LastOrbImportID is the orb import UUID (X-Orb-Import-ID) from the most recent
+	// successful consume dispatch. Used for correlation with orb's import history.
+	// +optional
+	LastOrbImportID string `json:"lastOrbImportID,omitempty"`
 
 	// LastAppliedAt is the time the last successful apply completed.
 	// +optional

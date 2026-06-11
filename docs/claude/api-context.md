@@ -1,18 +1,54 @@
 # API Reference
 
-> **When to load this file:** Read this before working on the bundler HTTP service, the `POST /enrich` endpoint, or any Orbital GraphQL integration.
+> **When to load this file:** Read this before working on the bundler HTTP service, the `POST /bundle` endpoint, or any Orbital GraphQL integration.
+
+
 
 ---
 
 ## Overview
 
-The configbundle bundler exposes a single HTTP endpoint (`POST /enrich`) that Orbital calls synchronously during its publish pipeline. The bundler queries Orbital's GraphQL API, builds a ConfigBundle manifest, and returns the encoded layer bytes. The bundler is stateless — it holds no OCI credentials and never pushes to ACR.
+The configbundle bundler exposes a single HTTP endpoint (`POST /bundle`) that Orbital calls synchronously during its publish pipeline. The bundler queries Orbital's GraphQL API, builds a ConfigBundle manifest, and returns the encoded layer bytes. The bundler is stateless — it holds no OCI credentials and never pushes to ACR.
+
+---
+
+## Bundler flow
+
+```mermaid
+sequenceDiagram
+    actor Admin
+    participant O as Orbital
+    participant DG as DGraph (Orbital)
+    participant CBB as CB Bundler
+    participant ACR
+
+    Admin->>O: POST /api/v1/export/jobs/:jobId/publish<br/>{"enrichers": ["http://cb-bundler/bundle"]}
+    O-->>Admin: 202 {artifactId, tag}
+
+    Note over O,CBB: synchronous — all enrichers must succeed before push
+
+    O->>CBB: POST /bundle<br/>{"datacenter": "colo-galleon"}
+    CBB->>DG: GraphQL queryDataCenter(name: "colo-galleon")<br/>servers { hostname serviceTag oobIP { address } idracSettings { ... } }
+    DG-->>CBB: datacenter + servers data
+    CBB->>CBB: map to ConfigBundleSpec<br/>skip servers without hostname<br/>marshal to YAML
+    CBB-->>O: [{mediaType: vnd.armada.configbundle.manifest.v1+yaml, data: <base64>}]
+
+    Note over O,ACR: all enrichers succeeded — assemble + sign + push
+
+    O->>O: assemble layers:<br/>  data.json.gz (graph data)<br/>  schema.gz (graph schema)<br/>  configbundle manifest (from bundler)
+    O->>O: cosign sign (once)
+    O->>ACR: push manifest + layers (tag: vN)
+    ACR-->>O: sha256 digest
+    O->>O: record RegistryArtifact (enriched: true)
+```
+
+**Failure path:** if `POST /bundle` returns non-2xx or times out, Orbital retries up to `ORBITAL_ENRICHER_MAX_ATTEMPTS` times (default 3, exponential backoff 1s–10s). If all attempts fail, the publish job is marked failed, nothing is pushed to ACR, and `enricher_error` is recorded.
 
 ---
 
 ## Key decisions
 
-- **Single endpoint** — `POST /enrich` only. No other routes. No health check beyond 2xx on enrich.
+- **Single endpoint** — `POST /bundle` only. No other routes. No health check beyond 2xx on bundle.
 - **Stateless** — no database, no persistent state; all data fetched from Orbital GraphQL per request.
 - **Fail fast** — any error (GraphQL failure, timeout, bad datacenter) returns non-2xx immediately. Orbital treats non-2xx as a publish failure and retries per `ORBITAL_ENRICHER_MAX_ATTEMPTS`.
 - **Auth is caller's concern** — the bundler does not issue tokens; it optionally attaches `ORBITAL_BEARER_TOKEN` as a bearer token on GraphQL requests. Empty = no auth header.
@@ -24,16 +60,17 @@ The configbundle bundler exposes a single HTTP endpoint (`POST /enrich`) that Or
 ### Request (Orbital → bundler)
 
 ```
-POST /enrich
+POST /bundle
 Content-Type: application/json
 
 {
-  "jobId": "a1b2c3d4-e5f6-...",
   "datacenter": "colo-galleon"
 }
 ```
 
 `datacenter` matches `DataCenter.name` in Orbital's DGraph schema.
+
+For request tracing, callers may pass `X-Request-ID` as a header — the bundler logs it if present.
 
 ### Response (bundler → Orbital)
 
@@ -53,8 +90,7 @@ Content-Type: application/json
 ### Go types
 
 ```go
-type enrichRequest struct {
-    JobID      string `json:"jobId"`
+type bundleRequest struct {
     Datacenter string `json:"datacenter"`
 }
 
@@ -110,7 +146,7 @@ Orbital retries failed enricher calls. These are Orbital-side settings, not conf
 - **Non-2xx = publish fails, with retry** — Orbital retries up to `ORBITAL_ENRICHER_MAX_ATTEMPTS` times (default 3) with exponential backoff (1s–10s). If all attempts fail, the publish job is marked failed, `enricher_error` is recorded, nothing is pushed to ACR. There is no partial-success path.
 - **Timeout counts as a failed attempt** — per-attempt timeout (default 30s via `ORBITAL_ENRICHER_TIMEOUT`) triggers the same retry logic as a non-2xx. The bundler does not need to handle Orbital's retry — just fail fast on its own errors.
 - **Response size limit** — a response body exceeding `ORBITAL_ENRICHER_MAX_RESPONSE_BYTES` (default 10 MB) causes an immediate failure with no retry.
-- **`jobId` is informational** — the bundler receives it for logging/tracing but does not need to use it to query data. All data comes from `datacenter`.
+- **`datacenter` is the only behavioral input** — all data is fetched from Orbital GraphQL using the datacenter name. For request tracing, callers pass `X-Request-ID` as a header.
 
 ---
 

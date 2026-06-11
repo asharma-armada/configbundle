@@ -20,7 +20,6 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
-	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -68,8 +67,6 @@ func main() {
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
 	var enableLeaderElection bool
-	var enablePuller bool
-	var enableOrbImport bool
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
@@ -91,12 +88,6 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
-	flag.BoolVar(&enablePuller, "enable-puller", false,
-		"Enable the Puller runnable (OCI poll → cosign verify → orb import → ConfigBundle CR write). "+
-			"Defaults to false; set to true in production via helm/kustomize.")
-	flag.BoolVar(&enableOrbImport, "enable-orb-import", false,
-		"Enable orb POST /import/subgraph call within the Puller cycle. "+
-			"Defaults to false; set to true in production. When false, GraphImported condition is set to False/Disabled.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -204,40 +195,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Wire the Puller unless disabled via --enable-puller=false.
-	// When enabled, DATACENTER must be set — omitting it skips registration even if the flag is true.
-	if !enablePuller {
-		setupLog.Info("Puller disabled via --enable-puller=false")
-	} else if datacenter := os.Getenv("DATACENTER"); datacenter != "" {
-		pollInterval, err := time.ParseDuration(envOrDefault("POLL_INTERVAL", "60s"))
-		if err != nil {
-			setupLog.Error(err, "Invalid POLL_INTERVAL")
-			os.Exit(1)
-		}
-		namespace := envOrDefault("NAMESPACE", "configbundle-system")
+	ns := envOrDefault("NAMESPACE", "configbundle-system")
 
-		puller := &controller.Puller{
-			Client: mgr.GetClient(),
-			Config: controller.PullerConfig{
-				RegistryURL:      envOrDefault("EDGE_REGISTRY_URL", "localhost:5000"),
-				PollInterval:     pollInterval,
-				OrbEndpoint:      envOrDefault("ORB_ENDPOINT", "http://localhost:8001"),
-				Datacenter:       datacenter,
-				Namespace:        namespace,
-				OrbImportEnabled: enableOrbImport,
-			},
-			OCI: controller.NewHTTPOCIClient(
-				envOrDefault("EDGE_REGISTRY_URL", "localhost:5000"),
-				envOrDefault("COSIGN_PUBLIC_KEY_PATH", "/etc/configbundle/cosign.pub"),
-			),
-			Orb: controller.NewHTTPOrbClient(envOrDefault("ORB_ENDPOINT", "http://localhost:8001")),
-		}
-		if err := mgr.Add(puller); err != nil {
-			setupLog.Error(err, "Failed to register Puller")
-			os.Exit(1)
-		}
-		setupLog.Info("Puller registered", "datacenter", datacenter, "interval", pollInterval)
+	// Register the Divergence Reporter — scheduled loop that detects local overrides.
+	reporter := controller.NewDivergenceReporter(mgr.GetClient(),
+		controller.WithDivergenceIntakeURL(envOrDefault("ORB_DIVERGENCE_INTAKE_URL", "http://orb:8010/api/v1/divergence")),
+		controller.WithDivergenceNamespace(ns),
+		controller.WithDivergenceEnabled(envOrDefault("DIVERGENCE_REPORTER_ENABLED", "false") == "true"),
+	)
+	if err := mgr.Add(reporter); err != nil {
+		setupLog.Error(err, "Failed to register DivergenceReporter")
+		os.Exit(1)
 	}
+
+	// Register the ConsumeServer — exposes POST /consume for orb layer dispatch.
+	consume := controller.NewConsumeServer(mgr.GetClient(),
+		controller.WithPort(envOrDefault("CB_CONTROLLER_PORT", ":8095")),
+		controller.WithNamespace(ns),
+		controller.WithDivergenceReporter(reporter),
+	)
+	if err := mgr.Add(consume); err != nil {
+		setupLog.Error(err, "Failed to register ConsumeServer")
+		os.Exit(1)
+	}
+	setupLog.Info("ConsumeServer registered", "port", envOrDefault("CB_CONTROLLER_PORT", ":8095"))
 
 	// +kubebuilder:scaffold:builder
 

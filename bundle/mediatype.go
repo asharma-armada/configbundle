@@ -11,4 +11,9 @@ const (
 
 	// MediaTypeSchema is the DGraph schema layer (schema.gz) produced by Orbital.
 	MediaTypeSchema = "application/vnd.orbital.subgraph.schema.v1+gzip"
+
+	// MediaTypeMapping is the path→orbId mapping layer produced by the bundler
+	// alongside the manifest. Orb stores it by bundle digest and uses it to
+	// translate K8s field paths to orbId+field at divergence intake time.
+	MediaTypeMapping = "application/vnd.armada.configbundle.mapping.v1+json"
 )

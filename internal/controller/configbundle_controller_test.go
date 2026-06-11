@@ -173,66 +173,42 @@ var _ = Describe("ConfigBundle Controller", func() {
 	})
 })
 
-// ---------------------------------------------------------------------------
-// Fakes for Puller envtest tests
-// ---------------------------------------------------------------------------
-
-type fakeOCIClient struct {
-	artifact *OCIArtifact
-	err      error
-}
-
-func (f *fakeOCIClient) Pull(_ context.Context, _ string) (*OCIArtifact, error) {
-	return f.artifact, f.err
-}
-
-type fakeOrbClient struct {
-	called bool
-	err    error
-}
-
-func (f *fakeOrbClient) ImportSubgraph(_ context.Context, _, _ []byte) error {
-	f.called = true
-	return f.err
-}
-
-// testManifest builds a minimal ConfigBundle manifest YAML for use in Puller tests.
+// testManifest builds a minimal ConfigBundle manifest YAML for use in ConsumeServer tests.
 func testManifest(datacenter string, servers ...armadav1.ServerSpec) []byte {
-	yaml := fmt.Sprintf("datacenter: %s\n", datacenter)
+	y := fmt.Sprintf("datacenter: %s\n", datacenter)
 	if len(servers) > 0 {
-		yaml += "servers:\n"
+		y += "servers:\n"
 		for _, s := range servers {
-			yaml += fmt.Sprintf("  - serviceTag: %q\n    hostname: %q\n    oobIP: %q\n",
+			y += fmt.Sprintf("  - serviceTag: %q\n    hostname: %q\n    oobIP: %q\n",
 				s.ServiceTag, s.Hostname, s.OobIP)
 		}
 	}
-	return []byte(yaml)
+	return []byte(y)
 }
 
 // ---------------------------------------------------------------------------
-// Puller envtest tests
+// ConsumeServer envtest tests
 // ---------------------------------------------------------------------------
 
-// Describe block is at package scope so it registers with the suite in suite_test.go.
-var _ = Describe("Puller", func() {
-	const (
-		timeout  = 10 * time.Second
-		interval = 250 * time.Millisecond
-	)
-
+var _ = Describe("ConsumeServer", func() {
 	ctx := context.Background()
 
 	var (
 		ns        string
 		nsCounter int
+		server    *ConsumeServer
 	)
 
 	BeforeEach(func() {
 		nsCounter++
-		ns = fmt.Sprintf("puller-%d", nsCounter)
+		ns = fmt.Sprintf("consume-%d", nsCounter)
 		Expect(k8sClient.Create(ctx, &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: ns},
 		})).To(Succeed())
+		server = NewConsumeServer(k8sClient,
+			WithNamespace(ns),
+			WithRetry(1, 0), // no retry delay in tests
+		)
 	})
 
 	AfterEach(func() {
@@ -241,139 +217,61 @@ var _ = Describe("Puller", func() {
 		})).To(Succeed())
 	})
 
-	newPuller := func(oci OCIClient, orb OrbClient, datacenter string) *Puller {
-		return &Puller{
-			Client: k8sClient,
-			Config: PullerConfig{
-				RegistryURL:      "localhost:5000",
-				PollInterval:     time.Hour, // not used in tests — RunCycle called directly
-				Datacenter:       datacenter,
-				Namespace:        ns,
-				OrbImportEnabled: true,
-			},
-			OCI: oci,
-			Orb: orb,
-		}
-	}
-
-	It("skips the cycle when the digest is unchanged", func() {
-		const digest = "sha256:aabbcc"
+	It("creates the ConfigBundle CR and sets status on a successful dispatch", func() {
 		const datacenter = "colo"
+		body := testManifest(datacenter,
+			armadav1.ServerSpec{ServiceTag: "3RK3V64", Hostname: "colo-r740-01", OobIP: "10.10.1.45"},
+		)
 
-		// Pre-create the ConfigBundle CR with lastAppliedDigest already set.
-		cb := &armadav1.ConfigBundle{
-			ObjectMeta: metav1.ObjectMeta{Name: datacenter, Namespace: ns},
-			Spec:       armadav1.ConfigBundleSpec{Datacenter: datacenter},
-		}
-		Expect(k8sClient.Create(ctx, cb)).To(Succeed())
-		cb.Status.LastAppliedDigest = digest
-		Expect(k8sClient.Status().Update(ctx, cb)).To(Succeed())
-
-		orb := &fakeOrbClient{}
-		puller := newPuller(&fakeOCIClient{
-			artifact: &OCIArtifact{Digest: digest, Manifest: testManifest(datacenter)},
-		}, orb, datacenter)
-
-		Expect(puller.RunCycle(ctx)).To(Succeed())
-
-		// Orb must not be called when digest is unchanged.
-		Expect(orb.called).To(BeFalse(), "orb must not be called when digest is unchanged")
-	})
-
-	It("aborts and does not write the CR when orb import fails", func() {
-		const datacenter = "colo"
-		orb := &fakeOrbClient{err: fmt.Errorf("orb unavailable")}
-		puller := newPuller(&fakeOCIClient{
-			artifact: &OCIArtifact{
-				Digest:   "sha256:newdigest",
-				Manifest: testManifest(datacenter, armadav1.ServerSpec{ServiceTag: "3RK3V64", Hostname: "colo-r740-01", OobIP: "10.0.0.1"}),
-				Data:     []byte("data"),
-				Schema:   []byte("schema"),
-			},
-		}, orb, datacenter)
-
-		err := puller.RunCycle(ctx)
-		Expect(err).To(HaveOccurred(), "RunCycle must return error when orb fails")
-		Expect(err.Error()).To(ContainSubstring("orb import"))
-
-		// ConfigBundle CR must not exist — cycle aborted before CR write.
-		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).
-			To(MatchError(ContainSubstring("not found")))
-	})
-
-	It("creates the ConfigBundle CR and updates status on a successful cycle", func() {
-		const datacenter = "colo"
-		orb := &fakeOrbClient{}
-		puller := newPuller(&fakeOCIClient{
-			artifact: &OCIArtifact{
-				Digest: "sha256:abc123",
-				Manifest: testManifest(datacenter,
-					armadav1.ServerSpec{ServiceTag: "3RK3V64", Hostname: "colo-r740-01", OobIP: "10.10.1.45"},
-				),
-				Data:   []byte("data"),
-				Schema: []byte("schema"),
-			},
-		}, orb, datacenter)
-
-		Expect(puller.RunCycle(ctx)).To(Succeed())
-		Expect(orb.called).To(BeTrue())
+		Expect(server.applyManifest(ctx, body, "sha256:abc123", "import-uuid-1")).To(Succeed())
 
 		var cb armadav1.ConfigBundle
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
-
 		Expect(cb.Spec.Datacenter).To(Equal(datacenter))
 		Expect(cb.Spec.Servers).To(HaveLen(1))
 		Expect(cb.Spec.Servers[0].ServiceTag).To(Equal("3RK3V64"))
-
 		Expect(cb.Status.LastAppliedDigest).To(Equal("sha256:abc123"))
+		Expect(cb.Status.LastOrbImportID).To(Equal("import-uuid-1"))
 		Expect(cb.Status.LastAppliedAt).NotTo(BeNil())
-		Expect(conditionStatus(cb.Status.Conditions, armadav1.ConditionArtifactFetched)).
-			To(Equal(metav1.ConditionTrue))
-		Expect(conditionStatus(cb.Status.Conditions, armadav1.ConditionSignatureVerified)).
-			To(Equal(metav1.ConditionTrue))
-		Expect(conditionStatus(cb.Status.Conditions, armadav1.ConditionGraphImported)).
+		Expect(conditionStatus(cb.Status.Conditions, armadav1.ConditionReconciled)).
 			To(Equal(metav1.ConditionTrue))
 	})
 
-	It("updates an existing ConfigBundle CR on a new digest", func() {
+	It("is idempotent — applying the same manifest twice does not error", func() {
 		const datacenter = "colo"
-		orb := &fakeOrbClient{}
-		oci := &fakeOCIClient{
-			artifact: &OCIArtifact{
-				Digest:   "sha256:first",
-				Manifest: testManifest(datacenter, armadav1.ServerSpec{ServiceTag: "3RK3V64", Hostname: "colo-r740-01", OobIP: "10.10.1.45"}),
-				Data:     []byte("d"),
-				Schema:   []byte("s"),
-			},
-		}
-		puller := newPuller(oci, orb, datacenter)
-
-		// First cycle creates the CR.
-		Expect(puller.RunCycle(ctx)).To(Succeed())
-
-		// Second cycle with a new digest — must update spec and status.
-		oci.artifact = &OCIArtifact{
-			Digest: "sha256:second",
-			Manifest: testManifest(datacenter,
-				armadav1.ServerSpec{ServiceTag: "3RK3V64", Hostname: "colo-r740-01", OobIP: "10.10.1.45"},
-				armadav1.ServerSpec{ServiceTag: "FQK3V64", Hostname: "colo-r740-02", OobIP: "10.10.1.46"},
-			),
-			Data:   []byte("d2"),
-			Schema: []byte("s2"),
-		}
-		Expect(puller.RunCycle(ctx)).To(Succeed())
+		body := testManifest(datacenter,
+			armadav1.ServerSpec{ServiceTag: "3RK3V64", Hostname: "colo-r740-01", OobIP: "10.10.1.45"},
+		)
+		Expect(server.applyManifest(ctx, body, "sha256:abc", "import-1")).To(Succeed())
+		Expect(server.applyManifest(ctx, body, "sha256:abc", "import-1")).To(Succeed())
 
 		var cb armadav1.ConfigBundle
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
-		Expect(cb.Status.LastAppliedDigest).To(Equal("sha256:second"))
+		Expect(cb.Spec.Servers).To(HaveLen(1))
+	})
+
+	It("updates an existing CR when a new dispatch arrives", func() {
+		const datacenter = "colo"
+		Expect(server.applyManifest(ctx, testManifest(datacenter,
+			armadav1.ServerSpec{ServiceTag: "3RK3V64", Hostname: "r1", OobIP: "10.0.0.1"},
+		), "sha256:v1", "import-1")).To(Succeed())
+
+		Expect(server.applyManifest(ctx, testManifest(datacenter,
+			armadav1.ServerSpec{ServiceTag: "3RK3V64", Hostname: "r1", OobIP: "10.0.0.1"},
+			armadav1.ServerSpec{ServiceTag: "FQK3V64", Hostname: "r2", OobIP: "10.0.0.2"},
+		), "sha256:v2", "import-2")).To(Succeed())
+
+		var cb armadav1.ConfigBundle
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
 		Expect(cb.Spec.Servers).To(HaveLen(2))
+		Expect(cb.Status.LastAppliedDigest).To(Equal("sha256:v2"))
+		Expect(cb.Status.LastOrbImportID).To(Equal("import-2"))
 	})
 
 	It("omits local:admin-owned server entries from the SSA patch", func() {
 		const datacenter = "colo"
 
-		// Step 1: local:admin applies and claims server A.
+		// Step 1: local:admin claims server A.
 		adminApply := &armadav1.ConfigBundle{
 			TypeMeta:   metav1.TypeMeta{APIVersion: armadav1.GroupVersion.String(), Kind: "ConfigBundle"},
 			ObjectMeta: metav1.ObjectMeta{Name: datacenter, Namespace: ns},
@@ -389,108 +287,35 @@ var _ = Describe("Puller", func() {
 			client.FieldOwner("local:admin"),
 		)).To(Succeed())
 
-		// Step 2: Puller cycle with two servers — A (admin-owned) and B (uncontested).
-		orb := &fakeOrbClient{}
-		puller := newPuller(&fakeOCIClient{
-			artifact: &OCIArtifact{
-				Digest: "sha256:newdigest",
-				Manifest: testManifest(datacenter,
-					armadav1.ServerSpec{ServiceTag: "AAA0001", Hostname: "colo-r740-01", OobIP: "10.10.1.45"},
-					armadav1.ServerSpec{ServiceTag: "BBB0002", Hostname: "colo-r740-02", OobIP: "10.10.1.46"},
-				),
-				Data:   []byte("data"),
-				Schema: []byte("schema"),
-			},
-		}, orb, datacenter)
-
-		Expect(puller.RunCycle(ctx)).To(Succeed())
+		// Step 2: dispatch includes both server A (admin-owned) and server B (uncontested).
+		// applyManifest must omit A and apply B without 409.
+		body := testManifest(datacenter,
+			armadav1.ServerSpec{ServiceTag: "AAA0001", Hostname: "colo-r740-01", OobIP: "10.10.1.45"},
+			armadav1.ServerSpec{ServiceTag: "BBB0002", Hostname: "colo-r740-02", OobIP: "10.10.1.46"},
+		)
+		Expect(server.applyManifest(ctx, body, "sha256:newdigest", "import-1")).To(Succeed())
 
 		var cb armadav1.ConfigBundle
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
-
-		// Server B must be present (Puller owns it).
 		serverB := findServerByTag(cb.Spec.Servers, "BBB0002")
-		Expect(serverB).NotTo(BeNil(), "server B must be present after Puller cycle")
-
-		// Server A must still be present (admin's entry preserved by SSA).
+		Expect(serverB).NotTo(BeNil(), "server B must be present")
 		serverA := findServerByTag(cb.Spec.Servers, "AAA0001")
-		Expect(serverA).NotTo(BeNil(), "server A must still be present")
-		// Admin's override must be intact.
-		Expect(serverA.Idrac.SSHEnabled).To(BeTrue(), "admin override on server A must be preserved")
-
-		// Orb must have been called.
-		Expect(orb.called).To(BeTrue())
+		Expect(serverA).NotTo(BeNil(), "server A must still be present (SSA preserves admin entry)")
+		Expect(serverA.Idrac.SSHEnabled).To(BeTrue(), "admin override must be preserved")
 	})
 
-	It("does not call orb when OCI pull fails", func() {
-		const datacenter = "colo"
-		orb := &fakeOrbClient{}
-		puller := newPuller(&fakeOCIClient{err: fmt.Errorf("zot unreachable")}, orb, datacenter)
-
-		err := puller.RunCycle(ctx)
+	It("returns error when manifest has empty datacenter", func() {
+		err := server.applyManifest(ctx, []byte("datacenter: \"\"\n"), "sha256:x", "import-1")
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("OCI pull"))
-		Expect(orb.called).To(BeFalse())
+		Expect(err.Error()).To(ContainSubstring("empty datacenter"))
 	})
 
-	It("processes a subsequent cycle when a second new digest arrives", func() {
+	It("applies a manifest with no servers", func() {
 		const datacenter = "colo"
-		orb := &fakeOrbClient{}
-
-		// First cycle — digest A.
-		oci := &fakeOCIClient{artifact: &OCIArtifact{
-			Digest:   "sha256:digestA",
-			Manifest: testManifest(datacenter),
-			Data:     []byte("d"), Schema: []byte("s"),
-		}}
-		Expect(newPuller(oci, orb, datacenter).RunCycle(ctx)).To(Succeed())
-
-		// Same digest — no orb call.
-		orb.called = false
-		Expect(newPuller(oci, orb, datacenter).RunCycle(ctx)).To(Succeed())
-		Expect(orb.called).To(BeFalse(), "same digest must not trigger orb call")
-
-		// New digest — orb called again.
-		oci.artifact = &OCIArtifact{
-			Digest:   "sha256:digestB",
-			Manifest: testManifest(datacenter),
-			Data:     []byte("d2"), Schema: []byte("s2"),
-		}
-		orb.called = false
-		Expect(newPuller(oci, orb, datacenter).RunCycle(ctx)).To(Succeed())
-		Expect(orb.called).To(BeTrue(), "new digest must trigger orb call")
-	})
-
-	It("sets GraphImported condition to False/Disabled when OrbImportEnabled=false", func() {
-		const datacenter = "colo"
-		orb := &fakeOrbClient{}
-		puller := &Puller{
-			Client: k8sClient,
-			Config: PullerConfig{
-				RegistryURL:      "localhost:5000",
-				PollInterval:     time.Hour,
-				Datacenter:       datacenter,
-				Namespace:        ns,
-				OrbImportEnabled: false,
-			},
-			OCI: &fakeOCIClient{
-				artifact: &OCIArtifact{
-					Digest:   "sha256:abc123",
-					Manifest: testManifest(datacenter, armadav1.ServerSpec{ServiceTag: "3RK3V64", Hostname: "colo-r740-01", OobIP: "10.10.1.45"}),
-					Data:     []byte("data"),
-					Schema:   []byte("schema"),
-				},
-			},
-			Orb: orb,
-		}
-
-		Expect(puller.RunCycle(ctx)).To(Succeed())
-		Expect(orb.called).To(BeFalse(), "orb must not be called when OrbImportEnabled=false")
-
+		Expect(server.applyManifest(ctx, testManifest(datacenter), "sha256:empty", "import-1")).To(Succeed())
 		var cb armadav1.ConfigBundle
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
-		Expect(conditionStatus(cb.Status.Conditions, armadav1.ConditionGraphImported)).
-			To(Equal(metav1.ConditionFalse), "GraphImported must be False when orb import is disabled")
+		Expect(cb.Spec.Servers).To(BeEmpty())
 	})
 })
 

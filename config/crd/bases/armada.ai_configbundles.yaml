@@ -121,6 +121,39 @@ spec:
                 x-kubernetes-list-map-keys:
                 - serviceTag
                 x-kubernetes-list-type: map
+              takeover:
+                description: |-
+                  Takeover contains force-resolution directives from the cloud admin.
+                  Each entry triggers a ForceOwnership SSA apply to reclaim the field from local:admin.
+                  Entries persist until the next bundle replaces the spec (cb-bundler omits consumed entries).
+                items:
+                  description: |-
+                    TakeoverEntry represents a cloud admin's "force" resolution: reclaim ownership
+                    of a specific field from local:admin. The consume handler processes these by
+                    running a per-field SSA apply with ForceOwnership after the normal apply pass.
+                  properties:
+                    field:
+                      description: |-
+                        Field is the leaf field name to reclaim (e.g. "sshEnabled").
+                        Must match the JSON tag name on IdracSpec (or ServerSpec for top-level fields).
+                      type: string
+                    orbId:
+                      description: |-
+                        OrbID is the Orbital ConfigItem identifier (e.g. "colo:srv-001-idrac").
+                        Informational — the controller does not use this for apply logic.
+                      type: string
+                    serviceTag:
+                      description: |-
+                        ServiceTag identifies which server entry the field belongs to.
+                        The bundler resolves this from the orbId→server mapping.
+                      type: string
+                  required:
+                  - field
+                  - orbId
+                  - serviceTag
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
             required:
             - datacenter
             type: object
@@ -194,8 +227,13 @@ spec:
                 type: string
               lastAppliedDigest:
                 description: |-
-                  LastAppliedDigest is the OCI artifact digest last successfully applied.
-                  The controller skips re-processing when the current artifact digest matches this value.
+                  LastAppliedDigest is the artifact manifest digest (X-Orb-Digest) from the most
+                  recent successful consume dispatch.
+                type: string
+              lastOrbImportID:
+                description: |-
+                  LastOrbImportID is the orb import UUID (X-Orb-Import-ID) from the most recent
+                  successful consume dispatch. Used for correlation with orb's import history.
                 type: string
               phase:
                 description: Phase is the current lifecycle phase.
