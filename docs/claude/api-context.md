@@ -107,8 +107,14 @@ type layer struct {
 | Variable | Default | Description |
 |---|---|---|
 | `BUNDLER_PORT` | `8020` | HTTP listen port |
-| `ORBITAL_GRAPHQL_URL` | `http://orbital/graphql` | Orbital GraphQL endpoint |
-| `ORBITAL_BEARER_TOKEN` | `""` | Bearer token for Orbital GraphQL (empty = no auth; required post-Spike 11) |
+| `ORBITAL_GRAPHQL_URL` | `http://localhost:8001/graphql` | Orbital GraphQL endpoint |
+| `ORBITAL_API_URL` | `http://localhost:8001` | Orbital REST API base (pending-force resolutions) |
+| `ORBITAL_OIDC_ISSUER_URL` | `https://login.microsoftonline.com/{tenant}/v2.0` | OIDC issuer; token URL derived from this |
+| `ORBITAL_OIDC_CLIENT_ID` | `{orbital app client ID}` | OAuth2 client ID (same as orbital's) |
+| `ORBITAL_OIDC_CLIENT_SECRET` | `""` | OAuth2 client secret — set this to enable OAuth2 mode |
+| `ORBITAL_BEARER_TOKEN` | `""` | Static bearer token (deprecated fallback; overrides OAuth2 if set) |
+
+Auth priority: `ORBITAL_BEARER_TOKEN` (static) → `ORBITAL_OIDC_CLIENT_SECRET` set (OAuth2 client credentials) → plain HTTP (local dev only, will 401 against real Orbital).
 
 ---
 
@@ -139,6 +145,50 @@ Orbital retries failed enricher calls. These are Orbital-side settings, not conf
 | `ORBITAL_ENRICHER_MAX_RESPONSE_BYTES` | `10485760` | Max response size (10 MB) |
 
 ---
+
+## Bundle manifest shape
+
+The bundler emits a `ConfigBundleSpec` YAML carrying Orbital's `orbId` as a
+first-class field at every K8s-addressable level. `orbId` is the immutable
+Orbital identifier — stable across `serviceTag` rebadges and hostname renames.
+See `docs/plans/server-identity-orbid.md`.
+
+```yaml
+orbId: colo:colo-galleon         # datacenter orbId (required)
+datacenter: colo-galleon
+servers:
+- orbId: colo:srv-001            # server orbId (required, listMapKey)
+  serviceTag: JQK3V64            # mutable hardware tag
+  hostname: r09-u22.colo-galleon
+  oobIP: 10.20.21.65
+  idrac: { ... }
+```
+
+The mapping layer JSON carries only **field-level** entries for Orbital nodes
+that are not independently addressable in K8s (IdracSettings and similar nested
+types). Datacenter and server orbIds are in spec, not mapping.
+
+## Admin override workflow
+
+Admin SSA uses `orbId` as the listMapKey for `spec.servers[]`:
+
+```bash
+ORB_ID=$(kubectl get cb colo-galleon -o jsonpath='{.spec.servers[?(@.hostname=="r09-u22.colo-galleon")].orbId}')
+kubectl apply --server-side --force-conflicts --field-manager=local:admin -f - <<EOF
+apiVersion: armada.ai/v1
+kind: ConfigBundle
+metadata:
+  name: colo-galleon
+spec:
+  servers:
+    - orbId: $ORB_ID
+      idrac:
+        sshEnabled: true
+EOF
+```
+
+`--force-conflicts` is required on the initial takeover (controller owns the
+field). After that admin owns the leaf and controller respects on next /consume.
 
 ## Gotchas
 

@@ -2,6 +2,7 @@
 FROM golang:1.25 AS builder
 ARG TARGETOS
 ARG TARGETARCH
+ARG BUNDLER_VERSION=v0.0.0-dev
 
 WORKDIR /workspace
 
@@ -20,7 +21,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o bundler cmd/bundler/main.go
+    GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
+    -ldflags "-X github.com/armada/configbundle/internal/version.Version=${BUNDLER_VERSION}" \
+    -o bundler cmd/bundler/main.go
 
 # ---- controller image ----
 FROM gcr.io/distroless/static:nonroot AS controller

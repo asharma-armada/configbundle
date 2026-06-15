@@ -2,6 +2,7 @@
 
 ## Recent accomplishments
 
+- **2026-06-14** — Dispatch rewrite: `POST /dispatch` (content-routed) replaces `/consume`+`/mapping`; mapping persists in `<cb-name>-mapping` ConfigMap with OwnerReference; event-driven debounced Divergence Reporter replaces ticker; bundler orbital client updated (force→reject, new divergence API endpoints); controller config migrated to envconfig; e2e-validated against live minikube+orb
 - **2026-06-11** — Divergence pipeline feature-complete: Reporter (Spike 7), mapping layer (7a), takeover handler (7b); ADRs 004–006; refactored mapToSpec + setFieldOnServer to generic JSON round-trip + reflection
 - **2026-06-08** — Bundler service (Spike 3) done: POST /bundle, sidecar deployment, Dockerfile multi-target build, ACR push targets
 - **2026-06-03** — Renamed /enrich → /bundle; dropped jobId from bundler API; added bundler sequence diagram

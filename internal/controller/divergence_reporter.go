@@ -3,34 +3,40 @@ package controller
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	armadav1 "github.com/armada/configbundle/api/v1"
 )
 
-// DivergenceReporter is a ctrl.Runnable that periodically inspects ConfigBundle CRs
-// for fields owned by local:admin and reports them to orb's divergence intake.
+// DivergenceReporter is a controller-runtime reconciler that watches ConfigBundle CRs
+// for changes in "local:*" field managers and reports divergences to orb's intake.
 type DivergenceReporter struct {
-	Client     client.Client
-	HTTPClient *http.Client
-	intakeURL  string
-	namespace  string
-	interval   time.Duration
-	enabled    bool
+	Client         client.Client
+	HTTPClient     *http.Client
+	intakeURL      string
+	namespace      string
+	debounceWindow time.Duration
+	enabled        bool
 
-	// lastManifests caches the last-applied manifest spec per ConfigBundle name
-	// so we can report intendedValue without re-fetching from anywhere.
-	lastManifests map[string]armadav1.ConfigBundleSpec
+	mu             sync.Mutex
+	lastEventAt    map[types.NamespacedName]time.Time
+	lastPostedHash map[types.NamespacedName][32]byte
+
+	lastManifestsMu sync.RWMutex
+	lastManifests   map[string]armadav1.ConfigBundleSpec
 }
 
 // DivergenceReporterOption configures a DivergenceReporter.
@@ -44,8 +50,8 @@ func WithDivergenceNamespace(ns string) DivergenceReporterOption {
 	return func(r *DivergenceReporter) { r.namespace = ns }
 }
 
-func WithDivergenceInterval(d time.Duration) DivergenceReporterOption {
-	return func(r *DivergenceReporter) { r.interval = d }
+func WithDivergenceDebounce(d time.Duration) DivergenceReporterOption {
+	return func(r *DivergenceReporter) { r.debounceWindow = d }
 }
 
 func WithDivergenceEnabled(enabled bool) DivergenceReporterOption {
@@ -54,13 +60,15 @@ func WithDivergenceEnabled(enabled bool) DivergenceReporterOption {
 
 func NewDivergenceReporter(c client.Client, opts ...DivergenceReporterOption) *DivergenceReporter {
 	r := &DivergenceReporter{
-		Client:        c,
-		HTTPClient:    &http.Client{Timeout: 10 * time.Second},
-		intakeURL:     "http://orb:8010/api/v1/divergence",
-		namespace:     "configbundle-system",
-		interval:      5 * time.Minute,
-		enabled:       false,
-		lastManifests: make(map[string]armadav1.ConfigBundleSpec),
+		Client:         c,
+		HTTPClient:     &http.Client{Timeout: 10 * time.Second},
+		intakeURL:      "http://orb:8010/api/v1/divergence",
+		namespace:      "configbundle-system",
+		debounceWindow: 5 * time.Second,
+		enabled:        false,
+		lastEventAt:    make(map[types.NamespacedName]time.Time),
+		lastPostedHash: make(map[types.NamespacedName][32]byte),
+		lastManifests:  make(map[string]armadav1.ConfigBundleSpec),
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -68,35 +76,11 @@ func NewDivergenceReporter(c client.Client, opts ...DivergenceReporterOption) *D
 	return r
 }
 
-func (r *DivergenceReporter) NeedsLeaderElection() bool { return true }
-
-func (r *DivergenceReporter) Start(ctx context.Context) error {
-	if !r.enabled {
-		log.FromContext(ctx).WithName("divergence-reporter").Info("disabled, not starting")
-		return nil
-	}
-
-	logger := log.FromContext(ctx).WithName("divergence-reporter")
-	logger.Info("starting", "interval", r.interval, "intakeURL", r.intakeURL)
-
-	ticker := time.NewTicker(r.interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			if err := r.report(ctx); err != nil {
-				logger.Error(err, "report tick failed")
-			}
-		}
-	}
-}
-
-// OverrideEntry is one divergence entry in the intake payload.
+// OverrideEntry is one orbital-native divergence entry in the intake payload.
 type OverrideEntry struct {
-	Path          string      `json:"path"`
+	OrbID         string      `json:"orbId"`
+	Field         string      `json:"field"`
+	Type          string      `json:"type"`
 	IntendedValue interface{} `json:"intendedValue"`
 	OverrideValue interface{} `json:"overrideValue"`
 	Who           string      `json:"who"`
@@ -105,33 +89,7 @@ type OverrideEntry struct {
 
 // DivergencePayload is the full intake payload sent to orb.
 type DivergencePayload struct {
-	BundleDigest string          `json:"bundleDigest"`
-	Overrides    []OverrideEntry `json:"overrides"`
-}
-
-func (r *DivergenceReporter) report(ctx context.Context) error {
-	logger := log.FromContext(ctx).WithName("divergence-reporter")
-
-	var cbList armadav1.ConfigBundleList
-	if err := r.Client.List(ctx, &cbList, client.InNamespace(r.namespace)); err != nil {
-		return fmt.Errorf("list ConfigBundles: %w", err)
-	}
-
-	for i := range cbList.Items {
-		cb := &cbList.Items[i]
-		overrides := r.extractOverrides(cb)
-		payload := DivergencePayload{
-			BundleDigest: cb.Status.LastAppliedDigest,
-			Overrides:    overrides,
-		}
-
-		if err := r.postToOrb(ctx, payload); err != nil {
-			logger.Error(err, "failed to POST divergence", "configbundle", cb.Name)
-			continue
-		}
-		logger.Info("reported divergence", "configbundle", cb.Name, "overrides", len(overrides))
-	}
-	return nil
+	Overrides []OverrideEntry `json:"overrides"`
 }
 
 func (r *DivergenceReporter) postToOrb(ctx context.Context, payload DivergencePayload) error {
@@ -160,8 +118,10 @@ func (r *DivergenceReporter) postToOrb(ctx context.Context, payload DivergencePa
 }
 
 // extractOverrides walks managedFields on the ConfigBundle CR, finds fields
-// owned by local:admin, and produces OverrideEntry values with K8s field paths.
-func (r *DivergenceReporter) extractOverrides(cb *armadav1.ConfigBundle) []OverrideEntry {
+// owned by any "local:<id>" field manager, translates K8s paths to orbital-native
+// entries via the mapping, and returns the divergence set. Each override carries
+// the actual field-manager string (e.g. "local:daniel") in Who.
+func (r *DivergenceReporter) extractOverrides(cb *armadav1.ConfigBundle, mapping *Mapping, lastManifest armadav1.ConfigBundleSpec) []OverrideEntry {
 	adminPaths := extractAdminPaths(cb.ManagedFields)
 	if len(adminPaths) == 0 {
 		return nil
@@ -169,18 +129,36 @@ func (r *DivergenceReporter) extractOverrides(cb *armadav1.ConfigBundle) []Overr
 
 	var overrides []OverrideEntry
 	for _, ap := range adminPaths {
-		intended := resolveValue(r.lastManifests[cb.Name], ap.path)
+		intended := resolveValue(lastManifest, ap.path)
 		override := resolveValue(cb.Spec, ap.path)
+
+		// Skip if the field isn't part of the current manifest's intent.
+		// This happens when orbital has resolved a prior divergence as `ignore`:
+		// the bundler omits the field from the cb-manifest entirely, cb-controller
+		// releases its claim, and only local:<id> remains as owner. Reporting it
+		// again would re-trigger the same ignore decision every tick (loop).
+		// A typed-nil pointer wrapped in interface{} is NOT == nil, so use the helper.
+		if intendedAbsent(intended) {
+			continue
+		}
 
 		if reflect.DeepEqual(intended, override) {
 			continue
 		}
 
+		orbID, field, typeName, err := mapping.Resolve(ap.path)
+		if err != nil {
+			// Path doesn't resolve — skip (e.g. metadata fields, or missing mapping entry).
+			continue
+		}
+
 		overrides = append(overrides, OverrideEntry{
-			Path:          ap.path,
+			OrbID:         orbID,
+			Field:         field,
+			Type:          typeName,
 			IntendedValue: intended,
 			OverrideValue: override,
-			Who:           "local:admin",
+			Who:           ap.manager,
 			When:          ap.when.Format(time.RFC3339),
 		})
 	}
@@ -190,20 +168,99 @@ func (r *DivergenceReporter) extractOverrides(cb *armadav1.ConfigBundle) []Overr
 // SetLastManifest records the last-applied manifest for a ConfigBundle so the
 // reporter can compare current values against intended values.
 func (r *DivergenceReporter) SetLastManifest(name string, spec armadav1.ConfigBundleSpec) {
+	r.lastManifestsMu.Lock()
+	defer r.lastManifestsMu.Unlock()
 	r.lastManifests[name] = spec
 }
 
-type adminPath struct {
-	path string
-	when time.Time
+// contentHash returns a stable SHA-256 hash of a DivergencePayload by sorting
+// overrides before hashing so order-invariant payloads produce the same hash.
+func contentHash(payload DivergencePayload) [32]byte {
+	sorted := make([]OverrideEntry, len(payload.Overrides))
+	copy(sorted, payload.Overrides)
+	sort.Slice(sorted, func(i, j int) bool {
+		if sorted[i].OrbID != sorted[j].OrbID {
+			return sorted[i].OrbID < sorted[j].OrbID
+		}
+		return sorted[i].Field < sorted[j].Field
+	})
+	b, _ := json.Marshal(DivergencePayload{Overrides: sorted})
+	return sha256.Sum256(b)
 }
 
-// extractAdminPaths parses managedFields to find all leaf field paths owned by local:admin.
-// Paths are formatted as: spec.servers[serviceTag=X].idrac.sshEnabled
+type adminPath struct {
+	path    string
+	when    time.Time
+	manager string // field manager that owns this path (e.g. "local:daniel")
+}
+
+// intendedAbsent reports whether a value returned from resolveValue indicates
+// "field not present in the manifest." Because IdracSpec/ServerSpec leaves are
+// pointers with omitempty (ADR-007), an absent field decodes as a typed-nil
+// pointer wrapped in an interface{}. The standard `== nil` check returns false
+// for typed-nil interfaces, so we reflect to detect them.
+func intendedAbsent(v interface{}) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice:
+		return rv.IsNil()
+	}
+	return false
+}
+
+// warnNonConformingManagers logs a warning for each field manager that owns
+// spec.* on a ConfigBundle CR but doesn't follow the `local:<id>` convention.
+// Such overrides are silently dropped by extractAdminPaths and omitAdminOwnedFields
+// — this surface makes the silence visible at the runtime where the bug bites.
+//
+// Skipped silently:
+//   - `configbundle-controller` (us)
+//   - managers that don't own spec.* (e.g. status-only writers, GC)
+//
+// Warned (and still dropped):
+//   - any other manager that owns a spec.* field (e.g. `daniel`, `kubectl-edit`,
+//     `admin:bob`) — operator likely forgot the `local:` prefix
+//
+// See docs/runbooks/divergence-e2e-local.md (orbital repo).
+func warnNonConformingManagers(logger logrLogger, cbName string, managedFields []metav1.ManagedFieldsEntry) {
+	for _, entry := range managedFields {
+		if entry.Manager == "configbundle-controller" || entry.FieldsV1 == nil {
+			continue
+		}
+		if strings.HasPrefix(entry.Manager, "local:") {
+			continue
+		}
+		var fields map[string]interface{}
+		if err := json.Unmarshal(entry.FieldsV1.Raw, &fields); err != nil {
+			continue
+		}
+		if _, ownsSpec := fields["f:spec"]; !ownsSpec {
+			continue
+		}
+		logger.Info("non-conforming field manager owns spec — override will not be reported; use --field-manager=local:<id>",
+			"configbundle", cbName,
+			"manager", entry.Manager,
+		)
+	}
+}
+
+// logrLogger is the subset of logr.Logger we need. Defined locally to avoid an
+// explicit logr import here; controller-runtime's log package returns this shape.
+type logrLogger interface {
+	Info(msg string, keysAndValues ...any)
+}
+
+// extractAdminPaths parses managedFields to find all leaf field paths owned by
+// any field manager whose name starts with "local:". Returns one adminPath per
+// owned leaf, carrying the manager identity so callers can attribute overrides.
+// Paths are formatted as: spec.servers[orbId=Y].idrac.sshEnabled (orbId is the listMapKey).
 func extractAdminPaths(managedFields []metav1.ManagedFieldsEntry) []adminPath {
 	var paths []adminPath
 	for _, entry := range managedFields {
-		if entry.Manager != "local:admin" || entry.FieldsV1 == nil {
+		if !strings.HasPrefix(entry.Manager, "local:") || entry.FieldsV1 == nil {
 			continue
 		}
 		when := time.Time{}
@@ -216,13 +273,13 @@ func extractAdminPaths(managedFields []metav1.ManagedFieldsEntry) []adminPath {
 			continue
 		}
 
-		walkFields(fields, "", when, &paths)
+		walkFields(fields, "", when, entry.Manager, &paths)
 	}
 	return paths
 }
 
 // walkFields recursively walks the fieldsV1 structure and emits leaf paths.
-func walkFields(node map[string]interface{}, prefix string, when time.Time, out *[]adminPath) {
+func walkFields(node map[string]interface{}, prefix string, when time.Time, manager string, out *[]adminPath) {
 	for key, val := range node {
 		path := fieldKeyToPath(prefix, key)
 		if path == "" {
@@ -231,7 +288,7 @@ func walkFields(node map[string]interface{}, prefix string, when time.Time, out 
 
 		child, ok := val.(map[string]interface{})
 		if !ok || len(child) == 0 {
-			*out = append(*out, adminPath{path: path, when: when})
+			*out = append(*out, adminPath{path: path, when: when, manager: manager})
 			continue
 		}
 
@@ -245,13 +302,13 @@ func walkFields(node map[string]interface{}, prefix string, when time.Time, out 
 			}
 		}
 		if hasSubfields {
-			walkFields(child, path, when, out)
+			walkFields(child, path, when, manager, out)
 		} else {
 			// Leaf — all children are empty maps (field markers).
 			for childKey := range child {
 				leafPath := fieldKeyToPath(path, childKey)
 				if leafPath != "" {
-					*out = append(*out, adminPath{path: leafPath, when: when})
+					*out = append(*out, adminPath{path: leafPath, when: when, manager: manager})
 				}
 			}
 		}
@@ -303,15 +360,14 @@ func resolveValue(spec armadav1.ConfigBundleSpec, path string) interface{} {
 	var current interface{} = spec
 	for _, part := range parts {
 		if part.selector != "" {
-			// Array lookup by map key
+			// Array lookup by listMapKey (orbId).
 			servers, ok := current.([]armadav1.ServerSpec)
 			if !ok {
-				// Try to access via reflection for the field before the selector
 				return nil
 			}
 			found := false
 			for _, s := range servers {
-				if s.ServiceTag == part.selector {
+				if s.OrbID == part.selector {
 					current = s
 					found = true
 					break
@@ -334,12 +390,12 @@ func resolveValue(spec armadav1.ConfigBundleSpec, path string) interface{} {
 
 type pathPart struct {
 	field    string
-	selector string // e.g. "3RK3V64" for [serviceTag=3RK3V64]
+	selector string // e.g. "colo:srv-001" for [orbId=colo:srv-001]
 }
 
 // splitPath splits a K8s field path into parts.
-// "spec.servers[serviceTag=X].idrac.sshEnabled" →
-// [{field:"spec"}, {field:"servers", selector:"X"}, {field:"idrac"}, {field:"sshEnabled"}]
+// "spec.servers[orbId=Y].idrac.sshEnabled" →
+// [{field:"spec"}, {field:"servers", selector:"Y"}, {field:"idrac"}, {field:"sshEnabled"}]
 func splitPath(path string) []pathPart {
 	var parts []pathPart
 	remaining := path

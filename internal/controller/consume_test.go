@@ -11,7 +11,7 @@ import (
 	"github.com/armada/configbundle/bundle"
 )
 
-// --- Unit tests (net/http/httptest — no K8s) ---
+// --- Unit tests for handleConsume (manifest path via handleDispatch) ---
 
 func TestHandleConsume_WrongMediaType(t *testing.T) {
 	s := NewConsumeServer(nil)
@@ -108,6 +108,49 @@ func TestHandleConsume_Success(t *testing.T) {
 	if gotImportID != "uuid-123" {
 		t.Errorf("importID mismatch: got %q", gotImportID)
 	}
+}
+
+// --- handleDispatch routing tests ---
+
+func TestHandleDispatch_UnsupportedMediaType(t *testing.T) {
+	s := NewConsumeServer(nil)
+	req := httptest.NewRequest(http.MethodPost, "/dispatch", bytes.NewBufferString("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleDispatch(w, req)
+	if w.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("expected 415, got %d", w.Code)
+	}
+}
+
+func TestHandleDispatch_MappingMissingDigest(t *testing.T) {
+	s := NewConsumeServer(nil)
+	req := httptest.NewRequest(http.MethodPost, "/dispatch", bytes.NewBufferString(`{"items":[]}`))
+	req.Header.Set("Content-Type", bundle.MediaTypeMapping)
+	// No X-Orb-Digest header
+	w := httptest.NewRecorder()
+	s.handleDispatch(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestHandleDispatch_ManifestRouted(t *testing.T) {
+	s := NewConsumeServer(nil)
+	done := make(chan struct{})
+	s.applyFn = func(_ context.Context, _ []byte, _, _ string) error {
+		close(done)
+		return nil
+	}
+	req := httptest.NewRequest(http.MethodPost, "/dispatch", bytes.NewBufferString("datacenter: colo"))
+	req.Header.Set("Content-Type", bundle.MediaTypeManifest)
+	req.Header.Set("X-Orb-Digest", "sha256:abc")
+	w := httptest.NewRecorder()
+	s.handleDispatch(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	<-done // wait for async apply to confirm routing reached the manifest handler
 }
 
 // --- Unit tests for applyManifest helpers ---

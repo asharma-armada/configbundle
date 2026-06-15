@@ -60,19 +60,31 @@ spec:
                 description: Datacenter is the identifier of the target datacenter
                   (matches Orbital namespace name).
                 type: string
+              orbId:
+                description: |-
+                  OrbID is the immutable Orbital identifier for this datacenter (e.g. "colo:colo-galleon").
+                  First-class cross-system correlation key; see docs/plans/server-identity-orbid.md.
+                type: string
               servers:
                 description: Servers is the list of server configurations for this
                   datacenter.
                 items:
-                  description: ServerSpec describes one server's desired configuration
-                    within a ConfigBundle.
+                  description: |-
+                    ServerSpec describes one server's desired configuration within a ConfigBundle.
+
+                    Hostname and OobIP are pointers so SSA partial patches can omit admin-owned
+                    fields (see ADR-007). OrbID is the listMapKey — Orbital's immutable identifier
+                    for this server, stable across hardware swaps and renames.
+                    See docs/plans/server-identity-orbid.md.
                   properties:
                     hostname:
                       description: Hostname is the server's hostname. Mandatory —
                         the bundler skips servers without one.
                       type: string
                     idrac:
-                      description: Idrac holds desired iDRAC configuration.
+                      description: |-
+                        Idrac holds desired iDRAC configuration. Idrac itself is a value type;
+                        its leaf fields are pointers (see IdracSpec).
                       properties:
                         dhcpEnabled:
                           type: boolean
@@ -93,33 +105,32 @@ spec:
                           type: boolean
                         usbManagementPortEnabled:
                           type: boolean
-                      required:
-                      - dhcpEnabled
-                      - ipmiEnabled
-                      - lockdownModeEnabled
-                      - osToIdracPassThroughEnabled
-                      - racadmEnabled
-                      - sshEnabled
-                      - usbManagementPortEnabled
                       type: object
                     oobIP:
                       description: |-
                         OobIP is the out-of-band management (iDRAC) IP address.
                         The ServerConfig controller sends Redfish calls here. Mandatory for actuation.
                       type: string
+                    orbId:
+                      description: |-
+                        OrbID is the immutable Orbital identifier for this server (e.g. "colo:srv-001").
+                        Used as the SSA listMapKey for spec.servers[]. Never changes for the same
+                        physical server, even when serviceTag is re-stamped or hostname renamed.
+                      type: string
                     serviceTag:
                       description: |-
-                        ServiceTag is the Dell hardware service tag (e.g. "3RK3V64").
-                        Identity key within the bundle. Propagated to the child ServerConfig spec.
+                        ServiceTag is the Dell hardware service tag (e.g. "3RK3V64"). Mutable across
+                        board swaps. Propagated to the child ServerConfig spec for operator visibility.
                       type: string
                   required:
                   - hostname
                   - oobIP
+                  - orbId
                   - serviceTag
                   type: object
                 type: array
                 x-kubernetes-list-map-keys:
-                - serviceTag
+                - orbId
                 x-kubernetes-list-type: map
               takeover:
                 description: |-
@@ -139,23 +150,25 @@ spec:
                       type: string
                     orbId:
                       description: |-
-                        OrbID is the Orbital ConfigItem identifier (e.g. "colo:srv-001-idrac").
-                        Informational — the controller does not use this for apply logic.
+                        OrbID is the Orbital ConfigItem identifier of the node that owns the field
+                        (e.g. "colo:srv-001-idrac" for an iDRAC field). Informational — used for
+                        audit and divergence-resolution correlation.
                       type: string
-                    serviceTag:
+                    serverOrbId:
                       description: |-
-                        ServiceTag identifies which server entry the field belongs to.
-                        The bundler resolves this from the orbId→server mapping.
+                        ServerOrbID identifies which server entry the field belongs to (matches
+                        ServerSpec.OrbID, the listMapKey for spec.servers[]).
                       type: string
                   required:
                   - field
                   - orbId
-                  - serviceTag
+                  - serverOrbId
                   type: object
                 type: array
                 x-kubernetes-list-type: atomic
             required:
             - datacenter
+            - orbId
             type: object
           status:
             description: ConfigBundleStatus records the controller's observed state.
@@ -235,6 +248,14 @@ spec:
                   LastOrbImportID is the orb import UUID (X-Orb-Import-ID) from the most recent
                   successful consume dispatch. Used for correlation with orb's import history.
                 type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the .metadata.generation the controller has most
+                  recently reconciled. When equal to .metadata.generation, the controller
+                  has observed the latest spec. Used to distinguish spec-change reconciles
+                  from drift / status-only reconciles in logging.
+                format: int64
+                type: integer
               phase:
                 description: Phase is the current lifecycle phase.
                 enum:

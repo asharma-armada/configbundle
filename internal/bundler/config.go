@@ -9,7 +9,14 @@ type Config struct {
 	Port               string `envconfig:"BUNDLER_PORT"              default:"8020"`
 	OrbitalGraphQLURL  string `envconfig:"ORBITAL_GRAPHQL_URL"       default:"http://localhost:8001/graphql"`
 	OrbitalAPIURL      string `envconfig:"ORBITAL_API_URL"           default:"http://localhost:8001"`
-	OrbitalBearerToken string `envconfig:"ORBITAL_BEARER_TOKEN"     default:""`
+	OrbitalBearerToken string `envconfig:"ORBITAL_BEARER_TOKEN"      default:""`
+
+	// OAuth2 client credentials (Azure AD). Reuses orbital's own OIDC app registration.
+	// Token URL is derived from OIDCIssuerURL; scope is derived from OIDCClientID.
+	// Used when OrbitalBearerToken is empty. See docs/decisions/010-bundler-service-auth.md.
+	OIDCIssuerURL    string `envconfig:"ORBITAL_OIDC_ISSUER_URL"    default:"https://login.microsoftonline.com/8f231c2a-9551-4b40-be17-5b24afe5e890/v2.0"`
+	OIDCClientID     string `envconfig:"ORBITAL_OIDC_CLIENT_ID"     default:"5fc832f6-843e-4207-93dd-b3c3a77c06f2"`
+	OIDCClientSecret string `envconfig:"ORBITAL_OIDC_CLIENT_SECRET" default:""`
 }
 
 func NewConfig() (*Config, error) {

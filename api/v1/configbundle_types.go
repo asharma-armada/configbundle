@@ -23,44 +23,66 @@ import (
 // IdracSpec holds desired iDRAC configuration, sourced from Orbital IdracSettings.
 // All fields are desired state — not observed state. The ServerConfig controller
 // actuates these via Redfish PATCH calls to the OOB IP.
+//
+// All leaf fields are pointers with omitempty so SSA partial patches can omit
+// admin-owned fields. See ADR-007.
 type IdracSpec struct {
 	// FirmwareVersion is the desired iDRAC firmware version (e.g. "7.20.10.05").
 	// Controller reads current version via Redfish GET and upgrades/downgrades to match.
 	// +optional
-	FirmwareVersion string `json:"firmwareVersion,omitempty"`
+	FirmwareVersion *string `json:"firmwareVersion,omitempty"`
 
-	SSHEnabled bool `json:"sshEnabled"`
+	// +optional
+	SSHEnabled *bool `json:"sshEnabled,omitempty"`
 
-	IPMIEnabled bool `json:"ipmiEnabled"`
+	// +optional
+	IPMIEnabled *bool `json:"ipmiEnabled,omitempty"`
 
-	LockdownModeEnabled bool `json:"lockdownModeEnabled"`
+	// +optional
+	LockdownModeEnabled *bool `json:"lockdownModeEnabled,omitempty"`
 
-	OsToIdracPassThroughEnabled bool `json:"osToIdracPassThroughEnabled"`
+	// +optional
+	OsToIdracPassThroughEnabled *bool `json:"osToIdracPassThroughEnabled,omitempty"`
 
-	UsbManagementPortEnabled bool `json:"usbManagementPortEnabled"`
+	// +optional
+	UsbManagementPortEnabled *bool `json:"usbManagementPortEnabled,omitempty"`
 
-	DHCPEnabled bool `json:"dhcpEnabled"`
+	// +optional
+	DHCPEnabled *bool `json:"dhcpEnabled,omitempty"`
 
-	RacadmEnabled bool `json:"racadmEnabled"`
+	// +optional
+	RacadmEnabled *bool `json:"racadmEnabled,omitempty"`
 }
 
 // ServerSpec describes one server's desired configuration within a ConfigBundle.
+//
+// Hostname and OobIP are pointers so SSA partial patches can omit admin-owned
+// fields (see ADR-007). OrbID is the listMapKey — Orbital's immutable identifier
+// for this server, stable across hardware swaps and renames.
+// See docs/plans/server-identity-orbid.md.
 type ServerSpec struct {
-	// ServiceTag is the Dell hardware service tag (e.g. "3RK3V64").
-	// Identity key within the bundle. Propagated to the child ServerConfig spec.
+	// OrbID is the immutable Orbital identifier for this server (e.g. "colo:srv-001").
+	// Used as the SSA listMapKey for spec.servers[]. Never changes for the same
+	// physical server, even when serviceTag is re-stamped or hostname renamed.
+	// +kubebuilder:validation:Required
+	OrbID string `json:"orbId"`
+
+	// ServiceTag is the Dell hardware service tag (e.g. "3RK3V64"). Mutable across
+	// board swaps. Propagated to the child ServerConfig spec for operator visibility.
 	// +kubebuilder:validation:Required
 	ServiceTag string `json:"serviceTag"`
 
 	// Hostname is the server's hostname. Mandatory — the bundler skips servers without one.
 	// +kubebuilder:validation:Required
-	Hostname string `json:"hostname"`
+	Hostname *string `json:"hostname,omitempty"`
 
 	// OobIP is the out-of-band management (iDRAC) IP address.
 	// The ServerConfig controller sends Redfish calls here. Mandatory for actuation.
 	// +kubebuilder:validation:Required
-	OobIP string `json:"oobIP"`
+	OobIP *string `json:"oobIP,omitempty"`
 
-	// Idrac holds desired iDRAC configuration.
+	// Idrac holds desired iDRAC configuration. Idrac itself is a value type;
+	// its leaf fields are pointers (see IdracSpec).
 	// +optional
 	Idrac IdracSpec `json:"idrac,omitempty"`
 }
@@ -69,22 +91,30 @@ type ServerSpec struct {
 // of a specific field from local:admin. The consume handler processes these by
 // running a per-field SSA apply with ForceOwnership after the normal apply pass.
 type TakeoverEntry struct {
-	// OrbID is the Orbital ConfigItem identifier (e.g. "colo:srv-001-idrac").
-	// Informational — the controller does not use this for apply logic.
-	OrbID string `json:"orbId"`
+	// ServerOrbID identifies which server entry the field belongs to (matches
+	// ServerSpec.OrbID, the listMapKey for spec.servers[]).
+	// +kubebuilder:validation:Required
+	ServerOrbID string `json:"serverOrbId"`
 
-	// ServiceTag identifies which server entry the field belongs to.
-	// The bundler resolves this from the orbId→server mapping.
-	ServiceTag string `json:"serviceTag"`
+	// OrbID is the Orbital ConfigItem identifier of the node that owns the field
+	// (e.g. "colo:srv-001-idrac" for an iDRAC field). Informational — used for
+	// audit and divergence-resolution correlation.
+	OrbID string `json:"orbId"`
 
 	// Field is the leaf field name to reclaim (e.g. "sshEnabled").
 	// Must match the JSON tag name on IdracSpec (or ServerSpec for top-level fields).
+	// +kubebuilder:validation:Required
 	Field string `json:"field"`
 }
 
 // ConfigBundleSpec holds the full intended configuration for a datacenter.
 // The ConfigBundle controller decomposes this into domain child CRs via SSA.
 type ConfigBundleSpec struct {
+	// OrbID is the immutable Orbital identifier for this datacenter (e.g. "colo:colo-galleon").
+	// First-class cross-system correlation key; see docs/plans/server-identity-orbid.md.
+	// +kubebuilder:validation:Required
+	OrbID string `json:"orbId"`
+
 	// Datacenter is the identifier of the target datacenter (matches Orbital namespace name).
 	// +kubebuilder:validation:Required
 	Datacenter string `json:"datacenter"`
@@ -92,7 +122,7 @@ type ConfigBundleSpec struct {
 	// Servers is the list of server configurations for this datacenter.
 	// +optional
 	// +listType=map
-	// +listMapKey=serviceTag
+	// +listMapKey=orbId
 	Servers []ServerSpec `json:"servers,omitempty"`
 
 	// Takeover contains force-resolution directives from the cloud admin.
@@ -122,6 +152,13 @@ const (
 
 // ConfigBundleStatus records the controller's observed state.
 type ConfigBundleStatus struct {
+	// ObservedGeneration is the .metadata.generation the controller has most
+	// recently reconciled. When equal to .metadata.generation, the controller
+	// has observed the latest spec. Used to distinguish spec-change reconciles
+	// from drift / status-only reconciles in logging.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
 	// Phase is the current lifecycle phase.
 	// +optional
 	Phase ConfigBundlePhase `json:"phase,omitempty"`

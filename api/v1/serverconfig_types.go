@@ -21,9 +21,19 @@ import (
 )
 
 // ServerConfigSpec mirrors the ServerSpec from ConfigBundle.
-// The ConfigBundle controller creates and updates this CR via SSA.
-// Local admins may override individual fields using field manager "local:<admin-id>".
+// The ConfigBundle controller creates and updates this CR via SSA. ServerConfig
+// is derived state — admin overrides happen on the parent ConfigBundle CR only.
+//
+// Field types match ServerSpec (pointer leaves, see ADR-007) so the parent→child
+// copy is a direct assignment.
 type ServerConfigSpec struct {
+	// OrbID is the immutable Orbital identifier for this server
+	// (mirrors ConfigBundle.spec.servers[].orbId). Carried on the child so
+	// cross-system grep, audit logs, and downstream telemetry can correlate
+	// without a parent round-trip. See docs/plans/server-identity-orbid.md.
+	// +kubebuilder:validation:Required
+	OrbID string `json:"orbId"`
+
 	// ServiceTag is the original-case Dell service tag (e.g. "3RK3V64").
 	// Repeated here (vs. deriving from CR name) so the controller has it without string manipulation.
 	// +kubebuilder:validation:Required
@@ -31,11 +41,11 @@ type ServerConfigSpec struct {
 
 	// Hostname is the server's hostname for display and logging.
 	// +kubebuilder:validation:Required
-	Hostname string `json:"hostname"`
+	Hostname *string `json:"hostname,omitempty"`
 
 	// OobIP is the iDRAC management IP. The ServerConfig controller targets Redfish here.
 	// +kubebuilder:validation:Required
-	OobIP string `json:"oobIP"`
+	OobIP *string `json:"oobIP,omitempty"`
 
 	// Idrac holds desired iDRAC configuration.
 	// +optional
@@ -73,10 +83,10 @@ type ServerConfigStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=sc
 // +kubebuilder:printcolumn:name="ServiceTag",type=string,JSONPath=`.spec.serviceTag`
-// +kubebuilder:printcolumn:name="Hostname",type=string,JSONPath=`.spec.hostname`
-// +kubebuilder:printcolumn:name="OobIP",type=string,JSONPath=`.spec.oobIP`
-// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:printcolumn:name="OrbID",type=string,priority=1,JSONPath=`.spec.orbId`
+// +kubebuilder:printcolumn:name="Hostname",type=string,priority=1,JSONPath=`.spec.hostname`
+// +kubebuilder:printcolumn:name="OOB IP",type=string,priority=1,JSONPath=`.spec.oobIP`
 
 // ServerConfig is a domain child CR owned by a ConfigBundle.
 // Created and updated by the ConfigBundle Controller via SSA (field manager: "configbundle-controller").

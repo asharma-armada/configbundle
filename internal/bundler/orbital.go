@@ -8,19 +8,35 @@ import (
 	"net/http"
 )
 
-// OrbitalQuerier fetches datacenter configuration from Orbital's GraphQL API.
+// OrbitalQuerier fetches datacenter configuration from Orbital's GraphQL API
+// by orbId — DataCenter.orbId is hash-indexed in DGraph and supports exact
+// `eq` filtering. Returns a single-element slice when found, empty when not.
 type OrbitalQuerier interface {
-	QueryDataCenter(ctx context.Context, name string) ([]DataCenterResult, error)
+	QueryDataCenter(ctx context.Context, orbID string) ([]DataCenterResult, error)
 }
 
-// ResolutionQuerier fetches pending force-resolutions from Orbital's REST API.
+// ResolutionQuerier fetches pending takeover and omission resolutions from Orbital.
+// Takeover (accept + force) is one-shot: orbital returns cb_consumed=false rows
+// and expects the bundler to mark them consumed after a successful publish.
+// Omissions (ignore) are persistent: returned on every bundle build until the
+// resolution row is deleted; never marked consumed.
 type ResolutionQuerier interface {
 	QueryPendingForce(ctx context.Context) ([]PendingForceResolution, error)
+	QueryOmissions(ctx context.Context) ([]Omission, error)
 }
 
-// PendingForceResolution is one un-consumed force resolution from Orbital.
+// PendingForceResolution is one un-consumed accept- or reject-resolution from Orbital.
+// The bundler doesn't distinguish action — orbital has already mutated the intent
+// value (for accept) before returning the row, so both shapes look identical here.
 type PendingForceResolution struct {
-	ID    string `json:"id"`
+	OrbID string
+	Field string
+}
+
+// Omission is one ignore-resolution from Orbital. It identifies a (orbId, field)
+// pair that the bundler must remove from the cb-manifest apply config, so the
+// controller releases its claim and the local:<id> manager remains sole owner.
+type Omission struct {
 	OrbID string `json:"orbId"`
 	Field string `json:"field"`
 }
@@ -60,9 +76,22 @@ type IdracSettingsResult struct {
 	RacadmEnabled               bool   `json:"racadmEnabled"`
 }
 
+// divergenceEntry is the wire shape for one item from GET /api/v1/divergences.
+// Only the fields the bundler uses are decoded; the rest are ignored.
+type divergenceEntry struct {
+	EntryOrbID string `json:"entryOrbId"`
+	Field      string `json:"field"`
+	Resolution struct {
+		Action string `json:"action"`
+	} `json:"resolution"`
+}
+
+// configBundleQuery filters by orbId — DataCenter.orbId is
+// @search(by: [hash]) which generates StringHashFilter (supports `eq`).
+// Verified working against the live DGraph schema 2026-06-12.
 const configBundleQuery = `
-query ConfigBundleFields($dc: String!) {
-  queryDataCenter(filter: { name: { eq: $dc } }) {
+query ConfigBundleByOrbID($orbId: String!) {
+  queryDataCenter(filter: { orbId: { eq: $orbId } }) {
     name
     orbId
     servers {
@@ -102,17 +131,17 @@ type graphqlResponse struct {
 }
 
 // HTTPOrbitalClient queries Orbital's GraphQL and REST APIs over HTTP.
+// Auth is handled by the injected HTTPClient transport (OAuth2 or static bearer).
 type HTTPOrbitalClient struct {
-	URL         string // GraphQL endpoint
-	APIURL      string // REST API base (e.g. "http://localhost:8001")
-	BearerToken string
-	HTTPClient  *http.Client
+	URL        string // GraphQL endpoint
+	APIURL     string // REST API base (e.g. "http://localhost:8001")
+	HTTPClient *http.Client
 }
 
-func (c *HTTPOrbitalClient) QueryDataCenter(ctx context.Context, name string) ([]DataCenterResult, error) {
+func (c *HTTPOrbitalClient) QueryDataCenter(ctx context.Context, orbID string) ([]DataCenterResult, error) {
 	body, err := json.Marshal(graphqlRequest{
 		Query:     configBundleQuery,
-		Variables: map[string]any{"dc": name},
+		Variables: map[string]any{"orbId": orbID},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal query: %w", err)
@@ -123,9 +152,6 @@ func (c *HTTPOrbitalClient) QueryDataCenter(ctx context.Context, name string) ([
 		return nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.BearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.BearerToken)
-	}
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -145,17 +171,20 @@ func (c *HTTPOrbitalClient) QueryDataCenter(ctx context.Context, name string) ([
 		return nil, fmt.Errorf("graphql error: %s", gqlResp.Errors[0].Message)
 	}
 
+	// orbId is hash-indexed and unique — filter returns 0 or 1 result.
 	return gqlResp.Data.QueryDataCenter, nil
 }
 
 func (c *HTTPOrbitalClient) QueryPendingForce(ctx context.Context) ([]PendingForceResolution, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.APIURL+"/api/v1/divergence/resolutions/pending-force", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.APIURL+"/api/v1/divergences", nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
-	if c.BearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.BearerToken)
-	}
+	q := req.URL.Query()
+	q.Add("action", "accept")
+	q.Add("action", "reject")
+	q.Set("propagated", "false")
+	req.URL.RawQuery = q.Encode()
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
@@ -167,9 +196,46 @@ func (c *HTTPOrbitalClient) QueryPendingForce(ctx context.Context) ([]PendingFor
 		return nil, fmt.Errorf("pending-force returned status %d", resp.StatusCode)
 	}
 
-	var resolutions []PendingForceResolution
-	if err := json.NewDecoder(resp.Body).Decode(&resolutions); err != nil {
+	var entries []divergenceEntry
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
 		return nil, fmt.Errorf("decode pending-force: %w", err)
 	}
-	return resolutions, nil
+	result := make([]PendingForceResolution, 0, len(entries))
+	for _, e := range entries {
+		result = append(result, PendingForceResolution{OrbID: e.EntryOrbID, Field: e.Field})
+	}
+	return result, nil
+}
+
+// QueryOmissions returns the set of (orbId, field) pairs that orbital has marked
+// for ignore resolution. The bundler must remove these from the cb-manifest apply
+// config on every bundle build (they persist until the resolution row is deleted).
+func (c *HTTPOrbitalClient) QueryOmissions(ctx context.Context) ([]Omission, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.APIURL+"/api/v1/divergences", nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	q := req.URL.Query()
+	q.Set("action", "ignore")
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("query omissions: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("omissions returned status %d", resp.StatusCode)
+	}
+
+	var entries []divergenceEntry
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
+		return nil, fmt.Errorf("decode omissions: %w", err)
+	}
+	result := make([]Omission, 0, len(entries))
+	for _, e := range entries {
+		result = append(result, Omission{OrbID: e.EntryOrbID, Field: e.Field})
+	}
+	return result, nil
 }

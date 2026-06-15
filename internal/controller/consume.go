@@ -12,6 +12,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/yaml"
@@ -27,9 +28,9 @@ const (
 	maxManifestBytes   = 10 * 1024 * 1024 // 10 MB — matches ORBITAL_ENRICHER_MAX_RESPONSE_BYTES
 )
 
-// ConsumeServer is a ctrl.Runnable that exposes POST /consume for orb layer dispatch.
-// Orb calls this endpoint after pulling and cosign-verifying the OCI artifact, passing
-// the raw manifest layer bytes. ConsumeServer validates the payload synchronously and
+// ConsumeServer is a ctrl.Runnable that exposes POST /dispatch for orb layer dispatch.
+// Orb calls this endpoint after pulling and cosign-verifying the OCI artifact, routing
+// layers by Content-Type. ConsumeServer validates the payload synchronously and
 // applies it to the cluster asynchronously.
 type ConsumeServer struct {
 	Client    client.Client
@@ -47,7 +48,7 @@ type ConsumeServer struct {
 // ConsumeServerOption configures a ConsumeServer.
 type ConsumeServerOption func(*ConsumeServer)
 
-// WithPort sets the TCP address the consume server listens on (default ":8080").
+// WithPort sets the TCP address the consume server listens on (default ":8095").
 func WithPort(port string) ConsumeServerOption {
 	return func(s *ConsumeServer) { s.port = port }
 }
@@ -73,7 +74,6 @@ func WithRetry(maxAttempts int, backoffBase time.Duration) ConsumeServerOption {
 	}
 }
 
-// NewConsumeServer returns a ConsumeServer with sensible defaults.
 func NewConsumeServer(c client.Client, opts ...ConsumeServerOption) *ConsumeServer {
 	s := &ConsumeServer{
 		Client:    c,
@@ -89,7 +89,7 @@ func NewConsumeServer(c client.Client, opts ...ConsumeServerOption) *ConsumeServ
 	return s
 }
 
-// NeedsLeaderElection returns false — all replicas serve /consume.
+// NeedsLeaderElection returns false — all replicas serve /dispatch.
 // SSA patches from the same field owner are idempotent; concurrent applies are safe.
 func (s *ConsumeServer) NeedsLeaderElection() bool { return false }
 
@@ -99,7 +99,7 @@ func (s *ConsumeServer) Start(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("consume-server")
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /consume", s.handleConsume)
+	mux.HandleFunc("POST /dispatch", s.handleDispatch)
 	srv := &http.Server{Addr: s.port, Handler: mux}
 
 	go func() {
@@ -116,25 +116,34 @@ func (s *ConsumeServer) Start(ctx context.Context) error {
 	return nil
 }
 
-// handleConsume is the POST /consume handler. Orb calls this after cosign-verifying
-// the artifact and completing its own Dgraph import.
-//
-// Validation (bad payload) is synchronous and returns 4xx — these are caller errors.
-// The K8s apply is asynchronous: the handler returns 200 as soon as the payload is
-// accepted, then applies in the background using the server lifecycle context.
-// Apply failures surface via ConfigBundle CR status conditions and controller logs,
-// not via orb's import history (which is about OCI ingestion, not K8s reconciliation).
-func (s *ConsumeServer) handleConsume(w http.ResponseWriter, r *http.Request) {
-	logger := log.FromContext(r.Context()).WithName("consume")
-
-	if r.Header.Get("Content-Type") != bundle.MediaTypeManifest {
+// handleDispatch is the POST /dispatch handler. Orb calls this for each layer it dispatches,
+// routing by Content-Type. Supported types: manifest (sync validate, async apply) and
+// mapping (sync validate, store in ConfigMap).
+func (s *ConsumeServer) handleDispatch(w http.ResponseWriter, r *http.Request) {
+	ct := r.Header.Get("Content-Type")
+	switch ct {
+	case bundle.MediaTypeManifest:
+		tag := r.Header.Get("X-Orb-Tag")
+		digest := r.Header.Get("X-Orb-Digest")
+		importID := r.Header.Get("X-Orb-Import-ID")
+		s.handleManifestBody(w, r, tag, digest, importID)
+	case bundle.MediaTypeMapping:
+		digest := r.Header.Get("X-Orb-Digest")
+		if digest == "" {
+			http.Error(w, "X-Orb-Digest header required", http.StatusBadRequest)
+			return
+		}
+		s.handleMappingBody(w, r, digest)
+	default:
 		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
-		return
 	}
+}
 
-	tag := r.Header.Get("X-Orb-Tag")
-	digest := r.Header.Get("X-Orb-Digest")
-	importID := r.Header.Get("X-Orb-Import-ID")
+// handleManifestBody processes the manifest layer. Validation is synchronous (bad payload
+// returns 4xx). The K8s apply is asynchronous: the handler returns 200 as soon as the
+// payload is accepted, then applies in the background using the server lifecycle context.
+func (s *ConsumeServer) handleManifestBody(w http.ResponseWriter, r *http.Request, tag, digest, importID string) {
+	logger := log.FromContext(r.Context()).WithName("consume")
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxManifestBytes+1))
 	if err != nil {
@@ -169,11 +178,84 @@ func (s *ConsumeServer) handleConsume(w http.ResponseWriter, r *http.Request) {
 	// Apply asynchronously — K8s apply latency must not block orb's import pipeline.
 	go func() {
 		if err := apply(s.ctx, body, digest, importID); err != nil {
-			logger.Error(err, "async apply failed", "importID", importID)
+			logger.Error(err, "async apply failed", "importID", importID, "digest", digest)
+			return
 		}
+		logger.Info("async apply succeeded", "importID", importID, "digest", digest)
 	}()
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleMappingBody processes the mapping layer from orb's dispatch pipeline.
+// It validates the mapping, finds the ConfigBundle with the matching digest, and
+// writes the mapping to a ConfigMap owned by that CR.
+func (s *ConsumeServer) handleMappingBody(w http.ResponseWriter, r *http.Request, digest string) {
+	logger := log.FromContext(r.Context()).WithName("mapping")
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxManifestBytes+1))
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(body) > maxManifestBytes {
+		http.Error(w, "mapping exceeds max size", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	if _, err := ParseMapping(body); err != nil {
+		http.Error(w, "invalid mapping: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Find the ConfigBundle whose LastAppliedDigest matches the provided digest.
+	var cbList armadav1.ConfigBundleList
+	if err := s.Client.List(r.Context(), &cbList, client.InNamespace(s.namespace)); err != nil {
+		http.Error(w, "list ConfigBundles: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var cb *armadav1.ConfigBundle
+	for i := range cbList.Items {
+		if cbList.Items[i].Status.LastAppliedDigest == digest {
+			cb = &cbList.Items[i]
+			break
+		}
+	}
+	if cb == nil {
+		http.Error(w, "ConfigBundle not found for digest; manifest may not have been applied yet", http.StatusConflict)
+		return
+	}
+
+	ownerRef := metav1.OwnerReference{
+		APIVersion:         armadav1.GroupVersion.String(),
+		Kind:               "ConfigBundle",
+		Name:               cb.Name,
+		UID:                cb.UID,
+		Controller:         ptr.To(true),
+		BlockOwnerDeletion: ptr.To(true),
+	}
+
+	if err := writeMappingConfigMap(r.Context(), s.Client, s.namespace, cb.Name, digest, body, ownerRef); err != nil {
+		http.Error(w, "write mapping ConfigMap: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	logger.Info("stored mapping", "digest", digest, "configbundle", cb.Name)
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleConsume is kept as an alias for handleManifestBody to support direct
+// method calls in existing unit tests. It extracts the headers and delegates.
+func (s *ConsumeServer) handleConsume(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Content-Type") != bundle.MediaTypeManifest {
+		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
+		return
+	}
+	tag := r.Header.Get("X-Orb-Tag")
+	digest := r.Header.Get("X-Orb-Digest")
+	importID := r.Header.Get("X-Orb-Import-ID")
+	s.handleManifestBody(w, r, tag, digest, importID)
 }
 
 // applyManifest parses the manifest bytes, runs the admin-override-aware SSA pipeline,
@@ -197,9 +279,18 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 		return fmt.Errorf("get ConfigBundle: %w", err)
 	}
 
-	// Omit server entries owned by local:admin to avoid SSA 409 conflicts.
-	// With +listType=map, ownership is per-entry by serviceTag.
-	patchSpec := omitAdminOwnedServers(spec, cb.ManagedFields)
+	// Flag any spec writer that doesn't follow the local:<id> convention.
+	// They're silently dropped by omitAdminOwnedFields below; the warning
+	// makes the silent drop visible at the runtime where the bug bites.
+	warnNonConformingManagers(log.FromContext(ctx).WithName("consume"), spec.Datacenter, cb.ManagedFields)
+
+	// Omit leaf fields owned by any local:<id> manager to avoid SSA 409 conflicts.
+	// Granularity is per-leaf: a single overridden field does not exempt the
+	// rest of the server from controller updates. See ADR-007.
+	patchSpec, err := omitAdminOwnedFields(spec, cb.ManagedFields)
+	if err != nil {
+		return fmt.Errorf("compute admin-omitted patch: %w", err)
+	}
 
 	apply := &armadav1.ConfigBundle{
 		TypeMeta: metav1.TypeMeta{
@@ -210,7 +301,7 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 			Name:      spec.Datacenter,
 			Namespace: s.namespace,
 		},
-		Spec: patchSpec,
+		Spec: *patchSpec,
 	}
 
 	// Retry with exponential backoff on transient K8s API errors.
@@ -233,7 +324,10 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 	}
 	// Takeover pass — runs regardless of whether the normal apply succeeded (ADR-006).
 	// Force-conflicts reclaims ownership of specific fields from local:admin.
-	takeoverErr := s.processTakeover(ctx, spec)
+	// The takeover apply re-sends the same patchSpec plus the takeover target
+	// leaves; ForceOwnership only effectively claims the takeover targets
+	// (everything else is already controller-owned and not in conflict).
+	takeoverErr := s.processTakeover(ctx, spec, patchSpec)
 
 	if lastErr != nil && takeoverErr != nil {
 		return fmt.Errorf("apply failed: %w; takeover also failed: %v", lastErr, takeoverErr)
@@ -250,15 +344,20 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 		s.reporter.SetLastManifest(spec.Datacenter, spec)
 	}
 
-	// After client.Apply, controller-runtime deserialises the full server response back
-	// into apply — giving us the current ResourceVersion and existing Status without a
-	// second round-trip. A re-fetch via the cached client would race on first-create.
+	// After client.Apply, controller-runtime deserialises the server response back
+	// into apply — giving us the current ResourceVersion and existing Status without
+	// a second round-trip.
 	now := metav1.Now()
 	apply.Status.LastAppliedDigest = digest
 	apply.Status.LastOrbImportID = importID
 	apply.Status.LastAppliedAt = &now
-	setCondition(&apply.Status.Conditions, armadav1.ConditionReconciled,
+	prev := setCondition(&apply.Status.Conditions, armadav1.ConditionReconciled,
 		metav1.ConditionTrue, "Reconciled", "manifest applied via orb dispatch")
+	if prev != metav1.ConditionTrue {
+		log.FromContext(ctx).WithName("consume").Info("condition transitioned",
+			"type", armadav1.ConditionReconciled, "from", prev, "to", metav1.ConditionTrue,
+			"reason", "Reconciled")
+	}
 
 	if err := s.Client.Status().Update(ctx, apply); err != nil {
 		return fmt.Errorf("update ConfigBundle status: %w", err)
@@ -276,71 +375,152 @@ func parseManifest(data []byte) (armadav1.ConfigBundleSpec, error) {
 	return spec, nil
 }
 
-// omitAdminOwnedServers returns a copy of spec with server entries removed if
-// local:admin owns any field within that entry. Omitting the entire entry is safe:
-// it preserves the admin's full intent and avoids a 409 partial-apply conflict.
-func omitAdminOwnedServers(spec armadav1.ConfigBundleSpec, managedFields []metav1.ManagedFieldsEntry) armadav1.ConfigBundleSpec {
-	owned := adminOwnedServiceTags(managedFields)
-	if len(owned) == 0 {
-		return spec
-	}
-	filtered := make([]armadav1.ServerSpec, 0, len(spec.Servers))
-	for _, s := range spec.Servers {
-		if !owned[s.ServiceTag] {
-			filtered = append(filtered, s)
-		}
-	}
-	spec.Servers = filtered
-	return spec
-}
-
-// adminOwnedServiceTags parses managedFields and returns the set of serviceTag values
-// for server entries that local:admin owns (at any field depth).
+// omitAdminOwnedFields returns a typed ConfigBundleSpec with all leaf fields
+// owned by local:admin removed. The result is the SSA-safe patch the controller
+// can apply with field manager "configbundle-controller" without 409-conflicting
+// on admin-owned fields.
 //
-// With +listType=map +listMapKey=serviceTag, the Kubernetes API encodes per-entry
-// ownership in fieldsV1 as:
+// Granularity is per-leaf, not per-server entry: if admin owns one iDRAC field
+// on a server, the controller still updates that server's hostname/oobIP and the
+// other iDRAC fields. Only the specific leaves admin owns are excluded.
 //
-//	{"f:spec": {"f:servers": {"k:{\"serviceTag\":\"3RK3V64\"}": {...}}}}
-func adminOwnedServiceTags(managedFields []metav1.ManagedFieldsEntry) map[string]bool {
-	owned := map[string]bool{}
+// Mechanism: round-trip spec → JSON map → delete admin-owned paths → JSON →
+// typed spec. Because all leaf fields in IdracSpec/ServerSpec are *bool/*string
+// with omitempty (ADR-007), deleted leaves decode as nil and are absent from
+// the serialized SSA apply.
+func omitAdminOwnedFields(spec armadav1.ConfigBundleSpec, managedFields []metav1.ManagedFieldsEntry) (*armadav1.ConfigBundleSpec, error) {
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		return nil, fmt.Errorf("marshal spec: %w", err)
+	}
+	var specMap map[string]any
+	if err := json.Unmarshal(raw, &specMap); err != nil {
+		return nil, fmt.Errorf("unmarshal spec: %w", err)
+	}
 	for _, entry := range managedFields {
-		if entry.Manager != "local:admin" || entry.FieldsV1 == nil {
+		// Match any "local:<id>" field manager — per-person identities, not just "local:admin".
+		if !strings.HasPrefix(entry.Manager, "local:") || entry.FieldsV1 == nil {
 			continue
 		}
-		var fields map[string]interface{}
+		var fields map[string]any
 		if err := json.Unmarshal(entry.FieldsV1.Raw, &fields); err != nil {
 			continue
 		}
-		specFields, _ := fields["f:spec"].(map[string]interface{})
-		serverFields, _ := specFields["f:servers"].(map[string]interface{})
-		for key := range serverFields {
-			if !strings.HasPrefix(key, "k:{") {
-				continue
-			}
-			var keyMap struct {
-				ServiceTag string `json:"serviceTag"`
-			}
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(key, "k:")), &keyMap); err != nil {
-				continue
-			}
-			if keyMap.ServiceTag != "" {
-				owned[keyMap.ServiceTag] = true
-			}
+		// FieldsV1 root holds {"f:spec": {...}}; descend into the spec subtree.
+		specOwned, _ := fields["f:spec"].(map[string]any)
+		if specOwned != nil {
+			deleteOwnedPaths(specMap, specOwned)
 		}
 	}
-	return owned
+	filtered, err := json.Marshal(specMap)
+	if err != nil {
+		return nil, fmt.Errorf("marshal filtered spec: %w", err)
+	}
+	var result armadav1.ConfigBundleSpec
+	if err := json.Unmarshal(filtered, &result); err != nil {
+		return nil, fmt.Errorf("unmarshal filtered spec: %w", err)
+	}
+	return &result, nil
 }
 
-// setCondition upserts a metav1.Condition on the conditions slice.
-func setCondition(conditions *[]metav1.Condition, condType string, status metav1.ConditionStatus, reason, message string) {
+// deleteOwnedPaths walks an SSA FieldsV1 subtree and deletes corresponding
+// leaves from target (a decoded spec subtree). FieldsV1 encoding rules:
+//   - "f:fieldName": {}     → admin owns the entire field; delete target[fieldName]
+//   - "f:fieldName": {...}  → admin owns leaves within; recurse
+//   - "k:{...}" keys appear only under an "f:listField" parent (handled below)
+func deleteOwnedPaths(target map[string]any, owned map[string]any) {
+	for ownedKey, ownedVal := range owned {
+		if !strings.HasPrefix(ownedKey, "f:") {
+			continue
+		}
+		field := strings.TrimPrefix(ownedKey, "f:")
+		ownedSubtree, _ := ownedVal.(map[string]any)
+		if len(ownedSubtree) == 0 {
+			delete(target, field)
+			continue
+		}
+		switch tv := target[field].(type) {
+		case map[string]any:
+			deleteOwnedPaths(tv, ownedSubtree)
+		case []any:
+			target[field] = filterOwnedFromList(tv, ownedSubtree)
+		}
+	}
+}
+
+// filterOwnedFromList applies admin-owned deletions inside a list field whose
+// SSA strategy is listType=map. owned holds "k:{...}" entries identifying the
+// list elements admin claims. For entries admin owns entirely (empty subtree),
+// the element is dropped from the returned slice; for partial ownership, the
+// element is kept with admin-owned leaves deleted.
+func filterOwnedFromList(target []any, owned map[string]any) []any {
+	out := make([]any, 0, len(target))
+	for _, item := range target {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			out = append(out, item)
+			continue
+		}
+		drop := false
+		for ownedKey, ownedVal := range owned {
+			if !strings.HasPrefix(ownedKey, "k:") {
+				continue
+			}
+			var keyMap map[string]any
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(ownedKey, "k:")), &keyMap); err != nil {
+				continue
+			}
+			if !entryMatchesListKey(entry, keyMap) {
+				continue
+			}
+			ownedSubtree, _ := ownedVal.(map[string]any)
+			if len(ownedSubtree) == 0 {
+				drop = true
+				break
+			}
+			deleteOwnedPaths(entry, ownedSubtree)
+			// Restore listMapKey fields. Admin co-owns the key (SSA always claims
+			// it on the apply), but the entry must still carry its key to remain
+			// a valid associative-list element.
+			for k, v := range keyMap {
+				entry[k] = v
+			}
+			break
+		}
+		if !drop {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+func entryMatchesListKey(entry map[string]any, keyMap map[string]any) bool {
+	for k, v := range keyMap {
+		if entry[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// setCondition upserts a metav1.Condition and returns the previous Status
+// (empty string if the condition did not exist). Callers can compare the
+// returned value to detect transitions for logging.
+//
+// LastTransitionTime is updated only when Status actually changes, per the
+// metav1.Condition contract.
+func setCondition(conditions *[]metav1.Condition, condType string, status metav1.ConditionStatus, reason, message string) metav1.ConditionStatus {
 	now := metav1.Now()
 	for i, c := range *conditions {
 		if c.Type == condType {
-			(*conditions)[i].Status = status
+			prev := c.Status
 			(*conditions)[i].Reason = reason
 			(*conditions)[i].Message = message
-			(*conditions)[i].LastTransitionTime = now
-			return
+			if prev != status {
+				(*conditions)[i].Status = status
+				(*conditions)[i].LastTransitionTime = now
+			}
+			return prev
 		}
 	}
 	*conditions = append(*conditions, metav1.Condition{
@@ -350,4 +530,5 @@ func setCondition(conditions *[]metav1.Condition, condType string, status metav1
 		Message:            message,
 		LastTransitionTime: now,
 	})
+	return ""
 }

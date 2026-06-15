@@ -102,6 +102,13 @@ var _ = BeforeSuite(func() {
 	}).SetupWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 
+	reporter := NewDivergenceReporter(mgr.GetClient(),
+		WithDivergenceEnabled(true),
+		WithDivergenceDebounce(50*time.Millisecond), // fast for tests
+	)
+	err = reporter.SetupWithManager(mgr)
+	Expect(err).NotTo(HaveOccurred())
+
 	go func() {
 		defer GinkgoRecover()
 		Expect(mgr.Start(ctx)).To(Succeed())

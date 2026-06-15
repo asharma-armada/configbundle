@@ -23,17 +23,20 @@ Build the **Divergence Reporter** as a scheduled `ctrl.Runnable` in the configbu
 
 CB Controller is the producer of K8s-path data; orb is the translator and relay. CB Controller does NOT translate to `orbId`+`field`, does NOT write to S3, does NOT hold cloud credentials. The full edge↔cloud transport — including the K8s-path → orbital translation — is orb's responsibility.
 
-## The intake payload (replace-not-merge, full set every POST)
+## The intake payload — orbital-native, replace-not-merge
+
+cb-controller translates K8s paths locally before POSTing. The payload speaks orbital-native vocabulary only (`orbId`, `field`, `type`); no configbundle concepts cross orb's API boundary. See [`docs/reference/DIVERGENCE-INTAKE.md`](../reference/DIVERGENCE-INTAKE.md) for the canonical intake contract.
 
 ```http
 POST http://orb:8010/api/v1/divergence
 Content-Type: application/json
 
 {
-  "bundleDigest": "sha256:abc123...",
   "overrides": [
     {
-      "path":          "spec.servers[serviceTag=3RK3V64].idrac.sshEnabled",
+      "orbId":         "colo:srv-001-idrac",
+      "field":         "sshEnabled",
+      "type":          "IdracSettings",
       "intendedValue": false,
       "overrideValue": true,
       "who":           "local:admin",
@@ -43,30 +46,29 @@ Content-Type: application/json
 }
 ```
 
-| Field | Source | Notes |
+| Field | Source (cb-controller side) | Notes |
 |---|---|---|
-| `bundleDigest` | cb-controller's `status.lastAppliedDigest` | Tells orb which mapping artifact to use for translation. |
-| `path` | parsed from `managedFields` entry owned by `local:admin` | Stable K8s field-path form (uses `serviceTag` as the list map key for `servers[]`). Orb walks this against the mapping to derive `orbId` + `field`. |
-| `intendedValue` | read from the manifest YAML cb-controller last applied | NOT from a live cluster read or orbital query. The intent value frozen at the bundle cb-controller is reporting against — survives orb importing a newer bundle while cb-controller still applies an older one. |
+| `orbId` | local mapping lookup: `path → orbId` | cb-controller stores the mapping from the bundle; resolves at report-time. |
+| `field` | local mapping lookup: `path → field` | The leaf field name on the orbital ConfigItem. |
+| `type` | local mapping lookup: `path → type` | Orbital GraphQL type name; orbital uses this to dispatch `update{Type}` on Accept. |
+| `intendedValue` | read from the manifest YAML cb-controller last applied | NOT from a live cluster read or an orbital query. The intent frozen at the bundle cb-controller is reporting against — survives orb importing a newer bundle while cb-controller still applies an older one. |
 | `overrideValue` | CR's current value at the path | What admin set locally. |
 | `who` | always `local:admin` for MVP | Single fixed string per configbundle settled decision. |
-| `when` | the time the field's ownership first transitioned to `local:admin` | Stable across reports. See "open items" below — `managedFields[].time` is updated on every re-apply by the manager; cb-controller may need a sidecar tracking annotation to preserve true first-seen. |
-
-### Empty array = no divergence
-
-`overrides: []` is valid and means "no local overrides currently." Orb publishes a snapshot with empty `overrides`, orbital interprets that as "all divergence resolved for this DC."
+| `when` | first observed time for the override | See open items — `managedFields[].time` updates on every re-apply by the manager, so cb-controller likely needs an annotation to preserve true first-seen. |
 
 ### Replace-not-merge
 
-Every POST is the **full current divergence set**. orb intake replaces, not merges. If a field is no longer owned by `local:admin` (ownership released), it MUST disappear from the next POST — that's how orb (and orbital) learn the divergence is resolved.
+Every POST is the **full current divergence set**. orb's intake replaces, not merges. If a field is no longer owned by `local:admin` (ownership released), cb-controller MUST omit it from the next POST — that's how orb (and orbital) learn the divergence is resolved.
 
 ### Empty array = no divergence
 
-`POST []` is valid and signals "currently no fields locally owned." Orbital interprets a snapshot with `overrides: []` as "all divergence resolved for this DC."
+`{"overrides": []}` is valid and means "no local overrides currently." Orb publishes a snapshot with empty entries; orbital interprets that as "all divergence resolved for this DC."
 
 ## How K8s field paths get translated to orbital orbId + field
 
-**Settled — option D2: orb hosts the mapping; cb-controller stays out of the translation.**
+**Settled — cb-controller owns the translation. Orb is a pipe.**
+
+This reverses an earlier draft of this contract. See `~/.claude/projects/-Users-daniel-armada-orbital/memory/feedback_orb_orbital_agnostic_of_configbundle.md` for the principle: orb and orbital are configbundle-agnostic; translation between producer-native and orbital-native lives in the producer ecosystem. See also [`docs/reference/DIVERGENCE-INTAKE.md`](../reference/DIVERGENCE-INTAKE.md) for orb's intake contract.
 
 ### What cb-bundler must do (cloud side, build time)
 
@@ -76,7 +78,7 @@ When producing a ConfigBundle artifact, cb-bundler creates a **new OCI layer** i
 |---|---|---|
 | `mapping.json` | `application/vnd.armada.configbundle.mapping.v1+json` | Path → orbId map for this bundle |
 
-The mapping is generated from orbital's data — cb-bundler already queries orbital GraphQL when building the bundle, so it knows each ConfigItem's `orbId`. It serializes that knowledge into the layer.
+The mapping is generated from orbital's data — cb-bundler already queries orbital GraphQL when building the bundle, so it knows each ConfigItem's `orbId` and orbital GraphQL `type`. It serializes that knowledge into the layer.
 
 Mapping content — **flat list of `{path, orbId, type}` entries**:
 
@@ -93,13 +95,11 @@ Mapping content — **flat list of `{path, orbId, type}` entries**:
 
 ### `type` field
 
-Each item carries the **orbital GraphQL type name** of the node identified by `orbId` (e.g. `Server`, `IdracSettings`, `DataCenter`). cb-bundler already has this — it knows the CRD type → orbital type mapping when building the bundle. The mapping ships this type alongside the orbId so orbital can dispatch `update{Type}(...)` mutations when a cloud admin clicks **Accept** on a divergence row (see `divergence-accept-mutation.md`).
-
-Without `type`, orbital cannot auto-mutate intent on Accept and falls back to a manual flow. cb-bundler MUST emit it.
+Each item carries the **orbital GraphQL type name** of the node identified by `orbId` (e.g. `Server`, `IdracSettings`, `DataCenter`). cb-controller emits this in every divergence-report entry so orbital can dispatch `update{Type}(...)` mutations on Accept (see `divergence-accept-mutation.md`).
 
 ### Why flat-list, not nested
 
-Nested formats (`servers: {serviceTag: {...}}`) hard-code each domain's `+listMapKey` field name into orb's parser. Every new CRD list (`clusters[]`, `applications[]`, …) would require orb code changes. The flat list keeps orb's parser **domain-agnostic** — it only does string prefix matching, never inspects the path internals.
+Nested formats (`servers: {serviceTag: {...}}`) hard-code each domain's `+listMapKey` field name into the resolver. The flat-list form keeps cb-controller's resolver decoupled from CRD shape — it only does string prefix matching, never inspects the path internals. Each new CRD list (`clusters[]`, `applications[]`, …) requires no resolver change.
 
 ### Path format convention
 
@@ -115,57 +115,55 @@ Format rules:
 - Quotes only on the value if it contains characters that need escaping; raw otherwise
 - Path produced by cb-controller from `managedFields` MUST be byte-equal to the path produced by cb-bundler from CRD schema knowledge
 
-This is the only convention spanning cb-bundler ↔ cb-controller. Both binaries are in the same repo, so enforcing it is local. orb depends only on prefix-matchability — it doesn't parse internals.
+This is a configbundle-internal convention — both binaries are in the same repo, so enforcing consistency is local. Orb never sees these paths; it only sees the orbital-native entries cb-controller posts.
 
-### Lookup algorithm (orb's intake)
+### Lookup algorithm (cb-controller's resolver)
 
-Given incoming `path = "spec.servers[serviceTag=3RK3V64].idrac.sshEnabled"`:
+Given an observed K8s field path `spec.servers[serviceTag=3RK3V64].idrac.sshEnabled`:
 
 ```
 matched := ""
-for each item in mapping.items:
+for each item in localMapping.items:
     if path starts with item.path AND len(item.path) > len(matched):
         matched = item.path
         matchedOrbId = item.orbId
+        matchedType  = item.type
 if matched is empty:
-    error: no mapping prefix matches path
+    log warn (no prefix match); skip this entry — do not include in report
 field = path[len(matched)+1:]  // strip the matched prefix + '.'
-emit { orbId: matchedOrbId, field: field }
+emit { orbId: matchedOrbId, field: field, type: matchedType }
 ```
 
-For each new ConfigBundle domain configbundle adds (cluster, application, network, …), cb-bundler emits the appropriate path entries and orb requires NO code change.
+Longest-prefix wins. cb-controller maintains the mapping locally; the lookup is in-process.
 
 ### What orb does (edge side, when bundle arrives)
 
 1. Pulls bundle from Zot (existing flow)
-2. Importer recognizes the mapping-layer media type, **stores under `DataDir/mappings/<bundle-digest>.json`** (rather than dispatching it to a consumer like the manifest layer)
+2. **Dispatcher routes the mapping layer to cb-controller** — same generic mechanism as the manifest layer. cb-controller registers as the consumer for the mapping media type via `ORB_CONSUMERS`.
 3. Graph layers (`data.json.gz`, `schema.gz`) imported to DGraph as today
 4. Manifest layer dispatched to cb-controller as today
-5. Old mappings pruned alongside old bundle artifacts
+
+Orb has **no special case** for the mapping layer. It's just another media type with a registered consumer.
+
+### What cb-controller does (edge side, mapping receipt)
+
+1. Receives the mapping layer via its registered HTTP endpoint (e.g. `POST /mapping` with `X-Orb-Digest` header)
+2. Stores it locally keyed by bundle digest — disk, ConfigMap, or in-memory; cb-controller's choice
+3. Uses it during the next divergence report tick to resolve paths
 
 ### What orb does (intake time, when cb-controller POSTs)
 
 On `POST /api/v1/divergence`:
 
-1. Parse the payload (see schema above)
-2. Load `DataDir/mappings/<bundleDigest>.json`
-3. For each `override` entry:
-   - Walk `path` against the mapping → resolve to `orbId` + leaf `field`
-4. Build canonical entries: `{orbId, field, intendedValue, overrideValue, who, when}`
-5. Save to `DataDir/divergence/current.json` (replace, not merge)
-6. Return 200 with count of entries stored
+1. Validate JSON shape and required fields (`orbId`, `field`, `type`, `intendedValue`, `overrideValue`, `who`, `when`)
+2. Replace the stored set with the new entries
+3. Return 200 with `{"stored": N}`
 
-If `bundleDigest` doesn't match any stored mapping: return **422 Unprocessable Entity** with `{error: "unknown bundleDigest", digest: "..."}`. cb-controller logs, skips this report, retries next tick.
-
-### Why cb-controller can't (and shouldn't) do the translation
-
-- Mapping format is orb-internal — keeping it on the orb side means it can evolve without coordinating with cb-controller's release
-- cb-controller stays small: it knows K8s, doesn't need to know orbital's identifier scheme
-- One side of the boundary owns the translation; one side owns the K8s state. Clear split.
+That's it. No mapping lookup, no path resolution, no bundle awareness. See [`DIVERGENCE-INTAKE.md`](../reference/DIVERGENCE-INTAKE.md).
 
 ### What if K8s field name ≠ orbital field name?
 
-Today they match — IdracSpec fields are named identically to IdracSettings fields. The leaf segment of the K8s path is the orbital field name. If they ever diverge, the mapping JSON can carry per-leaf name overrides; cb-controller's logic doesn't change (still sends paths).
+Today they match — IdracSpec fields are named identically to IdracSettings fields. The leaf segment of the K8s path is the orbital field name. If they ever diverge, the mapping JSON can carry per-leaf name overrides; the resolver handles them locally in cb-controller, and orb is unaffected (it only sees the post-translation entries).
 
 ## Resolution semantics — what cb-controller must do for the three cloud admin actions
 
@@ -190,7 +188,40 @@ spec:
 
 **cb-controller behavior:** when processing a new bundle that includes a `spec.takeover[]` list, for each entry it executes a separate apply with `--force-conflicts` scoped to just that field path. The local manager loses ownership. After the apply, the field is owned by `config-bundle-controller` again.
 
+### Why one apply per takeover entry (not whole-manifest)
+
+K8s SSA's `force` flag operates per-request on the apply body submitted — there is **no per-field force inside a single apply call**. Submitting one combined manifest with `force: true` would force ALL conflicts on every field in that manifest, which is not what we want — we only want to wrest ownership of the specific fields the cloud admin chose to force.
+
+The pattern below achieves de-facto per-field force semantics:
+
+1. Apply the bundle's regular config WITHOUT `force` — cb-controller-owned fields update; `local:admin`-owned fields stay put on conflict.
+2. For each `spec.takeover[]` entry, submit a **dedicated apply manifest containing only that single field**, with `force: true`:
+   ```yaml
+   apiVersion: armada.io/v1
+   kind: IdracSettings
+   metadata:
+     name: srv-001-idrac
+   spec:
+     sshEnabled: true
+   ```
+3. That narrow apply takes ownership of just `sshEnabled` away from `local:admin`. Other `local:admin`-owned fields on the same object are not touched because they're not in the apply body.
+
+**Critical:** the takeover apply MUST use the same `fieldManager` string as the bundle's normal apply (e.g., `cb-controller`). If it uses a different name, `local:admin` loses ownership but the bundle's normal apply still doesn't own the field — so the next reconcile produces a fresh conflict on a now-unowned field, which is a worse state. Both applies (normal + takeover) must claim the same manager.
+
+Cost: N+1 API calls per bundle when there are N takeovers. Fine at our scale.
+
 cb-bundler calls orbital's `POST /api/v1/divergence/resolutions/:id/consumed` after the bundle is pushed.
+
+### Why we do NOT use SSA shared management (conflict resolution option 3)
+
+K8s SSA offers three conflict resolutions: (1) overwrite + become sole manager (`--force-conflicts`), (2) drop the field from your manifest + give up the claim, (3) match the server's current value + become a **shared** manager (both managers appear in `managedFields` for that field).
+
+We use (1) for Force and (2) for Ignore. **We never use (3).** Reasons:
+
+- **Shared management does not enable writes.** It's a declarative co-existence state — both managers agree on the current value. The next time either tries to change it, the conflict re-fires. It doesn't unblock mutation; it only signals "I also care about this field."
+- **Our ownership model is single-owner with explicit handoff.** At any moment exactly one side is canonical: Accept → cb-controller (with new value); Force → cb-controller (reclaimed); Ignore → `local:admin` (cb-controller drops the field). Co-ownership would muddy "who really set this?" in the audit trail.
+- **Divergence detection does not need it.** cb-controller observes admin-owned fields by reading `managedFields` regardless of whether cb-controller co-owns them. The observation pipeline is independent of the apply pipeline.
+- **K8s designed option 3 for peer-equal controllers** (e.g. HPA + custom autoscaler both legitimately managing `spec.replicas`). Our model is hierarchical — orbital intent is canonical; local override is an exception to be resolved — not peer-equal. If we ever reach for option 3, it's a signal we've drifted from the divergence-resolution model and should flag.
 
 ### Ignore
 

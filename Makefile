@@ -2,8 +2,10 @@
 # Controller: controller/v* tags. Bundler: bundler/v* tags.
 # Tag with: git tag controller/v0.1.0  or  git tag bundler/v0.0.2
 ACR                := armadaeksatest.azurecr.io
+MODULE             := github.com/armada/configbundle
 CONTROLLER_VERSION := $(shell (git describe --tags --match 'controller/v*' --dirty 2>/dev/null || echo "controller/v0.0.0-dev") | sed 's|^controller/||')
 BUNDLER_VERSION    := $(shell (git describe --tags --match 'bundler/v*' --dirty 2>/dev/null || echo "bundler/v0.0.0-dev") | sed 's|^bundler/||')
+BUNDLER_LDFLAGS    := -ldflags "-X $(MODULE)/internal/version.Version=$(BUNDLER_VERSION)"
 
 # Image URLs
 IMG         ?= $(ACR)/configbundle-controller:$(CONTROLLER_VERSION)
@@ -127,7 +129,7 @@ build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
 .PHONY: up
-up: ## Start minikube and install CRDs — ready for 'make run'.
+up: ## Start minikube and install CRDs — ready for 'make run-controller'.
 	@minikube status >/dev/null 2>&1 || minikube start
 	@$(MAKE) install
 	@echo ""
@@ -148,7 +150,7 @@ run-controller: ## Run the controller from your host (set NAMESPACE=default for 
 
 .PHONY: run-bundler
 run-bundler: ## Run the bundler service locally (BUNDLER_PORT=8020, ORBITAL_GRAPHQL_URL=http://localhost:8001/graphql).
-	go run ./cmd/bundler/main.go
+	go run $(BUNDLER_LDFLAGS) ./cmd/bundler/main.go
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
@@ -161,7 +163,9 @@ docker-build-controller: ## Build and push controller image (requires: az acr lo
 .PHONY: docker-build-bundler
 docker-build-bundler: ## Build and push bundler image (requires: az acr login --name armadaeksatest).
 	@echo "Building $(BUNDLER_IMG)"
-	docker buildx build --platform linux/amd64 --target bundler -t $(BUNDLER_IMG) --push .
+	docker buildx build --platform linux/amd64 --target bundler \
+		--build-arg BUNDLER_VERSION=$(BUNDLER_VERSION) \
+		-t $(BUNDLER_IMG) --push .
 
 .PHONY: version
 version: ## Show current versions for both components.

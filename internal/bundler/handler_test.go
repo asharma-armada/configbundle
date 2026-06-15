@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"sigs.k8s.io/yaml"
@@ -52,7 +53,7 @@ func TestHandleBundle_EmptyDatacenter(t *testing.T) {
 func TestHandleBundle_GraphQLError(t *testing.T) {
 	h := &Handler{Orbital: &fakeQuerier{err: fmt.Errorf("connection refused")}}
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, newRequest(`{"datacenter":"colo"}`))
+	h.ServeHTTP(w, newRequest(`{"orbId":"colo:colo"}`))
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d", w.Code)
 	}
@@ -61,7 +62,7 @@ func TestHandleBundle_GraphQLError(t *testing.T) {
 func TestHandleBundle_DatacenterNotFound(t *testing.T) {
 	h := &Handler{Orbital: &fakeQuerier{results: nil}}
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, newRequest(`{"datacenter":"colo"}`))
+	h.ServeHTTP(w, newRequest(`{"orbId":"colo:colo"}`))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
@@ -82,12 +83,15 @@ func decodeResponse(t *testing.T, w *httptest.ResponseRecorder) bundleResponse {
 
 func TestHandleBundle_Success(t *testing.T) {
 	h := &Handler{Orbital: &fakeQuerier{results: []DataCenterResult{{
-		Name: "colo",
+		Name:  "colo",
+		OrbID: "colo:colo-galleon",
 		Servers: []ServerResult{{
 			Hostname:   "colo-r740-01",
 			ServiceTag: "3RK3V64",
+			OrbID:      "colo:srv-001",
 			OobIP:      &IPAddressResult{Address: "10.10.1.45"},
 			IdracSettings: &IdracSettingsResult{
+				OrbID:           "colo:srv-001-idrac",
 				FirmwareVersion: "7.20.10.05",
 				SSHEnabled:      true,
 				IPMIEnabled:     false,
@@ -97,7 +101,7 @@ func TestHandleBundle_Success(t *testing.T) {
 	}}}}
 
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, newRequest(`{"datacenter":"colo"}`))
+	h.ServeHTTP(w, newRequest(`{"orbId":"colo:colo"}`))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
@@ -130,26 +134,23 @@ func TestHandleBundle_Success(t *testing.T) {
 		t.Fatalf("servers: got %d", len(spec.Servers))
 	}
 	srv := spec.Servers[0]
-	if srv.Hostname != "colo-r740-01" {
-		t.Errorf("hostname: got %q", srv.Hostname)
+	if got := derefString(srv.Hostname); got != "colo-r740-01" {
+		t.Errorf("hostname: got %q", got)
 	}
 	if srv.ServiceTag != "3RK3V64" {
 		t.Errorf("serviceTag: got %q", srv.ServiceTag)
 	}
-	if srv.OobIP != "10.10.1.45" {
-		t.Errorf("oobIP: got %q", srv.OobIP)
+	if got := derefString(srv.OobIP); got != "10.10.1.45" {
+		t.Errorf("oobIP: got %q", got)
 	}
-	if srv.Idrac.FirmwareVersion != "7.20.10.05" {
-		t.Errorf("firmwareVersion: got %q", srv.Idrac.FirmwareVersion)
+	if got := derefString(srv.Idrac.FirmwareVersion); got != "7.20.10.05" {
+		t.Errorf("firmwareVersion: got %q", got)
 	}
-	if !srv.Idrac.SSHEnabled {
+	if !derefBool(srv.Idrac.SSHEnabled) {
 		t.Error("sshEnabled: want true")
 	}
-	if !srv.Idrac.RacadmEnabled {
+	if !derefBool(srv.Idrac.RacadmEnabled) {
 		t.Error("racadmEnabled: want true")
-	}
-	if len(resp.ConsumedResolutionIDs) != 0 {
-		t.Errorf("expected no consumed IDs without Resolutions querier, got %v", resp.ConsumedResolutionIDs)
 	}
 }
 
@@ -157,43 +158,97 @@ func TestHandleBundle_Success(t *testing.T) {
 
 func TestMapToSpec_SkipsServersWithoutHostname(t *testing.T) {
 	dc := DataCenterResult{
-		Name: "colo",
+		Name:  "colo",
+		OrbID: "colo:colo-galleon",
 		Servers: []ServerResult{
-			{Hostname: "", ServiceTag: "NO-HOST"},
-			{Hostname: "valid-host", ServiceTag: "HAS-HOST"},
+			{Hostname: "", ServiceTag: "NO-HOST", OrbID: "colo:srv-001"},
+			{Hostname: "valid-host", ServiceTag: "HAS-HOST", OrbID: "colo:srv-002"},
 		},
 	}
 	spec := mapToSpec(dc)
 	if len(spec.Servers) != 1 {
 		t.Fatalf("expected 1 server, got %d", len(spec.Servers))
 	}
-	if spec.Servers[0].Hostname != "valid-host" {
-		t.Errorf("expected valid-host, got %q", spec.Servers[0].Hostname)
+	if got := derefString(spec.Servers[0].Hostname); got != "valid-host" {
+		t.Errorf("expected valid-host, got %q", got)
+	}
+}
+
+func TestMapToSpec_SkipsServersWithoutOrbID(t *testing.T) {
+	dc := DataCenterResult{
+		Name:  "colo",
+		OrbID: "colo:colo-galleon",
+		Servers: []ServerResult{
+			{Hostname: "no-orbid", ServiceTag: "TAG-A", OrbID: ""},
+			{Hostname: "has-orbid", ServiceTag: "TAG-B", OrbID: "colo:srv-002"},
+		},
+	}
+	spec := mapToSpec(dc)
+	if len(spec.Servers) != 1 {
+		t.Fatalf("expected 1 server (orbid-less skipped), got %d", len(spec.Servers))
+	}
+	if spec.Servers[0].OrbID != "colo:srv-002" {
+		t.Errorf("expected colo:srv-002, got %q", spec.Servers[0].OrbID)
 	}
 }
 
 func TestMapToSpec_NilOobIP(t *testing.T) {
 	dc := DataCenterResult{
-		Name:    "colo",
-		Servers: []ServerResult{{Hostname: "host", OobIP: nil}},
+		Name:  "colo",
+		OrbID: "colo:colo-galleon",
+		Servers: []ServerResult{{
+			Hostname: "host", ServiceTag: "TAG-A", OrbID: "colo:srv-001", OobIP: nil,
+		}},
 	}
 	spec := mapToSpec(dc)
-	if spec.Servers[0].OobIP != "" {
-		t.Errorf("expected empty oobIP, got %q", spec.Servers[0].OobIP)
+	if got := derefString(spec.Servers[0].OobIP); got != "" {
+		t.Errorf("expected empty oobIP, got %q", got)
 	}
 }
 
 func TestMapToSpec_NilIdracSettings(t *testing.T) {
 	dc := DataCenterResult{
-		Name:    "colo",
-		Servers: []ServerResult{{Hostname: "host", IdracSettings: nil}},
+		Name:  "colo",
+		OrbID: "colo:colo-galleon",
+		Servers: []ServerResult{{
+			Hostname: "host", ServiceTag: "TAG-A", OrbID: "colo:srv-001", IdracSettings: nil,
+		}},
 	}
 	spec := mapToSpec(dc)
-	// Zero-value IdracSpec — all bools false, firmware empty.
 	idrac := spec.Servers[0].Idrac
-	if idrac.SSHEnabled || idrac.IPMIEnabled || idrac.FirmwareVersion != "" {
+	if derefBool(idrac.SSHEnabled) || derefBool(idrac.IPMIEnabled) || derefString(idrac.FirmwareVersion) != "" {
 		t.Error("expected zero-value IdracSpec for nil idracSettings")
 	}
+}
+
+func TestMapToSpec_PopulatesDatacenterOrbID(t *testing.T) {
+	dc := DataCenterResult{
+		Name:  "colo",
+		OrbID: "colo:colo-galleon",
+	}
+	spec := mapToSpec(dc)
+	if spec.OrbID != "colo:colo-galleon" {
+		t.Errorf("expected colo:colo-galleon, got %q", spec.OrbID)
+	}
+	if spec.Datacenter != "colo" {
+		t.Errorf("expected colo, got %q", spec.Datacenter)
+	}
+}
+
+// derefString returns *p or "" if nil.
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// derefBool returns *p or false if nil.
+func derefBool(p *bool) bool {
+	if p == nil {
+		return false
+	}
+	return *p
 }
 
 // --- Unit tests for buildMapping ---
@@ -224,8 +279,10 @@ func TestBuildMapping_FullDatacenter(t *testing.T) {
 	}
 
 	mapping := buildMapping(dc)
-	if len(mapping.Items) != 5 {
-		t.Fatalf("expected 5 mapping items, got %d: %+v", len(mapping.Items), mapping.Items)
+	// Post-orbId-migration: mapping carries IdracSettings entries only.
+	// DC and Server orbIds live in spec directly.
+	if len(mapping.Items) != 2 {
+		t.Fatalf("expected 2 mapping items (IdracSettings only), got %d: %+v", len(mapping.Items), mapping.Items)
 	}
 
 	type want struct {
@@ -233,11 +290,8 @@ func TestBuildMapping_FullDatacenter(t *testing.T) {
 		typ   string
 	}
 	expected := map[string]want{
-		"spec":                                   {"colo:colo-galleon", "DataCenter"},
-		"spec.servers[serviceTag=3RK3V64]":       {"colo:srv-001", "Server"},
-		"spec.servers[serviceTag=3RK3V64].idrac": {"colo:srv-001-idrac", "IdracSettings"},
-		"spec.servers[serviceTag=7BN2X91]":       {"colo:srv-002", "Server"},
-		"spec.servers[serviceTag=7BN2X91].idrac": {"colo:srv-002-idrac", "IdracSettings"},
+		"spec.servers[orbId=colo:srv-001].idrac": {"colo:srv-001-idrac", "IdracSettings"},
+		"spec.servers[orbId=colo:srv-002].idrac": {"colo:srv-002-idrac", "IdracSettings"},
 	}
 
 	for _, item := range mapping.Items {
@@ -280,35 +334,30 @@ func TestBuildMapping_SkipsServersWithoutHostname(t *testing.T) {
 // --- Unit tests for buildTakeover ---
 
 func TestBuildTakeover_Empty(t *testing.T) {
-	entries, ids := buildTakeover(nil, MappingLayer{})
+	entries := buildTakeover(nil, MappingLayer{})
 	if len(entries) != 0 {
 		t.Errorf("expected no entries, got %d", len(entries))
 	}
-	if len(ids) != 0 {
-		t.Errorf("expected no ids, got %d", len(ids))
-	}
 }
 
-func TestBuildTakeover_ResolvesOrbIdToServiceTag(t *testing.T) {
+func TestBuildTakeover_ResolvesOrbIdToServerOrbID(t *testing.T) {
 	mapping := MappingLayer{Items: []MappingEntry{
-		{Path: "spec.servers[serviceTag=3RK3V64]", OrbID: "colo:srv-001", Type: "Server"},
-		{Path: "spec.servers[serviceTag=3RK3V64].idrac", OrbID: "colo:srv-001-idrac", Type: "IdracSettings"},
-		{Path: "spec.servers[serviceTag=7BN2X91]", OrbID: "colo:srv-002", Type: "Server"},
+		{Path: "spec.servers[orbId=colo:srv-001].idrac", OrbID: "colo:srv-001-idrac", Type: "IdracSettings"},
+		{Path: "spec.servers[orbId=colo:srv-002].idrac", OrbID: "colo:srv-002-idrac", Type: "IdracSettings"},
 	}}
 
 	resolutions := []PendingForceResolution{
-		{ID: "res-1", OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
-		{ID: "res-2", OrbID: "colo:srv-002", Field: "hostname"},
+		{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
+		{OrbID: "colo:srv-002-idrac", Field: "racadmEnabled"},
 	}
 
-	entries, ids := buildTakeover(resolutions, mapping)
+	entries := buildTakeover(resolutions, mapping)
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 entries, got %d", len(entries))
 	}
 
-	// First entry: idrac field → serviceTag from parent server path
-	if entries[0].ServiceTag != "3RK3V64" {
-		t.Errorf("entry[0] serviceTag: got %q, want 3RK3V64", entries[0].ServiceTag)
+	if entries[0].ServerOrbID != "colo:srv-001" {
+		t.Errorf("entry[0] serverOrbId: got %q, want colo:srv-001", entries[0].ServerOrbID)
 	}
 	if entries[0].Field != "sshEnabled" {
 		t.Errorf("entry[0] field: got %q", entries[0].Field)
@@ -317,76 +366,49 @@ func TestBuildTakeover_ResolvesOrbIdToServiceTag(t *testing.T) {
 		t.Errorf("entry[0] orbId: got %q", entries[0].OrbID)
 	}
 
-	// Second entry: server-level field
-	if entries[1].ServiceTag != "7BN2X91" {
-		t.Errorf("entry[1] serviceTag: got %q, want 7BN2X91", entries[1].ServiceTag)
+	if entries[1].ServerOrbID != "colo:srv-002" {
+		t.Errorf("entry[1] serverOrbId: got %q, want colo:srv-002", entries[1].ServerOrbID)
 	}
-	if entries[1].Field != "hostname" {
+	if entries[1].Field != "racadmEnabled" {
 		t.Errorf("entry[1] field: got %q", entries[1].Field)
-	}
-
-	if len(ids) != 2 || ids[0] != "res-1" || ids[1] != "res-2" {
-		t.Errorf("consumed IDs: got %v", ids)
 	}
 }
 
 func TestBuildTakeover_SkipsUnknownOrbId(t *testing.T) {
 	mapping := MappingLayer{Items: []MappingEntry{
-		{Path: "spec.servers[serviceTag=3RK3V64].idrac", OrbID: "colo:srv-001-idrac", Type: "IdracSettings"},
+		{Path: "spec.servers[orbId=colo:srv-001].idrac", OrbID: "colo:srv-001-idrac", Type: "IdracSettings"},
 	}}
 
 	resolutions := []PendingForceResolution{
-		{ID: "res-1", OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
-		{ID: "res-2", OrbID: "unknown:orb-id", Field: "hostname"},
+		{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
+		{OrbID: "unknown:orb-id", Field: "hostname"},
 	}
 
-	entries, ids := buildTakeover(resolutions, mapping)
+	entries := buildTakeover(resolutions, mapping)
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 entry (unknown skipped), got %d", len(entries))
 	}
-	if len(ids) != 1 || ids[0] != "res-1" {
-		t.Errorf("consumed IDs: got %v", ids)
-	}
 }
 
-func TestBuildTakeover_SkipsDatacenterLevelOrbId(t *testing.T) {
-	mapping := MappingLayer{Items: []MappingEntry{
-		{Path: "spec", OrbID: "colo:colo-galleon", Type: "DataCenter"},
-	}}
+// --- Unit tests for extractServerOrbID ---
 
-	resolutions := []PendingForceResolution{
-		{ID: "res-1", OrbID: "colo:colo-galleon", Field: "datacenter"},
-	}
-
-	// spec path has no serviceTag — should be skipped
-	entries, ids := buildTakeover(resolutions, mapping)
-	if len(entries) != 0 {
-		t.Errorf("expected 0 entries for DC-level resolution, got %d", len(entries))
-	}
-	if len(ids) != 0 {
-		t.Errorf("expected 0 consumed IDs, got %v", ids)
-	}
-}
-
-// --- Unit tests for extractServiceTag ---
-
-func TestExtractServiceTag(t *testing.T) {
+func TestExtractServerOrbID(t *testing.T) {
 	tests := []struct {
 		path string
 		want string
 	}{
-		{"spec.servers[serviceTag=3RK3V64]", "3RK3V64"},
-		{"spec.servers[serviceTag=3RK3V64].idrac", "3RK3V64"},
-		{"spec.servers[serviceTag=ABC123].idrac.sshEnabled", "ABC123"},
+		{"spec.servers[orbId=colo:srv-001]", "colo:srv-001"},
+		{"spec.servers[orbId=colo:srv-001].idrac", "colo:srv-001"},
+		{"spec.servers[orbId=colo:srv-001].idrac.sshEnabled", "colo:srv-001"},
 		{"spec", ""},
 		{"spec.datacenter", ""},
 		{"", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
-			got := extractServiceTag(tt.path)
+			got := extractServerOrbID(tt.path)
 			if got != tt.want {
-				t.Errorf("extractServiceTag(%q) = %q, want %q", tt.path, got, tt.want)
+				t.Errorf("extractServerOrbID(%q) = %q, want %q", tt.path, got, tt.want)
 			}
 		})
 	}
@@ -396,11 +418,17 @@ func TestExtractServiceTag(t *testing.T) {
 
 type fakeResolutionQuerier struct {
 	resolutions []PendingForceResolution
+	omissions   []Omission
 	err         error
+	omErr       error
 }
 
 func (f *fakeResolutionQuerier) QueryPendingForce(_ context.Context) ([]PendingForceResolution, error) {
 	return f.resolutions, f.err
+}
+
+func (f *fakeResolutionQuerier) QueryOmissions(_ context.Context) ([]Omission, error) {
+	return f.omissions, f.omErr
 }
 
 func TestHandleBundle_WithTakeover(t *testing.T) {
@@ -420,12 +448,12 @@ func TestHandleBundle_WithTakeover(t *testing.T) {
 			}},
 		}}},
 		Resolutions: &fakeResolutionQuerier{resolutions: []PendingForceResolution{
-			{ID: "res-aaa", OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
+			{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
 		}},
 	}
 
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, newRequest(`{"datacenter":"colo"}`))
+	h.ServeHTTP(w, newRequest(`{"orbId":"colo:colo"}`))
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
@@ -444,19 +472,14 @@ func TestHandleBundle_WithTakeover(t *testing.T) {
 	if len(spec.Takeover) != 1 {
 		t.Fatalf("expected 1 takeover entry, got %d", len(spec.Takeover))
 	}
-	if spec.Takeover[0].ServiceTag != "3RK3V64" {
-		t.Errorf("takeover serviceTag: got %q", spec.Takeover[0].ServiceTag)
+	if spec.Takeover[0].ServerOrbID != "colo:srv-001" {
+		t.Errorf("takeover serverOrbId: got %q", spec.Takeover[0].ServerOrbID)
 	}
 	if spec.Takeover[0].Field != "sshEnabled" {
 		t.Errorf("takeover field: got %q", spec.Takeover[0].Field)
 	}
 	if spec.Takeover[0].OrbID != "colo:srv-001-idrac" {
 		t.Errorf("takeover orbId: got %q", spec.Takeover[0].OrbID)
-	}
-
-	// Verify consumed IDs
-	if len(resp.ConsumedResolutionIDs) != 1 || resp.ConsumedResolutionIDs[0] != "res-aaa" {
-		t.Errorf("consumed IDs: got %v", resp.ConsumedResolutionIDs)
 	}
 }
 
@@ -470,21 +493,23 @@ func TestHandleBundle_ResolutionQueryError(t *testing.T) {
 	}
 
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, newRequest(`{"datacenter":"colo"}`))
+	h.ServeHTTP(w, newRequest(`{"orbId":"colo:colo"}`))
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d", w.Code)
 	}
 }
 
-func TestBuildMapping_MissingOrbIds(t *testing.T) {
+func TestBuildMapping_ServerWithoutOrbIdSkipped(t *testing.T) {
+	// Servers without an orbId are skipped entirely — they can't be encoded
+	// as a path because the path uses orbId as the list key.
 	dc := DataCenterResult{
-		Name: "colo",
-		// No OrbID on datacenter
+		Name:  "colo",
+		OrbID: "colo:colo-galleon",
 		Servers: []ServerResult{
 			{
 				Hostname:   "host-01",
 				ServiceTag: "3RK3V64",
-				// No OrbID on server
+				// No OrbID on server → skipped
 				IdracSettings: &IdracSettingsResult{
 					OrbID: "colo:srv-001-idrac",
 				},
@@ -493,11 +518,135 @@ func TestBuildMapping_MissingOrbIds(t *testing.T) {
 	}
 
 	mapping := buildMapping(dc)
-	// Should only have the idrac entry (datacenter and server have no orbId)
-	if len(mapping.Items) != 1 {
-		t.Fatalf("expected 1 mapping item, got %d: %+v", len(mapping.Items), mapping.Items)
-	}
-	if mapping.Items[0].OrbID != "colo:srv-001-idrac" {
-		t.Errorf("got orbId %q", mapping.Items[0].OrbID)
+	if len(mapping.Items) != 0 {
+		t.Fatalf("expected 0 mapping items for server without orbId, got %d: %+v", len(mapping.Items), mapping.Items)
 	}
 }
+
+// --- Unit tests for applyOmissions ---
+
+func TestApplyOmissions_NoOp(t *testing.T) {
+	spec := armadav1.ConfigBundleSpec{
+		Datacenter: "colo",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:    "colo:srv-001",
+			Hostname: ptrString("host-01"),
+			Idrac:    armadav1.IdracSpec{SSHEnabled: ptrBool(true)},
+		}},
+	}
+	applyOmissions(&spec, nil, MappingLayer{})
+	if spec.Servers[0].Idrac.SSHEnabled == nil || *spec.Servers[0].Idrac.SSHEnabled != true {
+		t.Errorf("nil omissions must not touch the spec")
+	}
+}
+
+func TestApplyOmissions_ZeroesIdracLeaf(t *testing.T) {
+	spec := armadav1.ConfigBundleSpec{
+		Datacenter: "colo",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:    "colo:srv-001",
+			Hostname: ptrString("host-01"),
+			Idrac: armadav1.IdracSpec{
+				SSHEnabled:    ptrBool(true),
+				RacadmEnabled: ptrBool(true),
+			},
+		}},
+	}
+	mapping := MappingLayer{Items: []MappingEntry{
+		{Path: "spec.servers[orbId=colo:srv-001].idrac", OrbID: "colo:srv-001-idrac", Type: "IdracSettings"},
+	}}
+	omissions := []Omission{
+		{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
+	}
+
+	applyOmissions(&spec, omissions, mapping)
+
+	if spec.Servers[0].Idrac.SSHEnabled != nil {
+		t.Errorf("sshEnabled must be nil after omission, got %v", *spec.Servers[0].Idrac.SSHEnabled)
+	}
+	if spec.Servers[0].Idrac.RacadmEnabled == nil || *spec.Servers[0].Idrac.RacadmEnabled != true {
+		t.Errorf("racadmEnabled must be untouched (not in omission list)")
+	}
+}
+
+func TestApplyOmissions_OmittedFieldIsAbsentFromYAML(t *testing.T) {
+	// The whole point: after applyOmissions, the marshaled YAML must NOT contain
+	// the omitted field. This is what releases cb-controller's claim under SSA.
+	spec := armadav1.ConfigBundleSpec{
+		OrbID:      "colo:colo-galleon",
+		Datacenter: "colo",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:    "colo:srv-001",
+			Hostname: ptrString("host-01"),
+			Idrac: armadav1.IdracSpec{
+				SSHEnabled:    ptrBool(true),
+				RacadmEnabled: ptrBool(true),
+			},
+		}},
+	}
+	mapping := MappingLayer{Items: []MappingEntry{
+		{Path: "spec.servers[orbId=colo:srv-001].idrac", OrbID: "colo:srv-001-idrac", Type: "IdracSettings"},
+	}}
+	applyOmissions(&spec, []Omission{
+		{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
+	}, mapping)
+
+	out, err := yaml.Marshal(spec)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	yamlStr := string(out)
+	if strings.Contains(yamlStr, "sshEnabled") {
+		t.Errorf("omitted field still appears in YAML — omitempty not honored or filter broken.\nYAML:\n%s", yamlStr)
+	}
+	if !strings.Contains(yamlStr, "racadmEnabled") {
+		t.Errorf("non-omitted field missing from YAML.\nYAML:\n%s", yamlStr)
+	}
+}
+
+func TestApplyOmissions_UnknownOrbIdSkipped(t *testing.T) {
+	spec := armadav1.ConfigBundleSpec{
+		Servers: []armadav1.ServerSpec{{
+			OrbID:    "colo:srv-001",
+			Hostname: ptrString("host-01"),
+			Idrac:    armadav1.IdracSpec{SSHEnabled: ptrBool(true)},
+		}},
+	}
+	mapping := MappingLayer{} // empty — no resolution possible
+	applyOmissions(&spec, []Omission{
+		{OrbID: "unknown:srv-001-idrac", Field: "sshEnabled"},
+	}, mapping)
+	if spec.Servers[0].Idrac.SSHEnabled == nil {
+		t.Errorf("unknown orbId omission must not zero the field")
+	}
+}
+
+func TestApplyOmissions_ServerLevelField(t *testing.T) {
+	// Omission can target Hostname (ServerSpec-level) too. We rely on the mapping
+	// path encoding to derive the server orbId, then nil the field.
+	spec := armadav1.ConfigBundleSpec{
+		Servers: []armadav1.ServerSpec{{
+			OrbID:    "colo:srv-001",
+			Hostname: ptrString("host-01"),
+			OobIP:    ptrString("10.0.0.1"),
+		}},
+	}
+	// Mapping path encoded as if a Server-level orbital node owns the hostname.
+	// In practice the server itself is the owner; the mapping references its orbId.
+	mapping := MappingLayer{Items: []MappingEntry{
+		{Path: "spec.servers[orbId=colo:srv-001]", OrbID: "colo:srv-001", Type: "Server"},
+	}}
+	applyOmissions(&spec, []Omission{
+		{OrbID: "colo:srv-001", Field: "hostname"},
+	}, mapping)
+
+	if spec.Servers[0].Hostname != nil {
+		t.Errorf("hostname must be nil after omission, got %q", *spec.Servers[0].Hostname)
+	}
+	if spec.Servers[0].OobIP == nil || *spec.Servers[0].OobIP != "10.0.0.1" {
+		t.Errorf("oobIP must be untouched")
+	}
+}
+
+func ptrString(s string) *string { return &s }
+func ptrBool(b bool) *bool       { return &b }

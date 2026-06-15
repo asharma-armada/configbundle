@@ -26,14 +26,14 @@
 - **Enrichment is all-or-nothing.** A non-2xx response from the bundler causes Orbital to mark the publish failed and push nothing. Partial artifacts are never produced.
 - **Orbital never imports configbundle.** Dependency flows one way: configbundle calls Orbital's GraphQL API. No reverse imports.
 - **CMDB is not in the reconciliation path.** After a ConfigBundle lands on a Galleon, Orbital has no further role. ConfigBundle Controller and X Config Controllers run locally and reconcile from the CRD.
-- **Orb is the single artifact ingress at the edge.** Orb pulls from Zot, cosign-verifies, imports graph layers to DGraph, then dispatches each remaining layer to registered consumers by media type. CB Controller is a consumer — it receives its manifest layer via `POST /consume` and applies it. CB Controller never holds OCI credentials.
+- **Orb is the single artifact ingress at the edge.** Orb pulls from Zot, cosign-verifies, imports graph layers to DGraph, then dispatches each remaining layer to registered consumers by media type. CB Controller is a consumer — it receives layers via `POST /dispatch` (content-routed: manifest → apply CR, mapping → write ConfigMap). CB Controller never holds OCI credentials.
 - **Orb owns Dgraph import.** Configbundle never calls orb's import API. Orb is responsible for getting graph data into its own database. The ConfigBundle CR is the handoff artifact — orb reacts to it independently.
 
 ## Current State
 
 **Phase:** Prototype
-**Active work:** Divergence pipeline feature-complete; pending integration tests and e2e validation
-**Next priority:** Integration tests (envtest for reporter + takeover); bundler e2e validation against live Orbital (Spike 3 acceptance); Spike 8 (full pipeline e2e)
+**Active work:** Dispatch rewrite shipped; divergence pipeline complete and e2e-validated
+**Next priority:** Bundler e2e validation against live Orbital (Spike 3 acceptance); Spike 8 (full pipeline e2e); orbital e2e script update (`DIVERGENCE_REPORTER_INTERVAL` → removed, `DIVERGENCE_REPORTER_DEBOUNCE=2s` if needed)
 
 *Update this section at each session wrap-up.*
 

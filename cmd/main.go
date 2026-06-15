@@ -20,11 +20,13 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"github.com/kelseyhightower/envconfig"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -40,13 +42,13 @@ import (
 	// +kubebuilder:scaffold:imports
 )
 
-// envOrDefault returns the value of the environment variable key,
-// or defaultVal if the variable is unset or empty.
-func envOrDefault(key, defaultVal string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return defaultVal
+// Config holds all controller configuration. Defaults are set for local development.
+type Config struct {
+	Namespace                  string        `envconfig:"NAMESPACE"                   default:"default"`
+	CBControllerPort           string        `envconfig:"CB_CONTROLLER_PORT"          default:":8095"`
+	OrbDivergenceIntakeURL     string        `envconfig:"ORB_DIVERGENCE_INTAKE_URL"   default:"http://localhost:8010/api/v1/divergence"`
+	DivergenceReporterEnabled  bool          `envconfig:"DIVERGENCE_REPORTER_ENABLED" default:"true"`
+	DivergenceReporterDebounce time.Duration `envconfig:"DIVERGENCE_REPORTER_DEBOUNCE" default:"5s"`
 }
 
 var (
@@ -163,6 +165,12 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
+	var cfg Config
+	if err := envconfig.Process("", &cfg); err != nil {
+		setupLog.Error(err, "Failed to load config")
+		os.Exit(1)
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
@@ -195,30 +203,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	ns := envOrDefault("NAMESPACE", "configbundle-system")
-
-	// Register the Divergence Reporter — scheduled loop that detects local overrides.
 	reporter := controller.NewDivergenceReporter(mgr.GetClient(),
-		controller.WithDivergenceIntakeURL(envOrDefault("ORB_DIVERGENCE_INTAKE_URL", "http://orb:8010/api/v1/divergence")),
-		controller.WithDivergenceNamespace(ns),
-		controller.WithDivergenceEnabled(envOrDefault("DIVERGENCE_REPORTER_ENABLED", "false") == "true"),
+		controller.WithDivergenceIntakeURL(cfg.OrbDivergenceIntakeURL),
+		controller.WithDivergenceNamespace(cfg.Namespace),
+		controller.WithDivergenceEnabled(cfg.DivergenceReporterEnabled),
+		controller.WithDivergenceDebounce(cfg.DivergenceReporterDebounce),
 	)
-	if err := mgr.Add(reporter); err != nil {
+	if err := reporter.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to register DivergenceReporter")
 		os.Exit(1)
 	}
 
-	// Register the ConsumeServer — exposes POST /consume for orb layer dispatch.
+	// Register the ConsumeServer — exposes POST /dispatch for orb layer dispatch.
 	consume := controller.NewConsumeServer(mgr.GetClient(),
-		controller.WithPort(envOrDefault("CB_CONTROLLER_PORT", ":8095")),
-		controller.WithNamespace(ns),
+		controller.WithPort(cfg.CBControllerPort),
+		controller.WithNamespace(cfg.Namespace),
 		controller.WithDivergenceReporter(reporter),
 	)
 	if err := mgr.Add(consume); err != nil {
 		setupLog.Error(err, "Failed to register ConsumeServer")
 		os.Exit(1)
 	}
-	setupLog.Info("ConsumeServer registered", "port", envOrDefault("CB_CONTROLLER_PORT", ":8095"))
+	setupLog.Info("ConsumeServer registered", "port", cfg.CBControllerPort)
 
 	// +kubebuilder:scaffold:builder
 

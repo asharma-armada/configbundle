@@ -20,18 +20,21 @@ spec:
     - jsonPath: .spec.serviceTag
       name: ServiceTag
       type: string
-    - jsonPath: .spec.hostname
-      name: Hostname
-      type: string
-    - jsonPath: .spec.oobIP
-      name: OobIP
-      type: string
-    - jsonPath: .status.phase
-      name: Phase
-      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
+    - jsonPath: .spec.orbId
+      name: OrbID
+      priority: 1
+      type: string
+    - jsonPath: .spec.hostname
+      name: Hostname
+      priority: 1
+      type: string
+    - jsonPath: .spec.oobIP
+      name: OOB IP
+      priority: 1
+      type: string
     name: v1
     schema:
       openAPIV3Schema:
@@ -60,8 +63,11 @@ spec:
           spec:
             description: |-
               ServerConfigSpec mirrors the ServerSpec from ConfigBundle.
-              The ConfigBundle controller creates and updates this CR via SSA.
-              Local admins may override individual fields using field manager "local:<admin-id>".
+              The ConfigBundle controller creates and updates this CR via SSA. ServerConfig
+              is derived state — admin overrides happen on the parent ConfigBundle CR only.
+
+              Field types match ServerSpec (pointer leaves, see ADR-007) so the parent→child
+              copy is a direct assignment.
             properties:
               hostname:
                 description: Hostname is the server's hostname for display and logging.
@@ -88,18 +94,17 @@ spec:
                     type: boolean
                   usbManagementPortEnabled:
                     type: boolean
-                required:
-                - dhcpEnabled
-                - ipmiEnabled
-                - lockdownModeEnabled
-                - osToIdracPassThroughEnabled
-                - racadmEnabled
-                - sshEnabled
-                - usbManagementPortEnabled
                 type: object
               oobIP:
                 description: OobIP is the iDRAC management IP. The ServerConfig controller
                   targets Redfish here.
+                type: string
+              orbId:
+                description: |-
+                  OrbID is the immutable Orbital identifier for this server
+                  (mirrors ConfigBundle.spec.servers[].orbId). Carried on the child so
+                  cross-system grep, audit logs, and downstream telemetry can correlate
+                  without a parent round-trip. See docs/plans/server-identity-orbid.md.
                 type: string
               serviceTag:
                 description: |-
@@ -109,6 +114,7 @@ spec:
             required:
             - hostname
             - oobIP
+            - orbId
             - serviceTag
             type: object
           status:
