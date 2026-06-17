@@ -996,7 +996,7 @@ var _ = Describe("Takeover", func() {
 		// the normal-apply pass; compute it here for the test.
 		var cbForPatch armadav1.ConfigBundle
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cbForPatch)).To(Succeed())
-		patchSpec, err := omitAdminOwnedFields(spec, cbForPatch.ManagedFields)
+		patchSpec, err := omitAdminOwnedFields(spec, cbForPatch.Spec, cbForPatch.ManagedFields)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(server.processTakeover(ctx, spec, patchSpec)).To(Succeed())
 

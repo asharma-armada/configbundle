@@ -476,57 +476,51 @@ func TestBuildMapping_ServerWithoutOrbIdSkipped(t *testing.T) {
 	}
 }
 
-// --- Unit tests for applyOmissions ---
+// --- Unit tests for buildIgnored (replaces applyOmissions, 2026-06-16) ---
+//
+// Ignore now emits spec.ignored[] entries instead of niling field values.
+// The intent value stays in spec.servers[N].<field> so the divergence-reporter
+// can keep comparing intent vs local override and surfacing the divergence.
 
-func TestApplyOmissions_NoOp(t *testing.T) {
-	spec := armadav1.ConfigBundleSpec{
-		Datacenter: "colo",
-		Servers: []armadav1.ServerSpec{{
-			OrbID:    "colo:srv-001",
-			Hostname: ptrString("host-01"),
-			Idrac:    armadav1.IdracSpec{SSHEnabled: ptrBool(true)},
-		}},
-	}
-	applyOmissions(&spec, nil, bundle.MappingPayload{})
-	if spec.Servers[0].Idrac.SSHEnabled == nil || *spec.Servers[0].Idrac.SSHEnabled != true {
-		t.Errorf("nil omissions must not touch the spec")
+func TestBuildIgnored_NilInput(t *testing.T) {
+	got := buildIgnored(nil, bundle.MappingPayload{})
+	if got != nil {
+		t.Errorf("nil omissions must return nil entries, got %v", got)
 	}
 }
 
-func TestApplyOmissions_ZeroesIdracLeaf(t *testing.T) {
-	spec := armadav1.ConfigBundleSpec{
-		Datacenter: "colo",
-		Servers: []armadav1.ServerSpec{{
-			OrbID:    "colo:srv-001",
-			Hostname: ptrString("host-01"),
-			Idrac: armadav1.IdracSpec{
-				SSHEnabled:    ptrBool(true),
-				RacadmEnabled: ptrBool(true),
-			},
-		}},
-	}
+func TestBuildIgnored_ResolvesServerOrbIDFromMapping(t *testing.T) {
 	mapping := bundle.MappingPayload{Rules: []bundle.MappingRule{
 		{ListField: "spec.servers", ItemKey: "orbId", Field: "idrac", Type: "IdracSettings", OrbIDSuffix: "-idrac"},
 	}}
 	omissions := []Omission{
 		{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
+		{OrbID: "colo:srv-001-idrac", Field: "racadmEnabled"},
 	}
-
-	applyOmissions(&spec, omissions, mapping)
-
-	if spec.Servers[0].Idrac.SSHEnabled != nil {
-		t.Errorf("sshEnabled must be nil after omission, got %v", *spec.Servers[0].Idrac.SSHEnabled)
+	got := buildIgnored(omissions, mapping)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 ignored entries, got %d", len(got))
 	}
-	if spec.Servers[0].Idrac.RacadmEnabled == nil || *spec.Servers[0].Idrac.RacadmEnabled != true {
-		t.Errorf("racadmEnabled must be untouched (not in omission list)")
+	for _, e := range got {
+		if e.ServerOrbID != "colo:srv-001" {
+			t.Errorf("expected serverOrbId resolved from idrac orbId, got %q", e.ServerOrbID)
+		}
 	}
 }
 
-func TestApplyOmissions_OmittedFieldIsAbsentFromYAML(t *testing.T) {
-	// The whole point: after applyOmissions, the marshaled YAML must NOT contain
-	// the omitted field. This is what releases cb-controller's claim under SSA.
+func TestBuildIgnored_UnknownOrbIDSkipped(t *testing.T) {
+	got := buildIgnored([]Omission{{OrbID: "unknown:srv-001-idrac", Field: "sshEnabled"}}, bundle.MappingPayload{})
+	if len(got) != 0 {
+		t.Errorf("unknown orbId must be silently skipped, got %d entries", len(got))
+	}
+}
+
+func TestBuildIgnored_IntentValuesStayInSpec(t *testing.T) {
+	// Regression: under spec.ignored[], the field's intent value must remain in
+	// the manifest so the divergence-reporter can compare against the local
+	// override. Pre-2026-06-16 behavior nil'd the field; that broke "ignore
+	// continues to surface as divergence" semantics.
 	spec := armadav1.ConfigBundleSpec{
-		OrbID:      "colo:colo-galleon",
 		Datacenter: "colo",
 		Servers: []armadav1.ServerSpec{{
 			OrbID:    "colo:srv-001",
@@ -540,37 +534,17 @@ func TestApplyOmissions_OmittedFieldIsAbsentFromYAML(t *testing.T) {
 	mapping := bundle.MappingPayload{Rules: []bundle.MappingRule{
 		{ListField: "spec.servers", ItemKey: "orbId", Field: "idrac", Type: "IdracSettings", OrbIDSuffix: "-idrac"},
 	}}
-	applyOmissions(&spec, []Omission{
-		{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
-	}, mapping)
+	spec.Ignored = buildIgnored([]Omission{{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"}}, mapping)
 
 	out, err := yaml.Marshal(spec)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	yamlStr := string(out)
-	if strings.Contains(yamlStr, "sshEnabled") {
-		t.Errorf("omitted field still appears in YAML — omitempty not honored or filter broken.\nYAML:\n%s", yamlStr)
+	if !strings.Contains(string(out), "sshEnabled: true") {
+		t.Errorf("sshEnabled intent value must remain in spec YAML even when ignored.\nYAML:\n%s", out)
 	}
-	if !strings.Contains(yamlStr, "racadmEnabled") {
-		t.Errorf("non-omitted field missing from YAML.\nYAML:\n%s", yamlStr)
-	}
-}
-
-func TestApplyOmissions_UnknownOrbIdSkipped(t *testing.T) {
-	spec := armadav1.ConfigBundleSpec{
-		Servers: []armadav1.ServerSpec{{
-			OrbID:    "colo:srv-001",
-			Hostname: ptrString("host-01"),
-			Idrac:    armadav1.IdracSpec{SSHEnabled: ptrBool(true)},
-		}},
-	}
-	mapping := bundle.MappingPayload{} // empty — no resolution possible
-	applyOmissions(&spec, []Omission{
-		{OrbID: "unknown:srv-001-idrac", Field: "sshEnabled"},
-	}, mapping)
-	if spec.Servers[0].Idrac.SSHEnabled == nil {
-		t.Errorf("unknown orbId omission must not zero the field")
+	if !strings.Contains(string(out), "ignored:") {
+		t.Errorf("spec.ignored list missing from YAML.\nYAML:\n%s", out)
 	}
 }
 

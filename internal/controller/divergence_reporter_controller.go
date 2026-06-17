@@ -122,7 +122,7 @@ func (h *divergenceHeartbeat) tick(ctx context.Context, logger logrLogger) {
 	for _, cb := range list.Items {
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cb.Name, Namespace: cb.Namespace}}
 		if _, err := h.reporter.Reconcile(ctx, req); err != nil {
-			logger.Info("reconcile failed", "configbundle", cb.Name, "err", err.Error())
+			logger.Error(err, "reconcile failed", "configbundle", cb.Name)
 		}
 	}
 	logger.Info("heartbeat tick complete", "configbundles", len(list.Items))
@@ -191,6 +191,7 @@ func (r *DivergenceReporter) Reconcile(ctx context.Context, req reconcile.Reques
 	}
 
 	if err := r.postToOrb(ctx, payload); err != nil {
+		logger.Error(err, "POST divergence failed", "configbundle", req.Name, "url", r.intakeURL)
 		return reconcile.Result{}, fmt.Errorf("POST divergence: %w", err)
 	}
 

@@ -107,6 +107,30 @@ type TakeoverEntry struct {
 	Field string `json:"field"`
 }
 
+// IgnoredEntry represents a cloud admin's "ignore" resolution: the controller
+// MUST NOT claim this field even when the spec value matches the live value.
+// The field's intent value stays in the spec so the divergence-reporter can
+// surface it as an ongoing divergence; cb-controller bows out unconditionally.
+//
+// Ignore stays surfaced as divergence until the local admin releases ownership
+// or the cloud admin re-decides as Accept/Reject. Mirror of TakeoverEntry.
+type IgnoredEntry struct {
+	// ServerOrbID identifies which server entry the field belongs to (matches
+	// ServerSpec.OrbID, the listMapKey for spec.servers[]).
+	// +kubebuilder:validation:Required
+	ServerOrbID string `json:"serverOrbId"`
+
+	// OrbID is the Orbital ConfigItem identifier of the node that owns the field
+	// (e.g. "colo:srv-001-idrac" for an iDRAC field). Informational — used for
+	// audit and divergence-resolution correlation.
+	OrbID string `json:"orbId"`
+
+	// Field is the leaf field name to leave to the local manager (e.g. "racadmEnabled").
+	// Must match the JSON tag name on IdracSpec (or ServerSpec for top-level fields).
+	// +kubebuilder:validation:Required
+	Field string `json:"field"`
+}
+
 // ConfigBundleSpec holds the full intended configuration for a datacenter.
 // The ConfigBundle controller decomposes this into domain child CRs via SSA.
 type ConfigBundleSpec struct {
@@ -131,6 +155,17 @@ type ConfigBundleSpec struct {
 	// +optional
 	// +listType=atomic
 	Takeover []TakeoverEntry `json:"takeover,omitempty"`
+
+	// Ignored contains "do not claim" directives from the cloud admin. For each
+	// entry, cb-controller leaves the field to its local manager unconditionally
+	// — even when the spec's intent value matches the live value (which would
+	// otherwise trigger auto-claim under the simplified controller). The
+	// divergence-reporter still surfaces these fields as divergent so the
+	// operator continues to see the override; the resolution row in orbital
+	// records the deliberate "leave to edge" decision.
+	// +optional
+	// +listType=atomic
+	Ignored []IgnoredEntry `json:"ignored,omitempty"`
 }
 
 // ConfigBundlePhase represents the current lifecycle phase.

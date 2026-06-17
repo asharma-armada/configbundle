@@ -3,11 +3,16 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+
+	armadav1 "github.com/armada/configbundle/api/v1"
 	"github.com/armada/configbundle/bundle"
 )
 
@@ -206,5 +211,289 @@ func TestParseManifest(t *testing.T) {
 				t.Errorf("servers: want %d got %d", tc.wantServers, len(spec.Servers))
 			}
 		})
+	}
+}
+
+// --- Unit tests for omitAdminOwnedFields (post-simplification semantics) ---
+//
+// The simplification: cb-controller bows out only when local:* claims a field
+// AND intent value != live value AND the field is NOT in spec.takeover[].
+// When values match, the field stays in the apply body so the force-conflicts
+// pass can silently claim sole ownership (no steady-state co-ownership).
+//
+// Regression class: a refactor that drops the value-comparison or takeover-set
+// awareness in `omitAdminOwnedFields` would re-introduce either co-ownership
+// (no auto-claim on match) or the user-reported batch-Reject bug (Accept on
+// a sibling field invalidating Reject on this field).
+
+func managedFieldsClaim(t *testing.T, manager string, fieldsV1 map[string]any) []metav1.ManagedFieldsEntry {
+	t.Helper()
+	raw, err := json.Marshal(fieldsV1)
+	if err != nil {
+		t.Fatalf("marshal fieldsV1: %v", err)
+	}
+	return []metav1.ManagedFieldsEntry{{
+		Manager:    manager,
+		Operation:  metav1.ManagedFieldsOperationApply,
+		APIVersion: "armada.ai/v1",
+		FieldsV1:   &metav1.FieldsV1{Raw: raw},
+	}}
+}
+
+func TestOmitAdminOwnedFields_BowsOutOnValueMismatch(t *testing.T) {
+	// intent.sshEnabled=false, live.sshEnabled=true (genuine override) → omitted.
+	intent := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(false)},
+		}},
+	}
+	live := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(true)},
+		}},
+	}
+	mf := managedFieldsClaim(t, "local:admin", map[string]any{
+		"f:spec": map[string]any{
+			"f:servers": map[string]any{
+				`k:{"orbId":"colo:srv-1"}`: map[string]any{
+					"f:idrac": map[string]any{"f:sshEnabled": map[string]any{}},
+				},
+			},
+		},
+	})
+
+	out, err := omitAdminOwnedFields(intent, live, mf)
+	if err != nil {
+		t.Fatalf("omit: %v", err)
+	}
+	if len(out.Servers) != 1 {
+		t.Fatalf("expected 1 server, got %d", len(out.Servers))
+	}
+	if out.Servers[0].Idrac.SSHEnabled != nil {
+		t.Errorf("sshEnabled should be omitted (genuine override, values differ), got %v", *out.Servers[0].Idrac.SSHEnabled)
+	}
+}
+
+func TestOmitAdminOwnedFields_KeepsOnValueMatchForAutoClaim(t *testing.T) {
+	// intent.sshEnabled=true, live.sshEnabled=true, local:admin owns it.
+	// Values match → KEEP in apply so the force-conflicts pass silently claims.
+	intent := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(true)},
+		}},
+	}
+	live := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(true)},
+		}},
+	}
+	mf := managedFieldsClaim(t, "local:admin", map[string]any{
+		"f:spec": map[string]any{
+			"f:servers": map[string]any{
+				`k:{"orbId":"colo:srv-1"}`: map[string]any{
+					"f:idrac": map[string]any{"f:sshEnabled": map[string]any{}},
+				},
+			},
+		},
+	})
+
+	out, err := omitAdminOwnedFields(intent, live, mf)
+	if err != nil {
+		t.Fatalf("omit: %v", err)
+	}
+	if len(out.Servers) != 1 {
+		t.Fatalf("expected 1 server, got %d", len(out.Servers))
+	}
+	if out.Servers[0].Idrac.SSHEnabled == nil || *out.Servers[0].Idrac.SSHEnabled != true {
+		t.Errorf("sshEnabled should be KEPT when values match (auto-claim case); got %v",
+			out.Servers[0].Idrac.SSHEnabled)
+	}
+}
+
+func TestOmitAdminOwnedFields_KeepsTakeoverTargetEvenOnMismatch(t *testing.T) {
+	// intent.sshEnabled=false, live.sshEnabled=true, in takeover → KEEP for force.
+	intent := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(false)},
+		}},
+		Takeover: []armadav1.TakeoverEntry{{
+			OrbID: "colo:srv-1-idrac", ServerOrbID: "colo:srv-1", Field: "sshEnabled",
+		}},
+	}
+	live := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(true)},
+		}},
+	}
+	mf := managedFieldsClaim(t, "local:admin", map[string]any{
+		"f:spec": map[string]any{
+			"f:servers": map[string]any{
+				`k:{"orbId":"colo:srv-1"}`: map[string]any{
+					"f:idrac": map[string]any{"f:sshEnabled": map[string]any{}},
+				},
+			},
+		},
+	})
+
+	out, err := omitAdminOwnedFields(intent, live, mf)
+	if err != nil {
+		t.Fatalf("omit: %v", err)
+	}
+	if out.Servers[0].Idrac.SSHEnabled == nil || *out.Servers[0].Idrac.SSHEnabled != false {
+		t.Errorf("takeover-target sshEnabled should be KEPT for force-apply, got %v",
+			out.Servers[0].Idrac.SSHEnabled)
+	}
+}
+
+func TestOmitAdminOwnedFields_IgnoredAlwaysOmittedEvenOnValueMatch(t *testing.T) {
+	// Regression: under Ignore semantics, cb-controller MUST NOT claim the field
+	// even when values happen to match. A simplification that only checked
+	// values-match for auto-claim would silently evict local:* (broken Ignore).
+	intent := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac:      armadav1.IdracSpec{RacadmEnabled: ptr.To(true)},
+		}},
+		Ignored: []armadav1.IgnoredEntry{{
+			OrbID: "colo:srv-1-idrac", ServerOrbID: "colo:srv-1", Field: "racadmEnabled",
+		}},
+	}
+	// Live edge happens to match cloud intent (admin set both to true).
+	live := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac:      armadav1.IdracSpec{RacadmEnabled: ptr.To(true)},
+		}},
+	}
+	mf := managedFieldsClaim(t, "local:admin", map[string]any{
+		"f:spec": map[string]any{
+			"f:servers": map[string]any{
+				`k:{"orbId":"colo:srv-1"}`: map[string]any{
+					"f:idrac": map[string]any{"f:racadmEnabled": map[string]any{}},
+				},
+			},
+		},
+	})
+
+	out, err := omitAdminOwnedFields(intent, live, mf)
+	if err != nil {
+		t.Fatalf("omit: %v", err)
+	}
+	if len(out.Servers) > 0 && out.Servers[0].Idrac.RacadmEnabled != nil {
+		t.Errorf("ignored field must be OMITTED from apply body regardless of value match (Ignore preserves local ownership); got %v",
+			*out.Servers[0].Idrac.RacadmEnabled)
+	}
+}
+
+func TestOmitAdminOwnedFields_IgnoredOmittedEvenWithoutLocalClaim(t *testing.T) {
+	// Edge case: spec.Ignored names a field but no local:* manager has claimed
+	// it yet. The controller must still bow out — Ignore is a forward-looking
+	// directive ("if local takes this, leave them alone").
+	intent := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac:      armadav1.IdracSpec{RacadmEnabled: ptr.To(true)},
+		}},
+		Ignored: []armadav1.IgnoredEntry{{
+			OrbID: "colo:srv-1-idrac", ServerOrbID: "colo:srv-1", Field: "racadmEnabled",
+		}},
+	}
+	live := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac:      armadav1.IdracSpec{RacadmEnabled: ptr.To(true)},
+		}},
+	}
+	// No managedFields entries for local:* — controller currently sole owner.
+	out, err := omitAdminOwnedFields(intent, live, nil)
+	if err != nil {
+		t.Fatalf("omit: %v", err)
+	}
+	if len(out.Servers) > 0 && out.Servers[0].Idrac.RacadmEnabled != nil {
+		t.Errorf("ignored field must be omitted even when local:* hasn't claimed yet; got %v",
+			*out.Servers[0].Idrac.RacadmEnabled)
+	}
+}
+
+// TestOmitAdminOwnedFields_BatchSiblingsOnSameServer pins the original
+// user-reported bug: Reject sshEnabled + Accept ipmiEnabled on the same
+// IdracSettings. Reject is in takeover; Accept's mutation already set intent
+// = override (true), so values match for ipmiEnabled and it should be kept.
+// Both fields must end up in the apply body — neither silently bowed out.
+func TestOmitAdminOwnedFields_BatchSiblingsOnSameServer(t *testing.T) {
+	intent := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac: armadav1.IdracSpec{
+				SSHEnabled:  ptr.To(false), // reject: keep intent at false
+				IPMIEnabled: ptr.To(true),  // accept: intent updated to override
+			},
+		}},
+		Takeover: []armadav1.TakeoverEntry{{
+			OrbID: "colo:srv-1-idrac", ServerOrbID: "colo:srv-1", Field: "sshEnabled",
+		}},
+	}
+	live := armadav1.ConfigBundleSpec{
+		Datacenter: "colo:test",
+		Servers: []armadav1.ServerSpec{{
+			OrbID:      "colo:srv-1",
+			ServiceTag: "T1",
+			Idrac: armadav1.IdracSpec{
+				SSHEnabled:  ptr.To(true), // override still at edge
+				IPMIEnabled: ptr.To(true), // override matches new intent post-Accept
+			},
+		}},
+	}
+	mf := managedFieldsClaim(t, "local:admin", map[string]any{
+		"f:spec": map[string]any{
+			"f:servers": map[string]any{
+				`k:{"orbId":"colo:srv-1"}`: map[string]any{
+					"f:idrac": map[string]any{
+						"f:sshEnabled":  map[string]any{},
+						"f:ipmiEnabled": map[string]any{},
+					},
+				},
+			},
+		},
+	})
+
+	out, err := omitAdminOwnedFields(intent, live, mf)
+	if err != nil {
+		t.Fatalf("omit: %v", err)
+	}
+	srv := out.Servers[0]
+	if srv.Idrac.SSHEnabled == nil || *srv.Idrac.SSHEnabled != false {
+		t.Errorf("sshEnabled (in takeover) must stay in apply; got %v", srv.Idrac.SSHEnabled)
+	}
+	if srv.Idrac.IPMIEnabled == nil || *srv.Idrac.IPMIEnabled != true {
+		t.Errorf("ipmiEnabled (values match post-Accept) must stay for auto-claim; got %v", srv.Idrac.IPMIEnabled)
 	}
 }

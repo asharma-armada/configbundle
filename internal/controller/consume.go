@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -286,10 +287,11 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 	// makes the silent drop visible at the runtime where the bug bites.
 	warnNonConformingManagers(log.FromContext(ctx).WithName("consume"), spec.Datacenter, cb.ManagedFields)
 
-	// Omit leaf fields owned by any local:<id> manager to avoid SSA 409 conflicts.
-	// Granularity is per-leaf: a single overridden field does not exempt the
-	// rest of the server from controller updates. See ADR-007.
-	patchSpec, err := omitAdminOwnedFields(spec, cb.ManagedFields)
+	// Omit only "bow-out" leaves: local:*-owned fields where intent value differs
+	// from live value AND the field isn't in spec.takeover[]. Values-match fields
+	// stay in the apply and get force-claimed below — no steady-state co-ownership.
+	// See ADR-008 (companion simplification 2026-06-16).
+	patchSpec, err := omitAdminOwnedFields(spec, cb.Spec, cb.ManagedFields)
 	if err != nil {
 		return fmt.Errorf("compute admin-omitted patch: %w", err)
 	}
@@ -317,8 +319,14 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 			case <-time.After(wait):
 			}
 		}
+		// ForceOwnership: silently evict local:*-co-managers on the fields we DID
+		// include (intent matched live → no value conflict, ownership transfer
+		// is the whole point). Bowed-out fields aren't in `apply.Spec` so they're
+		// untouched. ADR-008 release pass cleans up the now-stale local:* claim
+		// records afterward.
 		lastErr = s.Client.Patch(ctx, apply, client.Apply,
 			client.FieldOwner("configbundle-controller"),
+			client.ForceOwnership,
 		)
 		if lastErr == nil {
 			break
@@ -403,28 +411,67 @@ func parseManifest(data []byte) (armadav1.ConfigBundleSpec, error) {
 	return spec, nil
 }
 
-// omitAdminOwnedFields returns a typed ConfigBundleSpec with all leaf fields
-// owned by local:admin removed. The result is the SSA-safe patch the controller
-// can apply with field manager "configbundle-controller" without 409-conflicting
-// on admin-owned fields.
+// omitAdminOwnedFields returns a typed ConfigBundleSpec with the "bow-out"
+// subset of local:*-owned leaves removed: those where the controller's intent
+// value differs from the live CR value AND the field is not explicitly in
+// `spec.takeover[]`. Other local:*-owned leaves stay in the apply body — the
+// controller's force-conflicts pass will silently claim them (no co-ownership
+// is allowed in the steady state).
 //
-// Granularity is per-leaf, not per-server entry: if admin owns one iDRAC field
-// on a server, the controller still updates that server's hostname/oobIP and the
-// other iDRAC fields. Only the specific leaves admin owns are excluded.
+// Three cases per local:*-owned leaf:
+//   - Field is in spec.takeover[] → KEEP (explicit reject/accept; force-claim
+//     even though values disagree).
+//   - intent value == live value → KEEP (no conflict; force-claim silently
+//     evicts local:* on the next force-conflicts apply).
+//   - intent value != live value, no takeover → OMIT (genuine override; bow
+//     out, preserve local:*'s ownership; surfaces as divergence in the next
+//     report).
 //
-// Mechanism: round-trip spec → JSON map → delete admin-owned paths → JSON →
-// typed spec. Because all leaf fields in IdracSpec/ServerSpec are *bool/*string
-// with omitempty (ADR-007), deleted leaves decode as nil and are absent from
-// the serialized SSA apply.
-func omitAdminOwnedFields(spec armadav1.ConfigBundleSpec, managedFields []metav1.ManagedFieldsEntry) (*armadav1.ConfigBundleSpec, error) {
-	raw, err := json.Marshal(spec)
+// Granularity is per-leaf: if admin owns one iDRAC field on a server, the
+// controller still updates the rest of that server.
+//
+// Mechanism: round-trip spec → JSON map → mark-and-delete bow-out paths →
+// JSON → typed spec. Leaf pointers (ADR-007) with omitempty serialize as
+// absent when nil, which is the SSA-correct way to "not claim this field."
+func omitAdminOwnedFields(intent armadav1.ConfigBundleSpec, live armadav1.ConfigBundleSpec, managedFields []metav1.ManagedFieldsEntry) (*armadav1.ConfigBundleSpec, error) {
+	rawIntent, err := json.Marshal(intent)
 	if err != nil {
-		return nil, fmt.Errorf("marshal spec: %w", err)
+		return nil, fmt.Errorf("marshal intent: %w", err)
 	}
-	var specMap map[string]any
-	if err := json.Unmarshal(raw, &specMap); err != nil {
-		return nil, fmt.Errorf("unmarshal spec: %w", err)
+	var intentMap map[string]any
+	if err := json.Unmarshal(rawIntent, &intentMap); err != nil {
+		return nil, fmt.Errorf("unmarshal intent: %w", err)
 	}
+	rawLive, err := json.Marshal(live)
+	if err != nil {
+		return nil, fmt.Errorf("marshal live: %w", err)
+	}
+	var liveMap map[string]any
+	if err := json.Unmarshal(rawLive, &liveMap); err != nil {
+		return nil, fmt.Errorf("unmarshal live: %w", err)
+	}
+
+	// Takeover set: (serverOrbId|field) — KEEP these in apply even when values
+	// disagree (force-claim on the next force-conflicts apply). Used for
+	// Accept/Reject resolutions.
+	//
+	// Ignored set: (serverOrbId|field) — OMIT these from apply unconditionally,
+	// even when values match (so auto-claim doesn't silently evict the local
+	// manager). Used for Ignore resolutions. takeoverSet takes precedence if
+	// somehow both lists name the same field (shouldn't happen — orbital writes
+	// one resolution row per field, mutually exclusive actions).
+	takeoverSet := map[string]bool{}
+	for _, t := range intent.Takeover {
+		takeoverSet[takeoverKey(t.ServerOrbID, t.Field)] = true
+	}
+	ignoredSet := map[string]bool{}
+	for _, ig := range intent.Ignored {
+		k := takeoverKey(ig.ServerOrbID, ig.Field)
+		if !takeoverSet[k] {
+			ignoredSet[k] = true
+		}
+	}
+
 	for _, entry := range managedFields {
 		// Match any "local:<id>" field manager — per-person identities, not just "local:admin".
 		if !strings.HasPrefix(entry.Manager, "local:") || entry.FieldsV1 == nil {
@@ -437,10 +484,18 @@ func omitAdminOwnedFields(spec armadav1.ConfigBundleSpec, managedFields []metav1
 		// FieldsV1 root holds {"f:spec": {...}}; descend into the spec subtree.
 		specOwned, _ := fields["f:spec"].(map[string]any)
 		if specOwned != nil {
-			deleteOwnedPaths(specMap, specOwned)
+			deleteOwnedPaths(intentMap, liveMap, specOwned, "", takeoverSet, ignoredSet)
 		}
 	}
-	filtered, err := json.Marshal(specMap)
+
+	// Even when local:* doesn't claim a field, an Ignore directive must still
+	// keep the controller from claiming it (e.g., orbital decided to ignore a
+	// field that the edge admin later released). Walk spec.Ignored directly
+	// and strip those leaves from intentMap regardless of managedFields state.
+	for _, ig := range intent.Ignored {
+		stripIgnoredField(intentMap, ig.ServerOrbID, ig.Field)
+	}
+	filtered, err := json.Marshal(intentMap)
 	if err != nil {
 		return nil, fmt.Errorf("marshal filtered spec: %w", err)
 	}
@@ -451,12 +506,29 @@ func omitAdminOwnedFields(spec armadav1.ConfigBundleSpec, managedFields []metav1
 	return &result, nil
 }
 
-// deleteOwnedPaths walks an SSA FieldsV1 subtree and deletes corresponding
-// leaves from target (a decoded spec subtree). FieldsV1 encoding rules:
-//   - "f:fieldName": {}     → admin owns the entire field; delete target[fieldName]
+// takeoverKey builds the per-(server, field) key used in the takeover set.
+// serverOrbID is empty for top-level (non-per-server) takeover entries.
+func takeoverKey(serverOrbID, field string) string {
+	return serverOrbID + "|" + field
+}
+
+// deleteOwnedPaths walks an SSA FieldsV1 subtree and deletes leaves from
+// intentMap based on the four-way rule:
+//   - in ignoredSet → omit unconditionally (Ignore: never claim, regardless of value)
+//   - in takeoverSet → keep (Accept/Reject: force-claim regardless of value)
+//   - values match → keep (auto-claim silently evicts local:*)
+//   - values differ → omit (bow out, preserve override)
+//
+// scope tracks the server-orbId context as we descend into spec.servers[]:
+// empty at top-level; set to the orbId when we enter a k:{"orbId":"X"} subtree.
+// Used to build the takeoverSet/ignoredSet key consistent with how spec.takeover[]
+// and spec.ignored[] are keyed (serverOrbId+field).
+//
+// FieldsV1 encoding rules:
+//   - "f:fieldName": {}     → admin owns the entire field
 //   - "f:fieldName": {...}  → admin owns leaves within; recurse
 //   - "k:{...}" keys appear only under an "f:listField" parent (handled below)
-func deleteOwnedPaths(target map[string]any, owned map[string]any) {
+func deleteOwnedPaths(intentMap, liveMap, owned map[string]any, scope string, takeoverSet, ignoredSet map[string]bool) {
 	for ownedKey, ownedVal := range owned {
 		if !strings.HasPrefix(ownedKey, "f:") {
 			continue
@@ -464,24 +536,116 @@ func deleteOwnedPaths(target map[string]any, owned map[string]any) {
 		field := strings.TrimPrefix(ownedKey, "f:")
 		ownedSubtree, _ := ownedVal.(map[string]any)
 		if len(ownedSubtree) == 0 {
-			delete(target, field)
+			// Leaf claim. Four-way decision.
+			key := takeoverKey(scope, field)
+			if ignoredSet[key] {
+				delete(intentMap, field)
+				continue
+			}
+			if takeoverSet[key] {
+				continue
+			}
+			liveVal := liveMap[field]
+			intentVal := intentMap[field]
+			if !leafValuesEqual(intentVal, liveVal) {
+				delete(intentMap, field)
+			}
 			continue
 		}
-		switch tv := target[field].(type) {
+		// Non-leaf claim: descend.
+		switch iv := intentMap[field].(type) {
 		case map[string]any:
-			deleteOwnedPaths(tv, ownedSubtree)
+			lv, _ := liveMap[field].(map[string]any)
+			deleteOwnedPaths(iv, nullSafeMap(lv), ownedSubtree, scope, takeoverSet, ignoredSet)
 		case []any:
-			target[field] = filterOwnedFromList(tv, ownedSubtree)
+			lvList, _ := liveMap[field].([]any)
+			intentMap[field] = filterOwnedFromList(iv, lvList, ownedSubtree, takeoverSet, ignoredSet)
 		}
 	}
 }
 
-// filterOwnedFromList applies admin-owned deletions inside a list field whose
+// stripIgnoredField removes (serverOrbID, field) from intentMap regardless of
+// managedFields state. Companion to deleteOwnedPaths: that function only walks
+// fields a local:* manager already claims, so it can't catch the case where
+// an Ignore resolution exists but no local:* has claimed yet. This sweep
+// ensures the controller never includes ignored fields in its apply body.
+//
+// serverOrbID == "" means the field is at spec top-level (not under a server
+// entry). Empty intentMap or missing path → no-op.
+func stripIgnoredField(intentMap map[string]any, serverOrbID, field string) {
+	if serverOrbID == "" {
+		delete(intentMap, field)
+		// Also walk the field as a possible nested struct, e.g., to strip
+		// "idrac.fooField" we'd need a path traversal. For MVP we keep only
+		// the top-level case explicit; the per-server case below handles the
+		// idrac.* leaves which are the dominant Ignore target today.
+		return
+	}
+	servers, ok := intentMap["servers"].([]any)
+	if !ok {
+		return
+	}
+	for _, item := range servers {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := entry["orbId"].(string)
+		if id != serverOrbID {
+			continue
+		}
+		if _, present := entry[field]; present {
+			delete(entry, field)
+		}
+		// Idrac sub-struct: leaf fields on IdracSpec live under "idrac".
+		if idrac, ok := entry["idrac"].(map[string]any); ok {
+			delete(idrac, field)
+		}
+	}
+}
+
+// nullSafeMap returns a non-nil map for safe key access during descent.
+func nullSafeMap(m map[string]any) map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	return m
+}
+
+// leafValuesEqual compares two decoded JSON leaf values (bools, strings, numbers,
+// nil) for equality. Used to decide bow-out vs force-claim on local:*-owned leaves.
+func leafValuesEqual(a, b any) bool {
+	// reflect.DeepEqual handles nil, bool, string, json.Number, and matching types.
+	// JSON numbers decode as float64 — same on both sides since both came through
+	// json.Unmarshal of the same go struct shape.
+	if a == nil && b == nil {
+		return true
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+// filterOwnedFromList applies bow-out deletions inside a list field whose
 // SSA strategy is listType=map. owned holds "k:{...}" entries identifying the
-// list elements admin claims. For entries admin owns entirely (empty subtree),
-// the element is dropped from the returned slice; for partial ownership, the
-// element is kept with admin-owned leaves deleted.
-func filterOwnedFromList(target []any, owned map[string]any) []any {
+// list elements admin claims. For each claimed entry we descend with the
+// scope set to the orbId so deleteOwnedPaths can consult the takeover/ignored
+// sets.
+//
+// Elements where admin owns the entire entry (empty subtree) are dropped only
+// when none of their fields are in takeoverSet — otherwise they're kept so
+// the takeover pass can force-claim them.
+func filterOwnedFromList(target []any, live []any, owned map[string]any, takeoverSet, ignoredSet map[string]bool) []any {
+	// Build orbId → live entry index for quick lookup during descent.
+	liveByOrbID := map[string]map[string]any{}
+	for _, item := range live {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if id, _ := entry["orbId"].(string); id != "" {
+			liveByOrbID[id] = entry
+		}
+	}
+
 	out := make([]any, 0, len(target))
 	for _, item := range target {
 		entry, ok := item.(map[string]any)
@@ -489,6 +653,10 @@ func filterOwnedFromList(target []any, owned map[string]any) []any {
 			out = append(out, item)
 			continue
 		}
+		// Scope for the takeover key is this entry's orbId (listMapKey).
+		orbID, _ := entry["orbId"].(string)
+		liveEntry := liveByOrbID[orbID]
+
 		drop := false
 		for ownedKey, ownedVal := range owned {
 			if !strings.HasPrefix(ownedKey, "k:") {
@@ -503,10 +671,14 @@ func filterOwnedFromList(target []any, owned map[string]any) []any {
 			}
 			ownedSubtree, _ := ownedVal.(map[string]any)
 			if len(ownedSubtree) == 0 {
+				// admin owns the entire entry. With no per-leaf takeover/value
+				// data to consult here, fall back to the pre-simplification
+				// behavior: drop. Rare path — granular `f:fieldname` claims
+				// per the SSA encoding are the common case.
 				drop = true
 				break
 			}
-			deleteOwnedPaths(entry, ownedSubtree)
+			deleteOwnedPaths(entry, nullSafeMap(liveEntry), ownedSubtree, orbID, takeoverSet, ignoredSet)
 			// Restore listMapKey fields. Admin co-owns the key (SSA always claims
 			// it on the apply), but the entry must still carry its key to remain
 			// a valid associative-list element.

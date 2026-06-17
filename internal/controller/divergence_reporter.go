@@ -144,12 +144,12 @@ func (r *DivergenceReporter) extractOverrides(cb *armadav1.ConfigBundle, mapping
 		intended := resolveValue(lastManifest, ap.path)
 		override := resolveValue(cb.Spec, ap.path)
 
-		// Skip if the field isn't part of the current manifest's intent.
-		// This happens when orbital has resolved a prior divergence as `ignore`:
-		// the bundler omits the field from the cb-manifest entirely, cb-controller
-		// releases its claim, and only local:<id> remains as owner. Reporting it
-		// again would re-trigger the same ignore decision every tick (loop).
-		// A typed-nil pointer wrapped in interface{} is NOT == nil, so use the helper.
+		// Skip if the field isn't part of the current manifest's intent. After
+		// the spec.ignored[] migration this should only happen for fields the
+		// bundler genuinely doesn't know about (schema drift, late-added local
+		// override on a field not in any orbital ConfigItem); not for Ignore
+		// resolutions (those now stay in spec.servers[N].<field> with intent
+		// value alongside spec.ignored[]).
 		if intendedAbsent(intended) {
 			continue
 		}
@@ -263,6 +263,7 @@ func warnNonConformingManagers(logger logrLogger, cbName string, managedFields [
 // explicit logr import here; controller-runtime's log package returns this shape.
 type logrLogger interface {
 	Info(msg string, keysAndValues ...any)
+	Error(err error, msg string, keysAndValues ...any)
 }
 
 // extractAdminPaths parses managedFields to find all leaf field paths owned by

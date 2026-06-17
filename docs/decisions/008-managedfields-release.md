@@ -103,6 +103,67 @@ Pending (un-resolved) divergences are also preserved: a field with no resolution
 
 If the release fails (rare: concurrent reconcile, CRD validation regression), `processTakeover` logs the error but returns success. The takeover apply itself succeeded — values are correct. Reporting the release failure as a hard error would mask the successful value transfer. The next bundle re-runs takeover, which re-attempts the release.
 
+### Refinement (2026-06-16): Ignore via spec.ignored[], not bundler omission
+
+Initial design had the bundler nil out (omit) ignored fields entirely, relying on cb-controller's "if not in apply, don't claim" behavior to preserve local:* ownership. That worked for the steady state, but two problems surfaced:
+
+1. **Divergence-reporter could not see ignored fields** because lastManifest didn't contain the intent value to compare against. Reporter skipped them via `intendedAbsent`. Orbital then loop-closed the entry (no incoming report → entry+resolution deleted on next ingest), bundler stopped emitting the omission, cb-controller silently auto-claimed the field, and the Ignore decision was undone without any signal.
+2. **Operator framing.** Ignore should not be a "fire and forget" mute. It's a deliberate "leave to edge" decision that must remain visible — overrides keep being surfaced so the operator can re-decide if circumstances change.
+
+The fix is a new CRD field `spec.ignored []IgnoredEntry`, parallel to `spec.takeover[]`:
+
+```yaml
+spec:
+  servers:
+    - orbId: colo:srv-1
+      idrac:
+        racadmEnabled: true     # intent value STAYS in spec
+  ignored:
+    - serverOrbId: colo:srv-1
+      orbId: colo:srv-1-idrac
+      field: racadmEnabled       # but don't claim it
+```
+
+cb-controller's reconcile per-field decision tree now:
+
+| State | Action |
+|---|---|
+| Field in `spec.ignored[]` | OMIT from apply unconditionally — local:* retains regardless of value match |
+| Field in `spec.takeover[]` | KEEP + force-claim regardless of value match |
+| local:* claims AND values match | KEEP (auto-claim silently evicts local:*) |
+| local:* claims AND values differ | OMIT (bow out, preserve override) |
+| no local:* claim | normal apply |
+
+The divergence-reporter no longer skips ignored fields (it has the intent value from lastManifest's preserved `spec.servers[N].<field>` and reports any local:* claim with value mismatch). Orbital sees the entry in every report, so loop closure never fires for an Ignore — the entry + resolution persist until something else changes.
+
+Pinned by `TestBuildIgnored_IntentValuesStayInSpec` (bundler emits the directive without nilling values) and `TestOmitAdminOwnedFields_IgnoredAlwaysOmittedEvenOnValueMatch` (controller bows out unconditionally for ignored fields, even when values would otherwise trigger auto-claim).
+
+### Refinement (2026-06-16): no steady-state co-ownership
+
+The original `omitAdminOwnedFields` removed *every* local:*-owned leaf from the controller's apply body. That left the field as `local:*`-only after the apply, and the divergence-reporter would report every local:* claim as divergence — including the case where local:*'s value happened to match cloud intent (e.g., another admin updated intent to match a previously-overridden edge value). The result was a stuck loop: values agreed but ownership stayed split, the reporter kept emitting, no admin action could close the loop without manual Ignore.
+
+The simplification (2026-06-16): cb-controller bows out **only** on genuine value mismatch + no explicit takeover. The three cases per local:*-owned leaf:
+
+| Case | Action | Result |
+|---|---|---|
+| Field in `spec.takeover[]` | KEEP in apply body | force-conflicts pass claims, evicts local:* (explicit Accept/Reject) |
+| intent value == live value | KEEP in apply body | force-conflicts silently claims, evicts local:* (no real conflict) |
+| intent value != live value, no takeover | OMIT (bow out) | local:* retains; surfaces as divergence in the next report |
+
+The main consume Apply now always carries `client.ForceOwnership`. Co-ownership is no longer a steady state — every Apply that includes a field claims it. The release-pass logic above is unchanged: still needed to clean up stale local:* manager records after the force-claim transfers ownership.
+
+**Why this avoids the stuck loop:** when another cloud admin's edit causes values to converge while a divergence resolution is still pending, the next reconcile auto-claims the field (values match → KEEP → force) and the local:* manager is evicted. The reporter then sees no co-manager → no further divergence emitted. The pending resolution gets loop-closed by the next divergence report that omits the field.
+
+**Why this preserves the negotiation:**
+
+- Genuine override (values differ) → cb-controller bows out → local:* retains → reporter sees the override + value mismatch → divergence emitted → admin sees and decides.
+- Explicit Reject → field appears in `spec.takeover[]` → cb-controller force-claims regardless of value → edge value reverts to intent.
+- Explicit Ignore → field omitted from spec entirely (bundler-side concern, unchanged) → cb-controller never claims → local:* sole owner indefinitely.
+
+Pinned by `TestOmitAdminOwnedFields_BowsOutOnValueMismatch`, `TestOmitAdminOwnedFields_KeepsOnValueMatchForAutoClaim`, `TestOmitAdminOwnedFields_KeepsTakeoverTargetEvenOnMismatch`, and `TestOmitAdminOwnedFields_BatchSiblingsOnSameServer` (the user-reported regression: batch Reject sshEnabled + Accept ipmiEnabled on the same IdracSettings — both fields must survive the omit pass).
+
+**Scope of the no-co-ownership rule: VALUE fields only.** SSA's `listType=map` protocol structurally requires any manager that claims a leaf inside a list entry to also claim the entry's `listMapKey` (and entry-presence `.` marker). So `f:orbId` on a server entry, the `.` marker, and struct wrappers like `f:idrac` will appear co-owned by cb-controller and local:* whenever both have any leaf claim on that entry — both write identical values, no SSA conflict, no behavior impact. The reporter ignores these (value comparison passes), the release-pass strips them when the last value-claim is released, and force-apply doesn't need them. The invariant is "no co-ownership of fields whose values drive divergence," not "no co-ownership of any field."
+
 ## Consequences
 
 **Positive:**

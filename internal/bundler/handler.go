@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"reflect"
-	"strings"
 
 	"sigs.k8s.io/yaml"
 
@@ -72,17 +70,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	spec := mapToSpec(results[0])
 	mapping := buildMapping(results[0])
 
-	// Query both takeover (accept+reject) and omission (ignore) resolutions.
-	// Order matters for the apply config: omissions zero out fields first, then
-	// the takeover list is computed (omissions never conflict with takeover —
-	// orbital writes one resolution row per field, mutually exclusive actions).
+	// Query both takeover (accept+reject) and ignored resolutions. Both surface
+	// as parallel directive lists in the manifest (spec.takeover / spec.ignored).
+	// Field values stay in the spec for either list — cb-controller decides
+	// per-field at reconcile time. Ignored fields keep their intent value so
+	// the divergence-reporter can compare it against the local override and
+	// continue surfacing the divergence.
 	if h.Resolutions != nil {
 		omissions, err := h.Resolutions.QueryOmissions(r.Context())
 		if err != nil {
 			http.Error(w, "query omissions: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		applyOmissions(&spec, omissions, mapping)
+		spec.Ignored = buildIgnored(omissions, mapping)
 
 		resolutions, err := h.Resolutions.QueryPendingForce(r.Context())
 		if err != nil {
@@ -145,59 +145,32 @@ func buildTakeover(resolutions []PendingForceResolution, mapping bundle.MappingP
 	return entries
 }
 
-// applyOmissions removes (orbId, field) pairs from spec for each ignore-resolution.
-// The orbId in the Omission identifies an Orbital ConfigItem (e.g. IdracSettings
-// owns idrac fields). We resolve via the mapping rules to find which server the
-// field lives on, then nil out the matching leaf — because IdracSpec/ServerSpec
-// leaves are pointers with omitempty (ADR-007), nil → absent from the serialized
-// apply config → cb-controller releases its claim → local:<id> remains sole manager.
+// buildIgnored translates ignore-resolutions into IgnoredEntry values using the
+// mapping rules to recover the owning server's orbId from each resolution's
+// nested-entity orbId (e.g. "colo:GQK3V64-idrac" → "colo:GQK3V64"). The intent
+// VALUE for the field stays in spec.servers[N] so the divergence-reporter can
+// continue surfacing the divergence; only the cb-controller's claim behavior
+// changes (it bows out unconditionally for fields in this list).
 //
-// Unknown orbIds, fields, or missing server entries are silently skipped — the
-// resolution may belong to a different bundle or a stale entry.
-func applyOmissions(spec *armadav1.ConfigBundleSpec, omissions []Omission, mapping bundle.MappingPayload) {
+// Resolutions whose orbId doesn't match any mapping rule are silently skipped —
+// the resolution may belong to a different bundle or a stale entry.
+func buildIgnored(omissions []Omission, mapping bundle.MappingPayload) []armadav1.IgnoredEntry {
 	if len(omissions) == 0 {
-		return
+		return nil
 	}
-	serverIndex := make(map[string]*armadav1.ServerSpec, len(spec.Servers))
-	for i := range spec.Servers {
-		serverIndex[spec.Servers[i].OrbID] = &spec.Servers[i]
-	}
+	var entries []armadav1.IgnoredEntry
 	for _, om := range omissions {
 		_, serverOrbID, ok := mapping.ResolveByOrbID(om.OrbID)
 		if !ok {
 			continue
 		}
-		server, ok := serverIndex[serverOrbID]
-		if !ok {
-			continue
-		}
-		nilFieldOnServer(server, om.Field)
+		entries = append(entries, armadav1.IgnoredEntry{
+			OrbID:       om.OrbID,
+			ServerOrbID: serverOrbID,
+			Field:       om.Field,
+		})
 	}
-}
-
-// nilFieldOnServer sets the named field on a ServerSpec to its zero value,
-// matching by JSON tag. Tries top-level ServerSpec fields first, then IdracSpec.
-// Returns true if a match was found and zeroed. For pointer leaves (ADR-007),
-// the zero value is nil — and omitempty will exclude it from the serialized YAML.
-func nilFieldOnServer(server *armadav1.ServerSpec, jsonName string) bool {
-	if zeroStructFieldByJSONTag(reflect.ValueOf(server).Elem(), jsonName) {
-		return true
-	}
-	return zeroStructFieldByJSONTag(reflect.ValueOf(&server.Idrac).Elem(), jsonName)
-}
-
-// zeroStructFieldByJSONTag finds a field on v whose first json tag part matches
-// jsonName, sets it to its zero value, and returns true.
-func zeroStructFieldByJSONTag(v reflect.Value, jsonName string) bool {
-	t := v.Type()
-	for i := 0; i < t.NumField(); i++ {
-		tag := strings.Split(t.Field(i).Tag.Get("json"), ",")[0]
-		if tag == jsonName {
-			v.Field(i).SetZero()
-			return true
-		}
-	}
-	return false
+	return entries
 }
 
 // buildMapping produces the structural identity-translation rules for a
