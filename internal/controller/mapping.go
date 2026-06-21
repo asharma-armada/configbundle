@@ -80,6 +80,10 @@ func writeLastAppliedSpec(ctx context.Context, c client.Client, namespace, cbNam
 				cm.Data = map[string]string{}
 			}
 			cm.Data[LastAppliedSpecKey] = string(yamlBytes)
+			// Clean up the pre-ADR-011 mapping.json key if a CM from the old
+			// controller version still has it. The mapping payload was deleted
+			// in ADR-011 — orbIds are now saturated directly on the CR.
+			delete(cm.Data, "mapping.json")
 			return nil
 		})
 		return err

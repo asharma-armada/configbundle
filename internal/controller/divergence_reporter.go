@@ -35,6 +35,12 @@ type DivergenceReporter struct {
 	mu             sync.Mutex
 	lastEventAt    map[types.NamespacedName]time.Time
 	lastPostedHash map[types.NamespacedName][32]byte
+	// lastPostedHadOverrides tracks whether the most recent POST to orb carried
+	// a non-empty override set. Used to silently skip steady-state empty-empty
+	// reconciles — there's nothing to report and orb's view doesn't need refreshing.
+	// Empty→non-empty and non-empty→empty transitions still POST and log, since
+	// those are meaningful state changes.
+	lastPostedHadOverrides map[types.NamespacedName]bool
 
 	lastManifestsMu sync.RWMutex
 	lastManifests   map[string]armadav1.ConfigBundleSpec
@@ -77,9 +83,10 @@ func NewDivergenceReporter(c client.Client, opts ...DivergenceReporterOption) *D
 		debounceWindow:    5 * time.Second,
 		heartbeatInterval: 5 * time.Minute,
 		enabled:           false,
-		lastEventAt:       make(map[types.NamespacedName]time.Time),
-		lastPostedHash:    make(map[types.NamespacedName][32]byte),
-		lastManifests:     make(map[string]armadav1.ConfigBundleSpec),
+		lastEventAt:            make(map[types.NamespacedName]time.Time),
+		lastPostedHash:         make(map[types.NamespacedName][32]byte),
+		lastPostedHadOverrides: make(map[types.NamespacedName]bool),
+		lastManifests:          make(map[string]armadav1.ConfigBundleSpec),
 	}
 	for _, opt := range opts {
 		opt(r)

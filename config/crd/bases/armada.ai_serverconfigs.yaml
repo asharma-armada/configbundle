@@ -189,10 +189,40 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              observed:
+                description: |-
+                  Observed holds the controller's per-field confirmed values — values the
+                  controller has successfully landed on the device (PATCH success), or
+                  confirmed already match on a no-op reconcile. Survives multi-step
+                  reconciles where the condition message can only hold the most recent
+                  action. Absence of a field means the controller has never confirmed it.
+                properties:
+                  idrac:
+                    description: Idrac holds the controller-confirmed iDRAC field
+                      values.
+                    properties:
+                      ipmiEnabled:
+                        type: boolean
+                      racadmEnabled:
+                        type: boolean
+                      sshEnabled:
+                        type: boolean
+                    type: object
+                type: object
               observedFirmwareVersion:
                 description: ObservedFirmwareVersion is the firmware version read
                   from Redfish at last reconcile.
                 type: string
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the spec.generation the controller last successfully
+                  reconciled. Tooling compares this to metadata.generation to know "has the
+                  controller caught up to my spec change yet?" — the K8s-standard
+                  "are we converged?" signal. Bumped on every successful reconcile, even
+                  when no PATCH was needed; gated by "only write if it would change" so
+                  periodic polls don't churn the apiserver.
+                format: int64
+                type: integer
               phase:
                 description: Phase is the current lifecycle phase.
                 enum:
@@ -200,6 +230,33 @@ spec:
                 - Applied
                 - Diverged
                 type: string
+              recentPatches:
+                description: |-
+                  RecentPatches is a bounded list of the last few PATCH actions, newest
+                  first. Lets operators see all PATCHes from a multi-step reconcile (e.g.
+                  a takeover roundtrip that produces multiple sc-controller reconciles)
+                  instead of just the most recent one — the condition `message` field
+                  can only hold one action and gets overwritten across reconciles.
+                  Capped at 5 entries to keep the status object small.
+                items:
+                  description: RecentPatch is one entry in ServerConfigStatus.RecentPatches.
+                  properties:
+                    message:
+                      description: |-
+                        Message describes which fields were PATCHed, e.g.
+                        "PATCHed 2 attribute(s): IPMILan.1.Enable=Disabled, SSH.1.Enable=Disabled".
+                        Same format as the Reconciled condition's message.
+                      type: string
+                    time:
+                      description: Time is when the PATCH succeeded against the iDRAC.
+                      format: date-time
+                      type: string
+                  required:
+                  - message
+                  - time
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
             type: object
         type: object
     served: true

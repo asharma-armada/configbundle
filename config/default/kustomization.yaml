@@ -1,3 +1,11 @@
+# Image versions for this deploy. Bump `newTag` here when rolling out a new
+# build — kustomize rewrites every `controller:latest` placeholder in the
+# manager Deployment. Source of truth: per-component git tags (controller/v*).
+images:
+- name: controller
+  newName: armadaeksatest.azurecr.io/configbundle-controller
+  newTag: v0.0.2
+
 # Adds namespace to all resources.
 namespace: configbundle-system
 

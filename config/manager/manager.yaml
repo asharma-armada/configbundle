@@ -1,16 +1,7 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  labels:
-    control-plane: controller-manager
-    app.kubernetes.io/name: configbundle
-    app.kubernetes.io/managed-by: kustomize
-  name: system
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: controller-manager
+  name: controller
   namespace: system
   labels:
     control-plane: controller-manager
@@ -64,6 +55,11 @@ spec:
           - --leader-elect
           - --health-probe-bind-address=:8081
         image: controller:latest
+        # Always re-pull on rollout — we ship dev iterations against mutable
+        # tags (e.g. v0.0.1 gets overwritten in ACR). Without this, kubelet's
+        # default for non-:latest tags is IfNotPresent and the cached image
+        # sticks. Switch back to IfNotPresent once tags are immutable.
+        imagePullPolicy: Always
         name: manager
         env:
         # OPERATOR_NAMESPACE is where cb-controller writes its own state
@@ -75,8 +71,11 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        # Orb's divergence intake. Orb runs in the `orb` namespace; cb-controller
+        # runs in `configbundle-system` — short-name `orb` only resolves within
+        # the controller's own namespace, so we need the FQDN form.
         - name: ORB_DIVERGENCE_INTAKE_URL
-          value: http://orb:8010/api/v1/divergence
+          value: http://orb.orb.svc.cluster.local:8010/api/v1/divergence
         - name: CB_CONTROLLER_PORT
           value: ":8095"
         ports:
@@ -115,5 +114,5 @@ spec:
             memory: 64Mi
         volumeMounts: []
       volumes: []
-      serviceAccountName: controller-manager
+      serviceAccountName: controller
       terminationGracePeriodSeconds: 10

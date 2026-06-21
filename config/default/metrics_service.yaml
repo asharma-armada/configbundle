@@ -5,7 +5,10 @@ metadata:
     control-plane: controller-manager
     app.kubernetes.io/name: configbundle
     app.kubernetes.io/managed-by: kustomize
-  name: controller-manager-metrics-service
+  # Controller-runtime's built-in metrics endpoint (HTTPS, :8443).
+  # Distinct from sc-controller's app-level `serverconfig-controller-metrics`
+  # which exposes domain gauges on :8093.
+  name: controller-metrics
   namespace: system
 spec:
   ports:

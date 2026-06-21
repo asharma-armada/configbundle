@@ -68,6 +68,15 @@ type ServerConfigStatus struct {
 	// +optional
 	Phase ServerConfigPhase `json:"phase,omitempty"`
 
+	// ObservedGeneration is the spec.generation the controller last successfully
+	// reconciled. Tooling compares this to metadata.generation to know "has the
+	// controller caught up to my spec change yet?" — the K8s-standard
+	// "are we converged?" signal. Bumped on every successful reconcile, even
+	// when no PATCH was needed; gated by "only write if it would change" so
+	// periodic polls don't churn the apiserver.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
 	// Conditions records detailed status conditions.
 	// +optional
 	// +listType=map
@@ -77,6 +86,53 @@ type ServerConfigStatus struct {
 	// ObservedFirmwareVersion is the firmware version read from Redfish at last reconcile.
 	// +optional
 	ObservedFirmwareVersion string `json:"observedFirmwareVersion,omitempty"`
+
+	// Observed holds the controller's per-field confirmed values — values the
+	// controller has successfully landed on the device (PATCH success), or
+	// confirmed already match on a no-op reconcile. Survives multi-step
+	// reconciles where the condition message can only hold the most recent
+	// action. Absence of a field means the controller has never confirmed it.
+	// +optional
+	Observed ObservedStatus `json:"observed,omitempty"`
+
+	// RecentPatches is a bounded list of the last few PATCH actions, newest
+	// first. Lets operators see all PATCHes from a multi-step reconcile (e.g.
+	// a takeover roundtrip that produces multiple sc-controller reconciles)
+	// instead of just the most recent one — the condition `message` field
+	// can only hold one action and gets overwritten across reconciles.
+	// Capped at 5 entries to keep the status object small.
+	// +optional
+	// +listType=atomic
+	RecentPatches []RecentPatch `json:"recentPatches,omitempty"`
+}
+
+// RecentPatch is one entry in ServerConfigStatus.RecentPatches.
+type RecentPatch struct {
+	// Time is when the PATCH succeeded against the iDRAC.
+	Time metav1.Time `json:"time"`
+
+	// Message describes which fields were PATCHed, e.g.
+	// "PATCHed 2 attribute(s): IPMILan.1.Enable=Disabled, SSH.1.Enable=Disabled".
+	// Same format as the Reconciled condition's message.
+	Message string `json:"message"`
+}
+
+// ObservedStatus contains per-domain observed-state ledgers.
+type ObservedStatus struct {
+	// Idrac holds the controller-confirmed iDRAC field values.
+	// +optional
+	Idrac ObservedIdracStatus `json:"idrac,omitempty"`
+}
+
+// ObservedIdracStatus mirrors the controller-managed subset of IdracSpec.
+// Pointer types so absence means "never confirmed" (vs. "confirmed and false").
+type ObservedIdracStatus struct {
+	// +optional
+	SSHEnabled *bool `json:"sshEnabled,omitempty"`
+	// +optional
+	IPMIEnabled *bool `json:"ipmiEnabled,omitempty"`
+	// +optional
+	RacadmEnabled *bool `json:"racadmEnabled,omitempty"`
 }
 
 // +kubebuilder:object:root=true

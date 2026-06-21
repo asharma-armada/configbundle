@@ -2,17 +2,16 @@
 # Controller: controller/v* tags. Bundler: bundler/v* tags.
 # Tag with: git tag controller/v0.1.0  or  git tag bundler/v0.0.2
 #
-# Manual override at the trailing position (conventional Make form):
+# Versions resolve from per-component git tags. Override one explicitly with
+# the matching var on the trailing position:
 #   make push-controller CONTROLLER_VERSION=v0.1.0
 #   make push-bundler    BUNDLER_VERSION=v0.0.4
-# Or use the VERSION umbrella to set both components at once:
-#   make push-controller VERSION=v0.1.0
-#   make push-bundler    VERSION=v0.0.4
+# (There is intentionally NO `VERSION` umbrella var — it silently shadowed
+# the tag-derived version when exported in the shell. Tag the commit instead.)
 ACR                := armadaeksatest.azurecr.io
 MODULE             := github.com/armada/configbundle
-VERSION            ?=
-CONTROLLER_VERSION ?= $(or $(VERSION),$(shell (git describe --tags --match 'controller/v*' --dirty 2>/dev/null || echo "controller/v0.0.0-dev") | sed 's|^controller/||'))
-BUNDLER_VERSION    ?= $(or $(VERSION),$(shell (git describe --tags --match 'bundler/v*' --dirty 2>/dev/null || echo "bundler/v0.0.0-dev") | sed 's|^bundler/||'))
+CONTROLLER_VERSION ?= $(shell (git describe --tags --match 'controller/v*' --dirty 2>/dev/null || echo "controller/v0.0.0-dev") | sed 's|^controller/||')
+BUNDLER_VERSION    ?= $(shell (git describe --tags --match 'bundler/v*' --dirty 2>/dev/null || echo "bundler/v0.0.0-dev") | sed 's|^bundler/||')
 BUNDLER_LDFLAGS    := -ldflags "-X $(MODULE)/internal/version.Version=$(BUNDLER_VERSION)"
 
 # Image URLs
@@ -174,11 +173,6 @@ push-bundler: ## Build and push bundler image to ACR (e.g. make push-bundler BUN
 	docker buildx build --platform linux/amd64 --target bundler \
 		--build-arg BUNDLER_VERSION=$(BUNDLER_VERSION) \
 		-t $(BUNDLER_IMG) --push .
-
-.PHONY: versions
-versions: ## Show the image tags that would be built / pushed right now.
-	@echo "controller: $(CONTROLLER_VERSION)  →  $(IMG)"
-	@echo "bundler:    $(BUNDLER_VERSION)  →  $(BUNDLER_IMG)"
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:

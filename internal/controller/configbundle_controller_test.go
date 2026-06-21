@@ -32,6 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -743,11 +744,16 @@ var _ = Describe("DivergenceReporter", func() {
 
 		// Update status with a digest (informational; divergence reporter no
 		// longer reads a mapping CM under ADR-011, but the status field is
-		// still part of the contract).
-		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cb)).To(Succeed())
-		cb.Status.LastAppliedDigest = "sha256:test-digest"
-		Expect(k8sClient.Status().Update(ctx, &cb)).To(Succeed())
+		// still part of the contract). RetryOnConflict — the configbundle
+		// reconciler also writes Status.ObservedGeneration in the background.
+		Expect(retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			var cb armadav1.ConfigBundle
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cb); err != nil {
+				return err
+			}
+			cb.Status.LastAppliedDigest = "sha256:test-digest"
+			return k8sClient.Status().Update(ctx, &cb)
+		})).To(Succeed())
 
 		// Step 3: Run reporter.Reconcile() directly (lastEventAt is zero → startup case, no debounce).
 		reporter := NewDivergenceReporter(k8sClient,

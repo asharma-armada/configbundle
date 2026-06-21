@@ -111,23 +111,32 @@ func (h *divergenceHeartbeat) tick(ctx context.Context, logger logrLogger) {
 	if len(list.Items) == 0 {
 		return
 	}
-	// Clear the dedup cache for every CR so the next reconcile re-posts even if
-	// the override set is unchanged. The actual re-post fires below.
-	h.reporter.mu.Lock()
+	// Only force-repost CBs that actually have local:* claims. The heartbeat's
+	// purpose is recovering from an orb state wipe — but if a CB has no local
+	// overrides, orb's view is "empty" with or without a wipe, so re-posting
+	// an empty payload would be noise. CBs with claims get the dedup hash
+	// cleared so Reconcile re-POSTs even if the override set is unchanged.
+	var withClaims []armadav1.ConfigBundle
 	for _, cb := range list.Items {
+		if len(extractAdminPaths(cb.ManagedFields)) > 0 {
+			withClaims = append(withClaims, cb)
+		}
+	}
+	h.reporter.mu.Lock()
+	for _, cb := range withClaims {
 		delete(h.reporter.lastPostedHash, types.NamespacedName{Name: cb.Name})
 	}
 	h.reporter.mu.Unlock()
-	// Trigger reconcile for each CR. Direct call bypasses the work queue —
-	// acceptable here because we ARE the periodic re-sync; there's no event
-	// debouncing to honor.
-	for _, cb := range list.Items {
+	// Trigger reconcile for each CR with claims. Direct call bypasses the work
+	// queue — acceptable here because we ARE the periodic re-sync; there's no
+	// event debouncing to honor.
+	for _, cb := range withClaims {
 		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cb.Name}}
 		if _, err := h.reporter.Reconcile(ctx, req); err != nil {
 			logger.Error(err, "reconcile failed", "configbundle", cb.Name)
 		}
 	}
-	logger.Info("heartbeat tick complete", "configbundles", len(list.Items))
+	logger.Info("heartbeat tick complete", "configbundles", len(list.Items), "withClaims", len(withClaims))
 }
 
 // Reconcile is called when a ConfigBundle CR's local:* managed fields change.
@@ -177,9 +186,22 @@ func (r *DivergenceReporter) Reconcile(ctx context.Context, req reconcile.Reques
 	h := contentHash(payload)
 	r.mu.Lock()
 	sameHash := r.lastPostedHash[req.NamespacedName] == h
+	lastHadOverrides := r.lastPostedHadOverrides[req.NamespacedName]
 	r.mu.Unlock()
 	if sameHash {
-		logger.Info("override set unchanged, skipping POST", "configbundle", req.Name)
+		logger.V(1).Info("override set unchanged, skipping POST", "configbundle", req.Name)
+		return reconcile.Result{}, nil
+	}
+
+	// Steady-state quiet: when this Reconcile would just send "still no overrides"
+	// (current empty AND last post was also empty), skip the POST and the log.
+	// Hash mismatch in this case comes from heartbeat clearing or fresh reporter
+	// startup, not from an actual state change. Transitions in either direction
+	// (empty→non-empty, non-empty→empty) still POST and log — those are meaningful.
+	if len(overrides) == 0 && !lastHadOverrides {
+		r.mu.Lock()
+		r.lastPostedHash[req.NamespacedName] = h
+		r.mu.Unlock()
 		return reconcile.Result{}, nil
 	}
 
@@ -190,9 +212,17 @@ func (r *DivergenceReporter) Reconcile(ctx context.Context, req reconcile.Reques
 
 	r.mu.Lock()
 	r.lastPostedHash[req.NamespacedName] = h
+	r.lastPostedHadOverrides[req.NamespacedName] = len(overrides) > 0
 	r.mu.Unlock()
 
-	logger.Info("reported divergence", "configbundle", req.Name, "overrides", len(overrides))
+	if len(overrides) > 0 {
+		logger.Info("reported divergence", "configbundle", req.Name, "overrides", len(overrides))
+	} else {
+		// Non-empty → empty transition. The override set was just cleared (e.g.
+		// local:admin released the field, or the cloud admin's takeover landed).
+		// Worth surfacing as a distinct log line from the steady-state quiet path.
+		logger.Info("cleared divergence (override set went empty)", "configbundle", req.Name)
+	}
 	return reconcile.Result{}, nil
 }
 
@@ -209,7 +239,14 @@ func (r *DivergenceReporter) predicate() predicate.Predicate {
 			r.mu.Unlock()
 			return true
 		},
-		CreateFunc:  func(_ event.CreateEvent) bool { return false },
+		// Fire on Create so a controller restart / rollout immediately re-establishes
+		// the divergence picture on orb. The reconcile path is naturally cold-start-safe:
+		//   - lastEventAt is zero for these → debounce check passes (treated as startup)
+		//   - lastPostedHash is empty → POST fires unconditionally (no dedup race)
+		//   - lastManifest guard skips the POST if bootstrap hasn't loaded it yet
+		// This closes the up-to-heartbeat-interval observability gap that would
+		// otherwise exist after every rollout.
+		CreateFunc:  func(_ event.CreateEvent) bool { return true },
 		DeleteFunc:  func(_ event.DeleteEvent) bool { return false },
 		GenericFunc: func(_ event.GenericEvent) bool { return false },
 	}
