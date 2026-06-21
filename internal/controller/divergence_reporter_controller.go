@@ -53,8 +53,9 @@ type lastManifestLoader struct {
 
 func (l *lastManifestLoader) Start(ctx context.Context) error {
 	logger := log.FromContext(ctx).WithName("divergence-reporter").WithName("bootstrap")
+	// ConfigBundle is cluster-scoped — list cluster-wide.
 	var list armadav1.ConfigBundleList
-	if err := l.reporter.Client.List(ctx, &list, client.InNamespace(l.reporter.namespace)); err != nil {
+	if err := l.reporter.Client.List(ctx, &list); err != nil {
 		logger.Info("list ConfigBundles failed; lastManifests will rely on next dispatch", "err", err.Error())
 		return nil
 	}
@@ -101,8 +102,9 @@ func (h *divergenceHeartbeat) Start(ctx context.Context) error {
 }
 
 func (h *divergenceHeartbeat) tick(ctx context.Context, logger logrLogger) {
+	// ConfigBundle is cluster-scoped — list cluster-wide.
 	var list armadav1.ConfigBundleList
-	if err := h.reporter.Client.List(ctx, &list, client.InNamespace(h.reporter.namespace)); err != nil {
+	if err := h.reporter.Client.List(ctx, &list); err != nil {
 		logger.Info("list ConfigBundles failed", "err", err.Error())
 		return
 	}
@@ -113,14 +115,14 @@ func (h *divergenceHeartbeat) tick(ctx context.Context, logger logrLogger) {
 	// the override set is unchanged. The actual re-post fires below.
 	h.reporter.mu.Lock()
 	for _, cb := range list.Items {
-		delete(h.reporter.lastPostedHash, types.NamespacedName{Name: cb.Name, Namespace: cb.Namespace})
+		delete(h.reporter.lastPostedHash, types.NamespacedName{Name: cb.Name})
 	}
 	h.reporter.mu.Unlock()
 	// Trigger reconcile for each CR. Direct call bypasses the work queue —
 	// acceptable here because we ARE the periodic re-sync; there's no event
 	// debouncing to honor.
 	for _, cb := range list.Items {
-		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cb.Name, Namespace: cb.Namespace}}
+		req := reconcile.Request{NamespacedName: types.NamespacedName{Name: cb.Name}}
 		if _, err := h.reporter.Reconcile(ctx, req); err != nil {
 			logger.Error(err, "reconcile failed", "configbundle", cb.Name)
 		}
@@ -153,15 +155,6 @@ func (r *DivergenceReporter) Reconcile(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, client.IgnoreNotFound(err)
 	}
 
-	mapping, err := readMappingConfigMap(ctx, r.Client, req.Namespace, req.Name)
-	if err != nil {
-		if client.IgnoreNotFound(err) == nil {
-			logger.Info("no mapping ConfigMap yet, skipping", "configbundle", req.Name)
-			return reconcile.Result{}, nil
-		}
-		return reconcile.Result{}, fmt.Errorf("read mapping ConfigMap: %w", err)
-	}
-
 	warnNonConformingManagers(logger, cb.Name, cb.ManagedFields)
 
 	r.lastManifestsMu.RLock()
@@ -178,7 +171,7 @@ func (r *DivergenceReporter) Reconcile(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, nil
 	}
 
-	overrides := r.extractOverrides(&cb, mapping, lastManifest)
+	overrides := r.extractOverrides(&cb, lastManifest)
 	payload := DivergencePayload{Overrides: overrides}
 
 	h := contentHash(payload)
@@ -209,7 +202,8 @@ func (r *DivergenceReporter) predicate() predicate.Predicate {
 			if !localManagersChanged(e.ObjectOld.GetManagedFields(), e.ObjectNew.GetManagedFields()) {
 				return false
 			}
-			key := types.NamespacedName{Name: e.ObjectNew.GetName(), Namespace: e.ObjectNew.GetNamespace()}
+			// ConfigBundle is cluster-scoped — Namespace is always "".
+			key := types.NamespacedName{Name: e.ObjectNew.GetName()}
 			r.mu.Lock()
 			r.lastEventAt[key] = time.Now()
 			r.mu.Unlock()

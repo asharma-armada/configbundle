@@ -68,7 +68,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	spec := mapToSpec(results[0])
-	mapping := buildMapping(results[0])
 
 	// Query both takeover (accept+reject) and ignored resolutions. Both surface
 	// as parallel directive lists in the manifest (spec.takeover / spec.ignored).
@@ -76,31 +75,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// per-field at reconcile time. Ignored fields keep their intent value so
 	// the divergence-reporter can compare it against the local override and
 	// continue surfacing the divergence.
+	//
+	// After ADR-011: orbId lookups walk spec.servers[].idrac.orbId directly
+	// instead of consulting a mapping payload. The spec IS the identity manifest.
 	if h.Resolutions != nil {
 		omissions, err := h.Resolutions.QueryOmissions(r.Context())
 		if err != nil {
 			http.Error(w, "query omissions: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		spec.Ignored = buildIgnored(omissions, mapping)
+		spec.Ignored = buildIgnored(omissions, spec.Servers)
 
 		resolutions, err := h.Resolutions.QueryPendingForce(r.Context())
 		if err != nil {
 			http.Error(w, "query pending-force: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		spec.Takeover = buildTakeover(resolutions, mapping)
+		spec.Takeover = buildTakeover(resolutions, spec.Servers)
 	}
 
 	yamlBytes, err := yaml.Marshal(spec)
 	if err != nil {
 		http.Error(w, "marshal manifest: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	mappingBytes, err := json.Marshal(mapping)
-	if err != nil {
-		http.Error(w, "marshal mapping: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -110,10 +106,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				MediaType: bundle.MediaTypeManifest,
 				Data:      base64.StdEncoding.EncodeToString(yamlBytes),
 			},
-			{
-				MediaType: bundle.MediaTypeMapping,
-				Data:      base64.StdEncoding.EncodeToString(mappingBytes),
-			},
 		},
 	}
 
@@ -121,97 +113,82 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// buildTakeover translates pending accept/reject-resolutions into TakeoverEntry values
-// using the mapping rules to recover the owning server's orbId from each
-// resolution's nested-entity orbId (e.g. "colo:GQK3V64-idrac" → "colo:GQK3V64").
-// Resolutions whose orbId doesn't match any mapping rule are silently skipped —
+// findServerByNestedOrbID returns the ServerSpec whose nested-entity orbId matches
+// the given resolution orbId (e.g. resolution orbId "colo:GQK3V64-idrac" matches
+// the server whose Idrac.OrbID == "colo:GQK3V64-idrac"). Returns nil if no match.
+//
+// Replaces bundle.MappingPayload.ResolveByOrbID (deleted in ADR-011). The
+// suffix convention ("<server>-idrac") is no longer encoded anywhere — instead
+// every nested entity stores its own orbId directly on the CR, and the lookup
+// is a direct walk.
+func findServerByNestedOrbID(orbID string, servers []armadav1.ServerSpec) *armadav1.ServerSpec {
+	for i := range servers {
+		if servers[i].Idrac.OrbID == orbID {
+			return &servers[i]
+		}
+		// Future: extend with other nested types here as they're added.
+	}
+	return nil
+}
+
+// buildTakeover translates pending accept/reject-resolutions into TakeoverEntry values.
+// For each resolution, looks up the owning server by matching the resolution's orbId
+// against each server's nested-entity orbIds (e.g. Idrac.OrbID).
+// Resolutions whose orbId doesn't match any server are silently skipped —
 // the resolution may belong to a different bundle or a stale entry.
-func buildTakeover(resolutions []PendingForceResolution, mapping bundle.MappingPayload) []armadav1.TakeoverEntry {
+func buildTakeover(resolutions []PendingForceResolution, servers []armadav1.ServerSpec) []armadav1.TakeoverEntry {
 	if len(resolutions) == 0 {
 		return nil
 	}
 	var entries []armadav1.TakeoverEntry
 	for _, res := range resolutions {
-		_, serverOrbID, ok := mapping.ResolveByOrbID(res.OrbID)
-		if !ok {
+		server := findServerByNestedOrbID(res.OrbID, servers)
+		if server == nil {
 			continue
 		}
 		entries = append(entries, armadav1.TakeoverEntry{
 			OrbID:       res.OrbID,
-			ServerOrbID: serverOrbID,
+			ServerOrbID: server.OrbID,
 			Field:       res.Field,
 		})
 	}
 	return entries
 }
 
-// buildIgnored translates ignore-resolutions into IgnoredEntry values using the
-// mapping rules to recover the owning server's orbId from each resolution's
-// nested-entity orbId (e.g. "colo:GQK3V64-idrac" → "colo:GQK3V64"). The intent
-// VALUE for the field stays in spec.servers[N] so the divergence-reporter can
-// continue surfacing the divergence; only the cb-controller's claim behavior
-// changes (it bows out unconditionally for fields in this list).
+// buildIgnored translates ignore-resolutions into IgnoredEntry values. Same lookup
+// model as buildTakeover. The intent VALUE for the field stays in spec.servers[N]
+// so the divergence-reporter can continue surfacing the divergence; only the
+// cb-controller's claim behavior changes (it bows out unconditionally for fields
+// in this list).
 //
-// Resolutions whose orbId doesn't match any mapping rule are silently skipped —
+// Resolutions whose orbId doesn't match any server are silently skipped —
 // the resolution may belong to a different bundle or a stale entry.
-func buildIgnored(omissions []Omission, mapping bundle.MappingPayload) []armadav1.IgnoredEntry {
+func buildIgnored(omissions []Omission, servers []armadav1.ServerSpec) []armadav1.IgnoredEntry {
 	if len(omissions) == 0 {
 		return nil
 	}
 	var entries []armadav1.IgnoredEntry
 	for _, om := range omissions {
-		_, serverOrbID, ok := mapping.ResolveByOrbID(om.OrbID)
-		if !ok {
+		server := findServerByNestedOrbID(om.OrbID, servers)
+		if server == nil {
 			continue
 		}
 		entries = append(entries, armadav1.IgnoredEntry{
 			OrbID:       om.OrbID,
-			ServerOrbID: serverOrbID,
+			ServerOrbID: server.OrbID,
 			Field:       om.Field,
 		})
 	}
 	return entries
 }
 
-// buildMapping produces the structural identity-translation rules for a
-// DataCenterResult. After the orbId-as-identity migration
-// (docs/plans/server-identity-orbid.md), the mapping carries ONLY rules for
-// nested Orbital nodes that don't have their own first-class identity in the
-// K8s spec — IdracSettings today, future nested config types (NetworkConfig,
-// BIOSConfig, etc.). Datacenter and server orbIds live in spec.orbId and
-// spec.servers[].orbId respectively, not here.
-//
-// One rule per nested type, emitted iff at least one server in the result has
-// the nested entity populated. Naming convention: nested orbital entities are
-// "<parent-orbId><suffix>" — e.g. "colo:GQK3V64-idrac" lives under server
-// "colo:GQK3V64". The rule carries the suffix so consumers can derive parent
-// from child without re-querying orbital.
-func buildMapping(dc DataCenterResult) bundle.MappingPayload {
-	var rules []bundle.MappingRule
-	for _, s := range dc.Servers {
-		if s.Hostname == "" || s.OrbID == "" {
-			continue
-		}
-		if s.IdracSettings != nil && s.IdracSettings.OrbID != "" {
-			rules = append(rules, bundle.MappingRule{
-				ListField:   "spec.servers",
-				ItemKey:     "orbId",
-				Field:       "idrac",
-				Type:        "IdracSettings",
-				OrbIDSuffix: "-idrac",
-			})
-			break
-		}
-	}
-	return bundle.MappingPayload{Rules: rules}
-}
-
 // mapToSpec maps a GraphQL DataCenterResult to a ConfigBundleSpec.
 // Servers without a hostname or orbId are skipped — hostname is required by the
 // CRD and orbId is the SSA listMapKey.
 // IdracSettings fields are transferred via JSON round-trip: both IdracSettingsResult
-// and IdracSpec use identical json tags, so adding a field to both structs is
-// sufficient — no field-by-field copy code to update.
+// and IdracSpec use identical json tags (including the OrbID added in ADR-011),
+// so adding a field to both structs is sufficient — no field-by-field copy code
+// to update.
 func mapToSpec(dc DataCenterResult) armadav1.ConfigBundleSpec {
 	spec := armadav1.ConfigBundleSpec{
 		OrbID:      dc.OrbID,
@@ -241,7 +218,8 @@ func mapToSpec(dc DataCenterResult) armadav1.ConfigBundleSpec {
 }
 
 // mapIdrac transfers IdracSettings fields via JSON round-trip.
-// Works because IdracSettingsResult and IdracSpec share identical json tag names.
+// Works because IdracSettingsResult and IdracSpec share identical json tag names,
+// including the OrbID added in ADR-011.
 func mapIdrac(src *IdracSettingsResult) armadav1.IdracSpec {
 	var dst armadav1.IdracSpec
 	b, err := json.Marshal(src)

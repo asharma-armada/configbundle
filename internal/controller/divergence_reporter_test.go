@@ -11,7 +11,6 @@ import (
 	"k8s.io/utils/ptr"
 
 	armadav1 "github.com/armada/configbundle/api/v1"
-	"github.com/armada/configbundle/bundle"
 )
 
 func TestExtractAdminPaths_NoAdminEntries(t *testing.T) {
@@ -184,20 +183,6 @@ func TestResolveValue(t *testing.T) {
 	}
 }
 
-func testMapping(t *testing.T) *bundle.MappingPayload {
-	t.Helper()
-	m, err := ParseMapping([]byte(`{
-		"bundleDigest": "sha256:abc",
-		"rules": [
-			{"listField": "spec.servers", "itemKey": "orbId", "field": "idrac", "type": "IdracSettings", "orbIdSuffix": "-idrac"}
-		]
-	}`))
-	if err != nil {
-		t.Fatalf("ParseMapping: %v", err)
-	}
-	return m
-}
-
 func TestExtractOverrides_NoDivergence(t *testing.T) {
 	spec := armadav1.ConfigBundleSpec{
 		OrbID:      "colo:colo",
@@ -244,7 +229,7 @@ func TestExtractOverrides_NoDivergence(t *testing.T) {
 		lastManifests: map[string]armadav1.ConfigBundleSpec{"colo": spec},
 	}
 
-	overrides := r.extractOverrides(cb, testMapping(t), spec)
+	overrides := r.extractOverrides(cb, spec)
 	if len(overrides) != 0 {
 		t.Errorf("expected 0 overrides (no divergence), got %d: %+v", len(overrides), overrides)
 	}
@@ -259,7 +244,7 @@ func TestExtractOverrides_WithDivergence(t *testing.T) {
 				OrbID:      "colo:srv-3rk3v64",
 				ServiceTag: "3RK3V64",
 				Hostname:   ptr.To("host-01"),
-				Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(false)},
+				Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(false)},
 			},
 		},
 	}
@@ -272,7 +257,7 @@ func TestExtractOverrides_WithDivergence(t *testing.T) {
 				OrbID:      "colo:srv-3rk3v64",
 				ServiceTag: "3RK3V64",
 				Hostname:   ptr.To("host-01"),
-				Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(true)},
+				Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(true)},
 			},
 		},
 	}
@@ -309,7 +294,7 @@ func TestExtractOverrides_WithDivergence(t *testing.T) {
 		lastManifests: map[string]armadav1.ConfigBundleSpec{"colo": intended},
 	}
 
-	overrides := r.extractOverrides(cb, testMapping(t), intended)
+	overrides := r.extractOverrides(cb, intended)
 	if len(overrides) != 1 {
 		t.Fatalf("expected 1 override, got %d: %+v", len(overrides), overrides)
 	}
@@ -408,7 +393,7 @@ func TestExtractOverrides_IgnoreResolution_NoLoop(t *testing.T) {
 		lastManifests: map[string]armadav1.ConfigBundleSpec{"colo": intended},
 	}
 
-	overrides := r.extractOverrides(cb, testMapping(t), intended)
+	overrides := r.extractOverrides(cb, intended)
 	if len(overrides) != 0 {
 		t.Errorf("expected 0 overrides (field not in manifest = ignore-resolved), got %d: %+v", len(overrides), overrides)
 	}

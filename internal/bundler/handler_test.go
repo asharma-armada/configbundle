@@ -108,14 +108,11 @@ func TestHandleBundle_Success(t *testing.T) {
 
 	resp := decodeResponse(t, w)
 	layers := resp.Layers
-	if len(layers) != 2 {
-		t.Fatalf("expected 2 layers, got %d", len(layers))
+	if len(layers) != 1 {
+		t.Fatalf("expected 1 layer, got %d", len(layers))
 	}
 	if layers[0].MediaType != bundle.MediaTypeManifest {
 		t.Errorf("manifest mediaType: got %q", layers[0].MediaType)
-	}
-	if layers[1].MediaType != bundle.MediaTypeMapping {
-		t.Errorf("mapping mediaType: got %q", layers[1].MediaType)
 	}
 
 	// Decode and unmarshal to verify round-trip fidelity.
@@ -251,80 +248,31 @@ func derefBool(p *bool) bool {
 	return *p
 }
 
-// --- Unit tests for buildMapping ---
-
-func TestBuildMapping_EmitsOneRulePerNestedType(t *testing.T) {
-	dc := DataCenterResult{
-		Name:  "colo",
-		OrbID: "colo:colo-galleon",
-		Servers: []ServerResult{
-			{
-				Hostname:   "host-01",
-				ServiceTag: "3RK3V64",
-				OrbID:      "colo:srv-001",
-				IdracSettings: &IdracSettingsResult{
-					OrbID:           "colo:srv-001-idrac",
-					FirmwareVersion: "7.20.10.05",
-				},
-			},
-			{
-				Hostname:   "host-02",
-				ServiceTag: "7BN2X91",
-				OrbID:      "colo:srv-002",
-				IdracSettings: &IdracSettingsResult{
-					OrbID: "colo:srv-002-idrac",
-				},
-			},
-		},
-	}
-
-	mapping := buildMapping(dc)
-	// Post-orbId-migration AND post-structural-rule migration: mapping carries
-	// ONE rule per nested type — covers ALL server instances structurally.
-	// DC and Server orbIds live in spec directly (not in this payload).
-	if len(mapping.Rules) != 1 {
-		t.Fatalf("expected 1 rule (IdracSettings type), got %d: %+v", len(mapping.Rules), mapping.Rules)
-	}
-	r := mapping.Rules[0]
-	if r.ListField != "spec.servers" || r.ItemKey != "orbId" || r.Field != "idrac" || r.Type != "IdracSettings" || r.OrbIDSuffix != "-idrac" {
-		t.Errorf("unexpected rule shape: %+v", r)
-	}
-}
-
-func TestBuildMapping_NoRuleWhenNoServerHasIdrac(t *testing.T) {
-	dc := DataCenterResult{
-		Name:  "colo",
-		OrbID: "colo:colo-galleon",
-		Servers: []ServerResult{
-			{Hostname: "host-01", ServiceTag: "NO-IDRAC", OrbID: "colo:srv-001"},
-		},
-	}
-	mapping := buildMapping(dc)
-	if len(mapping.Rules) != 0 {
-		t.Fatalf("no servers carry idrac → no rule expected; got %+v", mapping.Rules)
-	}
-}
-
 // --- Unit tests for buildTakeover ---
+//
+// After ADR-011: resolutions are looked up against spec.servers[] directly —
+// each server's nested-entity orbId (Idrac.OrbID) is the join key. No mapping
+// payload anymore; the spec carries identity for both top-level and nested nodes.
 
 func TestBuildTakeover_Empty(t *testing.T) {
-	entries := buildTakeover(nil, bundle.MappingPayload{})
+	entries := buildTakeover(nil, nil)
 	if len(entries) != 0 {
 		t.Errorf("expected no entries, got %d", len(entries))
 	}
 }
 
-func TestBuildTakeover_DerivesServerOrbIDFromSuffix(t *testing.T) {
-	mapping := bundle.MappingPayload{Rules: []bundle.MappingRule{
-		{ListField: "spec.servers", ItemKey: "orbId", Field: "idrac", Type: "IdracSettings", OrbIDSuffix: "-idrac"},
-	}}
+func TestBuildTakeover_ResolvesServerOrbIDViaNestedOrbID(t *testing.T) {
+	servers := []armadav1.ServerSpec{
+		{OrbID: "colo:srv-001", Idrac: armadav1.IdracSpec{OrbID: "colo:srv-001-idrac"}},
+		{OrbID: "colo:srv-002", Idrac: armadav1.IdracSpec{OrbID: "colo:srv-002-idrac"}},
+	}
 
 	resolutions := []PendingForceResolution{
 		{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
 		{OrbID: "colo:srv-002-idrac", Field: "racadmEnabled"},
 	}
 
-	entries := buildTakeover(resolutions, mapping)
+	entries := buildTakeover(resolutions, servers)
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 entries, got %d", len(entries))
 	}
@@ -347,23 +295,23 @@ func TestBuildTakeover_DerivesServerOrbIDFromSuffix(t *testing.T) {
 	}
 }
 
-func TestBuildTakeover_SkipsOrbIdWithUnknownSuffix(t *testing.T) {
-	mapping := bundle.MappingPayload{Rules: []bundle.MappingRule{
-		{ListField: "spec.servers", ItemKey: "orbId", Field: "idrac", Type: "IdracSettings", OrbIDSuffix: "-idrac"},
-	}}
-
-	resolutions := []PendingForceResolution{
-		{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},          // matches -idrac
-		{OrbID: "colo:srv-002-bios", Field: "biosMode"},             // no rule for -bios → skipped
-		{OrbID: "this-is-not-a-suffix-match", Field: "x"},           // no rule matches → skipped
+func TestBuildTakeover_SkipsOrbIdNotMatchingAnyServer(t *testing.T) {
+	servers := []armadav1.ServerSpec{
+		{OrbID: "colo:srv-001", Idrac: armadav1.IdracSpec{OrbID: "colo:srv-001-idrac"}},
 	}
 
-	entries := buildTakeover(resolutions, mapping)
+	resolutions := []PendingForceResolution{
+		{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},    // matches server-001
+		{OrbID: "colo:srv-002-idrac", Field: "racadmEnabled"}, // no server-002 in bundle → skipped
+		{OrbID: "this-is-not-a-known-id", Field: "x"},         // not matching any nested orbId → skipped
+	}
+
+	entries := buildTakeover(resolutions, servers)
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 entry, got %d", len(entries))
 	}
 	if entries[0].OrbID != "colo:srv-001-idrac" {
-		t.Errorf("expected -idrac entry to survive, got %q", entries[0].OrbID)
+		t.Errorf("expected server-001 entry to survive, got %q", entries[0].OrbID)
 	}
 }
 
@@ -452,30 +400,6 @@ func TestHandleBundle_ResolutionQueryError(t *testing.T) {
 	}
 }
 
-func TestBuildMapping_ServerWithoutOrbIdSkipped(t *testing.T) {
-	// A server without OrbID is skipped entirely. If it was the ONLY server
-	// carrying an iDRAC, no rule is emitted (no nested type present in this bundle).
-	dc := DataCenterResult{
-		Name:  "colo",
-		OrbID: "colo:colo-galleon",
-		Servers: []ServerResult{
-			{
-				Hostname:   "host-01",
-				ServiceTag: "3RK3V64",
-				// No OrbID on server → skipped
-				IdracSettings: &IdracSettingsResult{
-					OrbID: "colo:srv-001-idrac",
-				},
-			},
-		},
-	}
-
-	mapping := buildMapping(dc)
-	if len(mapping.Rules) != 0 {
-		t.Fatalf("expected 0 rules when no server-with-orbId carries idrac, got %d: %+v", len(mapping.Rules), mapping.Rules)
-	}
-}
-
 // --- Unit tests for buildIgnored (replaces applyOmissions, 2026-06-16) ---
 //
 // Ignore now emits spec.ignored[] entries instead of niling field values.
@@ -483,21 +407,21 @@ func TestBuildMapping_ServerWithoutOrbIdSkipped(t *testing.T) {
 // can keep comparing intent vs local override and surfacing the divergence.
 
 func TestBuildIgnored_NilInput(t *testing.T) {
-	got := buildIgnored(nil, bundle.MappingPayload{})
+	got := buildIgnored(nil, nil)
 	if got != nil {
 		t.Errorf("nil omissions must return nil entries, got %v", got)
 	}
 }
 
-func TestBuildIgnored_ResolvesServerOrbIDFromMapping(t *testing.T) {
-	mapping := bundle.MappingPayload{Rules: []bundle.MappingRule{
-		{ListField: "spec.servers", ItemKey: "orbId", Field: "idrac", Type: "IdracSettings", OrbIDSuffix: "-idrac"},
-	}}
+func TestBuildIgnored_ResolvesServerOrbIDViaNestedOrbID(t *testing.T) {
+	servers := []armadav1.ServerSpec{
+		{OrbID: "colo:srv-001", Idrac: armadav1.IdracSpec{OrbID: "colo:srv-001-idrac"}},
+	}
 	omissions := []Omission{
 		{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
 		{OrbID: "colo:srv-001-idrac", Field: "racadmEnabled"},
 	}
-	got := buildIgnored(omissions, mapping)
+	got := buildIgnored(omissions, servers)
 	if len(got) != 2 {
 		t.Fatalf("expected 2 ignored entries, got %d", len(got))
 	}
@@ -509,7 +433,7 @@ func TestBuildIgnored_ResolvesServerOrbIDFromMapping(t *testing.T) {
 }
 
 func TestBuildIgnored_UnknownOrbIDSkipped(t *testing.T) {
-	got := buildIgnored([]Omission{{OrbID: "unknown:srv-001-idrac", Field: "sshEnabled"}}, bundle.MappingPayload{})
+	got := buildIgnored([]Omission{{OrbID: "unknown:srv-001-idrac", Field: "sshEnabled"}}, nil)
 	if len(got) != 0 {
 		t.Errorf("unknown orbId must be silently skipped, got %d entries", len(got))
 	}
@@ -526,15 +450,13 @@ func TestBuildIgnored_IntentValuesStayInSpec(t *testing.T) {
 			OrbID:    "colo:srv-001",
 			Hostname: ptrString("host-01"),
 			Idrac: armadav1.IdracSpec{
+				OrbID:         "colo:srv-001-idrac",
 				SSHEnabled:    ptrBool(true),
 				RacadmEnabled: ptrBool(true),
 			},
 		}},
 	}
-	mapping := bundle.MappingPayload{Rules: []bundle.MappingRule{
-		{ListField: "spec.servers", ItemKey: "orbId", Field: "idrac", Type: "IdracSettings", OrbIDSuffix: "-idrac"},
-	}}
-	spec.Ignored = buildIgnored([]Omission{{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"}}, mapping)
+	spec.Ignored = buildIgnored([]Omission{{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"}}, spec.Servers)
 
 	out, err := yaml.Marshal(spec)
 	if err != nil {

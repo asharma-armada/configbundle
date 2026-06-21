@@ -14,7 +14,7 @@ spec:
     shortNames:
     - cb
     singular: configbundle
-  scope: Namespaced
+  scope: Cluster
   versions:
   - additionalPrinterColumns:
     - jsonPath: .spec.datacenter
@@ -60,6 +60,48 @@ spec:
                 description: Datacenter is the identifier of the target datacenter
                   (matches Orbital namespace name).
                 type: string
+              ignored:
+                description: |-
+                  Ignored contains "do not claim" directives from the cloud admin. For each
+                  entry, cb-controller leaves the field to its local manager unconditionally
+                  — even when the spec's intent value matches the live value (which would
+                  otherwise trigger auto-claim under the simplified controller). The
+                  divergence-reporter still surfaces these fields as divergent so the
+                  operator continues to see the override; the resolution row in orbital
+                  records the deliberate "leave to edge" decision.
+                items:
+                  description: |-
+                    IgnoredEntry represents a cloud admin's "ignore" resolution: the controller
+                    MUST NOT claim this field even when the spec value matches the live value.
+                    The field's intent value stays in the spec so the divergence-reporter can
+                    surface it as an ongoing divergence; cb-controller bows out unconditionally.
+
+                    Ignore stays surfaced as divergence until the local admin releases ownership
+                    or the cloud admin re-decides as Accept/Reject. Mirror of TakeoverEntry.
+                  properties:
+                    field:
+                      description: |-
+                        Field is the leaf field name to leave to the local manager (e.g. "racadmEnabled").
+                        Must match the JSON tag name on IdracSpec (or ServerSpec for top-level fields).
+                      type: string
+                    orbId:
+                      description: |-
+                        OrbID is the Orbital ConfigItem identifier of the node that owns the field
+                        (e.g. "colo:srv-001-idrac" for an iDRAC field). Informational — used for
+                        audit and divergence-resolution correlation.
+                      type: string
+                    serverOrbId:
+                      description: |-
+                        ServerOrbID identifies which server entry the field belongs to (matches
+                        ServerSpec.OrbID, the listMapKey for spec.servers[]).
+                      type: string
+                  required:
+                  - field
+                  - orbId
+                  - serverOrbId
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
               orbId:
                 description: |-
                   OrbID is the immutable Orbital identifier for this datacenter (e.g. "colo:colo-galleon").
@@ -97,6 +139,13 @@ spec:
                           type: boolean
                         lockdownModeEnabled:
                           type: boolean
+                        orbId:
+                          description: |-
+                            OrbID is the immutable Orbital identifier for this IdracSettings node
+                            (e.g. "colo:srv-001-idrac"). Set by the bundler; identity-only, never
+                            admin-overridable. Required so a malformed bundle (bundler bug — forgot
+                            to set orbId on an idrac block) fails at apply time, not later.
+                          type: string
                         osToIdracPassThroughEnabled:
                           type: boolean
                         racadmEnabled:
@@ -105,6 +154,8 @@ spec:
                           type: boolean
                         usbManagementPortEnabled:
                           type: boolean
+                      required:
+                      - orbId
                       type: object
                     oobIP:
                       description: |-
@@ -146,48 +197,6 @@ spec:
                     field:
                       description: |-
                         Field is the leaf field name to reclaim (e.g. "sshEnabled").
-                        Must match the JSON tag name on IdracSpec (or ServerSpec for top-level fields).
-                      type: string
-                    orbId:
-                      description: |-
-                        OrbID is the Orbital ConfigItem identifier of the node that owns the field
-                        (e.g. "colo:srv-001-idrac" for an iDRAC field). Informational — used for
-                        audit and divergence-resolution correlation.
-                      type: string
-                    serverOrbId:
-                      description: |-
-                        ServerOrbID identifies which server entry the field belongs to (matches
-                        ServerSpec.OrbID, the listMapKey for spec.servers[]).
-                      type: string
-                  required:
-                  - field
-                  - orbId
-                  - serverOrbId
-                  type: object
-                type: array
-                x-kubernetes-list-type: atomic
-              ignored:
-                description: |-
-                  Ignored contains "do not claim" directives from the cloud admin. For each
-                  entry, cb-controller leaves the field to its local manager unconditionally
-                  — even when the spec's intent value matches the live value (which would
-                  otherwise trigger auto-claim under the simplified controller). The
-                  divergence-reporter still surfaces these fields as divergent so the
-                  operator continues to see the override; the resolution row in orbital
-                  records the deliberate "leave to edge" decision.
-                items:
-                  description: |-
-                    IgnoredEntry represents a cloud admin's "ignore" resolution: the controller
-                    MUST NOT claim this field even when the spec value matches the live value.
-                    The field's intent value stays in the spec so the divergence-reporter can
-                    surface it as an ongoing divergence; cb-controller bows out unconditionally.
-
-                    Ignore stays surfaced as divergence until the local admin releases ownership
-                    or the cloud admin re-decides as Accept/Reject. Mirror of TakeoverEntry.
-                  properties:
-                    field:
-                      description: |-
-                        Field is the leaf field name to leave to the local manager (e.g. "racadmEnabled").
                         Must match the JSON tag name on IdracSpec (or ServerSpec for top-level fields).
                       type: string
                     orbId:

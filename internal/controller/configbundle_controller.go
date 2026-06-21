@@ -45,6 +45,7 @@ type ConfigBundleReconciler struct {
 // +kubebuilder:rbac:groups=armada.ai,resources=configbundles/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=armada.ai,resources=configbundles/finalizers,verbs=update
 // +kubebuilder:rbac:groups=armada.ai,resources=serverconfigs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ConfigBundleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
@@ -80,7 +81,8 @@ func (r *ConfigBundleReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		// which races our ObservedGeneration update. RetryOnConflict refetches and reapplies.
 		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 			var fresh armadav1.ConfigBundle
-			if err := r.Get(ctx, types.NamespacedName{Name: cb.Name, Namespace: cb.Namespace}, &fresh); err != nil {
+			// ConfigBundle is cluster-scoped — no namespace.
+			if err := r.Get(ctx, types.NamespacedName{Name: cb.Name}, &fresh); err != nil {
 				return client.IgnoreNotFound(err)
 			}
 			if fresh.Status.ObservedGeneration == cb.Generation {
@@ -106,14 +108,14 @@ func (r *ConfigBundleReconciler) applyServerConfig(ctx context.Context, cb *arma
 	if server.Hostname != nil {
 		hostname = *server.Hostname
 	}
+	// ServerConfig is cluster-scoped — no namespace in metadata.
 	sc := &armadav1.ServerConfig{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: armadav1.GroupVersion.String(),
 			Kind:       "ServerConfig",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      strings.ToLower(hostname),
-			Namespace: cb.Namespace,
+			Name: strings.ToLower(hostname),
 		},
 		Spec: armadav1.ServerConfigSpec{
 			OrbID:      server.OrbID,

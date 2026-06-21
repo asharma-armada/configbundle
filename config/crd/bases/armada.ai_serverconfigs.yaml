@@ -14,7 +14,7 @@ spec:
     shortNames:
     - sc
     singular: serverconfig
-  scope: Namespaced
+  scope: Cluster
   versions:
   - additionalPrinterColumns:
     - jsonPath: .spec.serviceTag
@@ -86,6 +86,13 @@ spec:
                     type: boolean
                   lockdownModeEnabled:
                     type: boolean
+                  orbId:
+                    description: |-
+                      OrbID is the immutable Orbital identifier for this IdracSettings node
+                      (e.g. "colo:srv-001-idrac"). Set by the bundler; identity-only, never
+                      admin-overridable. Required so a malformed bundle (bundler bug — forgot
+                      to set orbId on an idrac block) fails at apply time, not later.
+                    type: string
                   osToIdracPassThroughEnabled:
                     type: boolean
                   racadmEnabled:
@@ -94,6 +101,8 @@ spec:
                     type: boolean
                   usbManagementPortEnabled:
                     type: boolean
+                required:
+                - orbId
                 type: object
               oobIP:
                 description: OobIP is the iDRAC management IP. The ServerConfig controller

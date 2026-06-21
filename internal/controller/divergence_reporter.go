@@ -19,7 +19,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	armadav1 "github.com/armada/configbundle/api/v1"
-	"github.com/armada/configbundle/bundle"
 )
 
 // DivergenceReporter is a controller-runtime reconciler that watches ConfigBundle CRs
@@ -131,9 +130,10 @@ func (r *DivergenceReporter) postToOrb(ctx context.Context, payload DivergencePa
 
 // extractOverrides walks managedFields on the ConfigBundle CR, finds fields
 // owned by any "local:<id>" field manager, translates K8s paths to orbital-native
-// entries via the mapping, and returns the divergence set. Each override carries
-// the actual field-manager string (e.g. "local:daniel") in Who.
-func (r *DivergenceReporter) extractOverrides(cb *armadav1.ConfigBundle, mapping *bundle.MappingPayload, lastManifest armadav1.ConfigBundleSpec) []OverrideEntry {
+// entries by reading orbIds directly from the spec (no mapping payload — see
+// ADR-011), and returns the divergence set. Each override carries the actual
+// field-manager string (e.g. "local:daniel") in Who.
+func (r *DivergenceReporter) extractOverrides(cb *armadav1.ConfigBundle, lastManifest armadav1.ConfigBundleSpec) []OverrideEntry {
 	adminPaths := extractAdminPaths(cb.ManagedFields)
 	if len(adminPaths) == 0 {
 		return nil
@@ -158,9 +158,11 @@ func (r *DivergenceReporter) extractOverrides(cb *armadav1.ConfigBundle, mapping
 			continue
 		}
 
-		orbID, field, typeName, err := mapping.Resolve(ap.path)
+		orbID, field, typeName, err := resolveOrbital(cb.Spec, ap.path)
 		if err != nil {
-			// Path doesn't resolve — skip (e.g. metadata fields, or missing mapping entry).
+			// Path doesn't resolve — skip (e.g. metadata fields, malformed
+			// paths, or fields under a server/nested struct missing an orbId
+			// — would be a bundler bug since OrbID is +kubebuilder:Required).
 			continue
 		}
 
@@ -175,6 +177,66 @@ func (r *DivergenceReporter) extractOverrides(cb *armadav1.ConfigBundle, mapping
 		})
 	}
 	return overrides
+}
+
+// resolveOrbital walks the ConfigBundle spec to translate a K8s field path
+// into the orbital identity (orbId, leaf field name, type name) that the
+// divergence reporter posts to orb. Replaces bundle.MappingPayload.Resolve
+// (deleted in ADR-011): every level that has orbital identity stores its
+// orbId directly on the CR, so resolution is a direct spec read.
+//
+// Supported path shape today:
+//
+//	"spec.servers[orbId=<X>].idrac.<leaf>"  →  (server.Idrac.OrbID, <leaf>, IdracTypeName)
+//
+// When a new nested type is added (BIOS, NIC, ...), add a switch branch and a
+// corresponding {Type}TypeName constant alongside the struct in api/v1.
+func resolveOrbital(spec armadav1.ConfigBundleSpec, path string) (orbID, field, typeName string, err error) {
+	parts := splitPath(path)
+	// splitPath emits the server entry as TWO parts: {field:"servers"} followed
+	// by {selector:"<orbid>"}. Walk for the selector and the two field segments
+	// that follow (nested struct name + leaf field name).
+	var serverOrbID, nestedName, leaf string
+	for i, p := range parts {
+		if p.selector == "" {
+			continue
+		}
+		serverOrbID = p.selector
+		if i+1 < len(parts) {
+			nestedName = parts[i+1].field
+		}
+		if i+2 < len(parts) {
+			leaf = parts[i+2].field
+		}
+		break
+	}
+	if serverOrbID == "" {
+		return "", "", "", fmt.Errorf("no server selector in path: %q", path)
+	}
+	if nestedName == "" || leaf == "" {
+		return "", "", "", fmt.Errorf("malformed path (need nested.leaf after server selector): %q", path)
+	}
+
+	var server *armadav1.ServerSpec
+	for i := range spec.Servers {
+		if spec.Servers[i].OrbID == serverOrbID {
+			server = &spec.Servers[i]
+			break
+		}
+	}
+	if server == nil {
+		return "", "", "", fmt.Errorf("server with orbId %q not found in spec", serverOrbID)
+	}
+
+	switch nestedName {
+	case "idrac":
+		if server.Idrac.OrbID == "" {
+			return "", "", "", fmt.Errorf("server %q has empty idrac.orbId (bundler bug?)", serverOrbID)
+		}
+		return server.Idrac.OrbID, leaf, armadav1.IdracTypeName, nil
+	default:
+		return "", "", "", fmt.Errorf("unknown nested type %q in path %q", nestedName, path)
+	}
 }
 
 // SetLastManifest records the last-applied manifest for a ConfigBundle so the

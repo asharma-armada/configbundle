@@ -15,7 +15,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/yaml"
@@ -56,7 +55,10 @@ func WithPort(port string) ConsumeServerOption {
 	return func(s *ConsumeServer) { s.port = port }
 }
 
-// WithNamespace sets the K8s namespace for ConfigBundle CRs (default "configbundle-system").
+// WithNamespace sets the K8s namespace for child resources — ServerConfig CRs,
+// the per-bundle mapping ConfigMap, the last-applied-spec ConfigMap. Default
+// "configbundle-system". ConfigBundle itself is cluster-scoped and
+// has no namespace.
 func WithNamespace(ns string) ConsumeServerOption {
 	return func(s *ConsumeServer) { s.namespace = ns }
 }
@@ -120,8 +122,9 @@ func (s *ConsumeServer) Start(ctx context.Context) error {
 }
 
 // handleDispatch is the POST /dispatch handler. Orb calls this for each layer it dispatches,
-// routing by Content-Type. Supported types: manifest (sync validate, async apply) and
-// mapping (sync validate, store in ConfigMap).
+// routing by Content-Type. After ADR-011 the only layer cb-controller consumes is the
+// manifest layer; the mapping layer was deleted because all orbital identifiers now live
+// directly on the ConfigBundle CR.
 func (s *ConsumeServer) handleDispatch(w http.ResponseWriter, r *http.Request) {
 	ct := r.Header.Get("Content-Type")
 	switch ct {
@@ -130,13 +133,6 @@ func (s *ConsumeServer) handleDispatch(w http.ResponseWriter, r *http.Request) {
 		digest := r.Header.Get("X-Orb-Digest")
 		importID := r.Header.Get("X-Orb-Import-ID")
 		s.handleManifestBody(w, r, tag, digest, importID)
-	case bundle.MediaTypeMapping:
-		digest := r.Header.Get("X-Orb-Digest")
-		if digest == "" {
-			http.Error(w, "X-Orb-Digest header required", http.StatusBadRequest)
-			return
-		}
-		s.handleMappingBody(w, r, digest)
 	default:
 		http.Error(w, "unsupported media type", http.StatusUnsupportedMediaType)
 	}
@@ -190,64 +186,6 @@ func (s *ConsumeServer) handleManifestBody(w http.ResponseWriter, r *http.Reques
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleMappingBody processes the mapping layer from orb's dispatch pipeline.
-// It validates the mapping, finds the ConfigBundle with the matching digest, and
-// writes the mapping to a ConfigMap owned by that CR.
-func (s *ConsumeServer) handleMappingBody(w http.ResponseWriter, r *http.Request, digest string) {
-	logger := log.FromContext(r.Context()).WithName("mapping")
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxManifestBytes+1))
-	if err != nil {
-		http.Error(w, "read body: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if len(body) > maxManifestBytes {
-		http.Error(w, "mapping exceeds max size", http.StatusRequestEntityTooLarge)
-		return
-	}
-
-	if _, err := ParseMapping(body); err != nil {
-		http.Error(w, "invalid mapping: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	// Find the ConfigBundle whose LastAppliedDigest matches the provided digest.
-	var cbList armadav1.ConfigBundleList
-	if err := s.Client.List(r.Context(), &cbList, client.InNamespace(s.namespace)); err != nil {
-		http.Error(w, "list ConfigBundles: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	var cb *armadav1.ConfigBundle
-	for i := range cbList.Items {
-		if cbList.Items[i].Status.LastAppliedDigest == digest {
-			cb = &cbList.Items[i]
-			break
-		}
-	}
-	if cb == nil {
-		http.Error(w, "ConfigBundle not found for digest; manifest may not have been applied yet", http.StatusConflict)
-		return
-	}
-
-	ownerRef := metav1.OwnerReference{
-		APIVersion:         armadav1.GroupVersion.String(),
-		Kind:               "ConfigBundle",
-		Name:               cb.Name,
-		UID:                cb.UID,
-		Controller:         ptr.To(true),
-		BlockOwnerDeletion: ptr.To(true),
-	}
-
-	if err := writeMappingConfigMap(r.Context(), s.Client, s.namespace, cb.Name, digest, body, ownerRef); err != nil {
-		http.Error(w, "write mapping ConfigMap: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	logger.Info("stored mapping", "digest", digest, "configbundle", cb.Name)
-	w.WriteHeader(http.StatusOK)
-}
-
 // handleConsume is kept as an alias for handleManifestBody to support direct
 // method calls in existing unit tests. It extracts the headers and delegates.
 func (s *ConsumeServer) handleConsume(w http.ResponseWriter, r *http.Request) {
@@ -273,11 +211,9 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 	}
 
 	// Fetch the current CR to read managedFields for omitAdminOwnedServers.
+	// ConfigBundle is cluster-scoped — no namespace.
 	var cb armadav1.ConfigBundle
-	err = s.Client.Get(ctx, types.NamespacedName{
-		Name:      spec.Datacenter,
-		Namespace: s.namespace,
-	}, &cb)
+	err = s.Client.Get(ctx, types.NamespacedName{Name: spec.Datacenter}, &cb)
 	if client.IgnoreNotFound(err) != nil {
 		return fmt.Errorf("get ConfigBundle: %w", err)
 	}
@@ -286,6 +222,15 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 	// They're silently dropped by omitAdminOwnedFields below; the warning
 	// makes the silent drop visible at the runtime where the bug bites.
 	warnNonConformingManagers(log.FromContext(ctx).WithName("consume"), spec.Datacenter, cb.ManagedFields)
+
+	// Drop spec.Ignored entries whose target field has no active local:*
+	// claim. Per ADR-009, an Ignore directive is meaningless without an
+	// override — persisting such entries (e.g. after edge handback, or
+	// because orbital hasn't yet cleaned up a stale resolution row) violates
+	// the data-model invariant. Apply the spec without them so the CR stays
+	// internally consistent.
+	claimed := collectLocalClaimedKeys(cb.ManagedFields)
+	spec.Ignored = filterActiveIgnored(spec.Ignored, claimed)
 
 	// Omit only "bow-out" leaves: local:*-owned fields where intent value differs
 	// from live value AND the field isn't in spec.takeover[]. Values-match fields
@@ -296,14 +241,14 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 		return fmt.Errorf("compute admin-omitted patch: %w", err)
 	}
 
+	// ConfigBundle is cluster-scoped — no namespace in metadata.
 	apply := &armadav1.ConfigBundle{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: armadav1.GroupVersion.String(),
 			Kind:       "ConfigBundle",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      spec.Datacenter,
-			Namespace: s.namespace,
+			Name: spec.Datacenter,
 		},
 		Spec: *patchSpec,
 	}
@@ -488,13 +433,6 @@ func omitAdminOwnedFields(intent armadav1.ConfigBundleSpec, live armadav1.Config
 		}
 	}
 
-	// Even when local:* doesn't claim a field, an Ignore directive must still
-	// keep the controller from claiming it (e.g., orbital decided to ignore a
-	// field that the edge admin later released). Walk spec.Ignored directly
-	// and strip those leaves from intentMap regardless of managedFields state.
-	for _, ig := range intent.Ignored {
-		stripIgnoredField(intentMap, ig.ServerOrbID, ig.Field)
-	}
 	filtered, err := json.Marshal(intentMap)
 	if err != nil {
 		return nil, fmt.Errorf("marshal filtered spec: %w", err)
@@ -564,44 +502,78 @@ func deleteOwnedPaths(intentMap, liveMap, owned map[string]any, scope string, ta
 	}
 }
 
-// stripIgnoredField removes (serverOrbID, field) from intentMap regardless of
-// managedFields state. Companion to deleteOwnedPaths: that function only walks
-// fields a local:* manager already claims, so it can't catch the case where
-// an Ignore resolution exists but no local:* has claimed yet. This sweep
-// ensures the controller never includes ignored fields in its apply body.
+// collectLocalClaimedKeys walks managedFields and returns the set of
+// "<serverOrbId>|<field>" keys for every leaf field owned by at least one
+// local:* manager. Top-level (non-per-server) claims use "" as the
+// serverOrbId, matching takeoverKey() — so the result is directly usable
+// against an IgnoredEntry/TakeoverEntry tuple of (ServerOrbID, Field).
 //
-// serverOrbID == "" means the field is at spec top-level (not under a server
-// entry). Empty intentMap or missing path → no-op.
-func stripIgnoredField(intentMap map[string]any, serverOrbID, field string) {
-	if serverOrbID == "" {
-		delete(intentMap, field)
-		// Also walk the field as a possible nested struct, e.g., to strip
-		// "idrac.fooField" we'd need a path traversal. For MVP we keep only
-		// the top-level case explicit; the per-server case below handles the
-		// idrac.* leaves which are the dominant Ignore target today.
-		return
-	}
-	servers, ok := intentMap["servers"].([]any)
-	if !ok {
-		return
-	}
-	for _, item := range servers {
-		entry, ok := item.(map[string]any)
-		if !ok {
+// Structural FieldsV1 markers (entry-presence ".", listMapKey "f:orbId")
+// produce harmless keys that won't false-match any IgnoredEntry — Field on
+// IgnoredEntry is a real spec leaf name (e.g. "racadmEnabled"), never "."
+// or "orbId" as a stand-alone Ignore target.
+func collectLocalClaimedKeys(fields []metav1.ManagedFieldsEntry) map[string]bool {
+	out := map[string]bool{}
+	for _, e := range fields {
+		if !strings.HasPrefix(e.Manager, "local:") || e.FieldsV1 == nil {
 			continue
 		}
-		id, _ := entry["orbId"].(string)
-		if id != serverOrbID {
+		var tree map[string]any
+		if err := json.Unmarshal(e.FieldsV1.Raw, &tree); err != nil {
 			continue
 		}
-		if _, present := entry[field]; present {
-			delete(entry, field)
+		specTree, _ := tree["f:spec"].(map[string]any)
+		if specTree == nil {
+			continue
 		}
-		// Idrac sub-struct: leaf fields on IdracSpec live under "idrac".
-		if idrac, ok := entry["idrac"].(map[string]any); ok {
-			delete(idrac, field)
+		walkLocalClaims(specTree, "", out)
+	}
+	return out
+}
+
+// walkLocalClaims descends a FieldsV1 subtree (rooted at f:spec or below) and
+// emits "<scope>|<field>" keys for every leaf claim. scope is the current
+// server orbId (empty at top level), updated when descending into a
+// k:{"orbId":"X"} list-map entry.
+func walkLocalClaims(node map[string]any, scope string, out map[string]bool) {
+	for k, v := range node {
+		sub, _ := v.(map[string]any)
+		switch {
+		case strings.HasPrefix(k, "f:"):
+			field := strings.TrimPrefix(k, "f:")
+			if len(sub) == 0 {
+				out[scope+"|"+field] = true
+				continue
+			}
+			walkLocalClaims(sub, scope, out)
+		case strings.HasPrefix(k, "k:"):
+			raw := strings.TrimPrefix(k, "k:")
+			var key map[string]string
+			if err := json.Unmarshal([]byte(raw), &key); err != nil {
+				continue
+			}
+			id := key["orbId"]
+			if len(sub) > 0 {
+				walkLocalClaims(sub, id, out)
+			}
 		}
 	}
+}
+
+// filterActiveIgnored drops IgnoredEntry rows whose (ServerOrbID, Field) has
+// no corresponding local:* claim. Under ADR-009, Ignore is meaningless without
+// an active override.
+func filterActiveIgnored(entries []armadav1.IgnoredEntry, claimed map[string]bool) []armadav1.IgnoredEntry {
+	if len(entries) == 0 {
+		return entries
+	}
+	kept := make([]armadav1.IgnoredEntry, 0, len(entries))
+	for _, ig := range entries {
+		if claimed[ig.ServerOrbID+"|"+ig.Field] {
+			kept = append(kept, ig)
+		}
+	}
+	return kept
 }
 
 // nullSafeMap returns a non-nil map for safe key access during descent.

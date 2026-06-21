@@ -44,9 +44,13 @@ import (
 
 // Config holds all controller configuration. Defaults are set for local development.
 type Config struct {
-	Namespace                  string        `envconfig:"NAMESPACE"                   default:"default"`
-	CBControllerPort           string        `envconfig:"CB_CONTROLLER_PORT"          default:":8095"`
-	OrbDivergenceIntakeURL     string        `envconfig:"ORB_DIVERGENCE_INTAKE_URL"   default:"http://localhost:8010/api/v1/divergence"`
+	// OperatorNamespace is where cb-controller writes its own state ConfigMaps
+	// (the per-bundle mapping CM and last-applied-spec CM). ConfigBundle and
+	// ServerConfig are both cluster-scoped and have no namespace; only the
+	// operator's internal state is namespaced.
+	OperatorNamespace           string        `envconfig:"OPERATOR_NAMESPACE"             default:"default"`
+	CBControllerPort            string        `envconfig:"CB_CONTROLLER_PORT"          default:":8095"`
+	OrbDivergenceIntakeURL      string        `envconfig:"ORB_DIVERGENCE_INTAKE_URL"   default:"http://localhost:8010/api/v1/divergence"`
 	DivergenceReporterEnabled   bool          `envconfig:"DIVERGENCE_REPORTER_ENABLED"   default:"true"`
 	DivergenceReporterDebounce  time.Duration `envconfig:"DIVERGENCE_REPORTER_DEBOUNCE"  default:"5s"`
 	DivergenceReporterHeartbeat time.Duration `envconfig:"DIVERGENCE_REPORTER_HEARTBEAT" default:"5m"`
@@ -206,7 +210,7 @@ func main() {
 
 	reporter := controller.NewDivergenceReporter(mgr.GetClient(),
 		controller.WithDivergenceIntakeURL(cfg.OrbDivergenceIntakeURL),
-		controller.WithDivergenceNamespace(cfg.Namespace),
+		controller.WithDivergenceNamespace(cfg.OperatorNamespace),
 		controller.WithDivergenceEnabled(cfg.DivergenceReporterEnabled),
 		controller.WithDivergenceDebounce(cfg.DivergenceReporterDebounce),
 		controller.WithDivergenceHeartbeat(cfg.DivergenceReporterHeartbeat),
@@ -219,7 +223,7 @@ func main() {
 	// Register the ConsumeServer — exposes POST /dispatch for orb layer dispatch.
 	consume := controller.NewConsumeServer(mgr.GetClient(),
 		controller.WithPort(cfg.CBControllerPort),
-		controller.WithNamespace(cfg.Namespace),
+		controller.WithNamespace(cfg.OperatorNamespace),
 		controller.WithDivergenceReporter(reporter),
 	)
 	if err := mgr.Add(consume); err != nil {
@@ -227,6 +231,15 @@ func main() {
 		os.Exit(1)
 	}
 	setupLog.Info("ConsumeServer registered", "port", cfg.CBControllerPort)
+
+	// ReclaimController — watches local:* SSA releases and replays the last
+	// imported manifest so released fields revert to intent (ADR-009).
+	reclaim := controller.NewReclaimController(mgr.GetClient(), consume, cfg.OperatorNamespace)
+	if err := reclaim.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to register ReclaimController")
+		os.Exit(1)
+	}
+	setupLog.Info("ReclaimController registered")
 
 	// +kubebuilder:scaffold:builder
 

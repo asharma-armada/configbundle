@@ -15,7 +15,6 @@ import (
 	"sigs.k8s.io/yaml"
 
 	armadav1 "github.com/armada/configbundle/api/v1"
-	"github.com/armada/configbundle/bundle"
 )
 
 // LastAppliedSpecKey is the ConfigMap data key under which the most recent
@@ -25,71 +24,18 @@ import (
 // empty until the next bundle dispatch).
 const LastAppliedSpecKey = "last-applied-spec.yaml"
 
-// ParseMapping is a thin alias for bundle.ParseMappingPayload, preserving the
-// existing call-site name. The wire type and resolution semantics live in the
-// shared bundle package so cb-bundler (producer) and cb-controller (consumer)
-// import the same Go type — no per-side hand-rolled JSON parsing.
-func ParseMapping(b []byte) (*bundle.MappingPayload, error) {
-	return bundle.ParseMappingPayload(b)
-}
-
-// MappingConfigMapName returns the name of the mapping ConfigMap for a ConfigBundle.
+// MappingConfigMapName returns the name of the per-CR state ConfigMap for a
+// ConfigBundle. The "-mapping" suffix is retained for backward compatibility
+// with the previous design (the CM still has the same name); after ADR-011 the
+// CM carries only the last-applied-spec snapshot, not the deleted mapping.json
+// payload.
 func MappingConfigMapName(cbName string) string {
 	return cbName + "-mapping"
 }
 
-// writeMappingConfigMap creates or updates the mapping ConfigMap for a ConfigBundle.
-// The ConfigMap is owned by the CR so K8s GC deletes it when the CR is deleted.
-// Wrapped in RetryOnConflict so a racing writer (or owner-reference reconciler)
-// bumping the resourceVersion mid-update doesn't drop the mapping.
-func writeMappingConfigMap(ctx context.Context, c client.Client, namespace, cbName, digest string, raw []byte, ownerRef metav1.OwnerReference) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		cm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      MappingConfigMapName(cbName),
-				Namespace: namespace,
-			},
-		}
-		_, err := controllerutil.CreateOrUpdate(ctx, c, cm, func() error {
-			cm.Labels = map[string]string{
-				"armada.ai/configbundle": cbName,
-				"armada.ai/component":    "mapping",
-			}
-			cm.OwnerReferences = []metav1.OwnerReference{ownerRef}
-			// Merge — the CM also carries LastAppliedSpecKey written by the
-			// manifest dispatch path. Replacing the whole map would wipe it.
-			if cm.Data == nil {
-				cm.Data = map[string]string{}
-			}
-			cm.Data["digest"] = digest
-			cm.Data["mapping.json"] = string(raw)
-			return nil
-		})
-		return err
-	})
-}
-
-// readMappingConfigMap reads the mapping ConfigMap for a ConfigBundle.
-// Returns a not-found error if no ConfigMap exists yet.
-func readMappingConfigMap(ctx context.Context, c client.Client, namespace, cbName string) (*bundle.MappingPayload, error) {
-	var cm corev1.ConfigMap
-	if err := c.Get(ctx, types.NamespacedName{
-		Name:      MappingConfigMapName(cbName),
-		Namespace: namespace,
-	}, &cm); err != nil {
-		return nil, err
-	}
-	raw := cm.Data["mapping.json"]
-	if raw == "" {
-		return nil, fmt.Errorf("mapping ConfigMap %s/%s has no mapping.json key", namespace, MappingConfigMapName(cbName))
-	}
-	return ParseMapping([]byte(raw))
-}
-
 // writeLastAppliedSpec persists the controller-applied manifest spec to the
-// per-CR ConfigMap under LastAppliedSpecKey. The CM is shared with the mapping
-// layer — adding/updating a key here doesn't disturb mapping.json or digest if
-// they were written earlier. The OwnerReference ties lifecycle to the CR.
+// per-CR ConfigMap under LastAppliedSpecKey. The OwnerReference ties lifecycle
+// to the CR — K8s GC deletes the CM when the parent CB is deleted.
 //
 // The reporter rehydrates lastManifests from this on controller startup so a
 // fresh process doesn't lose its intent baseline. Without persistence, every
@@ -103,8 +49,9 @@ func writeLastAppliedSpec(ctx context.Context, c client.Client, namespace, cbNam
 	}
 	// Fetch the CR for the OwnerReference UID. The apply that produced this
 	// spec has already succeeded at this point, so the CR exists.
+	// ConfigBundle is cluster-scoped — Get with name only.
 	var cb armadav1.ConfigBundle
-	if err := c.Get(ctx, types.NamespacedName{Name: cbName, Namespace: namespace}, &cb); err != nil {
+	if err := c.Get(ctx, types.NamespacedName{Name: cbName}, &cb); err != nil {
 		return fmt.Errorf("get ConfigBundle for ownerRef: %w", err)
 	}
 	ownerRef := metav1.OwnerReference{

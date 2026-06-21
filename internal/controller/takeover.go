@@ -57,14 +57,14 @@ func (s *ConsumeServer) processTakeover(ctx context.Context, fullSpec armadav1.C
 		return fmt.Errorf("%d of %d takeover entries failed", len(errs), len(fullSpec.Takeover))
 	}
 
+	// ConfigBundle is cluster-scoped — no namespace in metadata.
 	apply := &armadav1.ConfigBundle{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: armadav1.GroupVersion.String(),
 			Kind:       "ConfigBundle",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fullSpec.Datacenter,
-			Namespace: s.namespace,
+			Name: fullSpec.Datacenter,
 		},
 		Spec: *patchSpec,
 	}
@@ -128,11 +128,9 @@ func (s *ConsumeServer) releaseOtherClaims(ctx context.Context, fullSpec armadav
 		return nil
 	}
 
+	// ConfigBundle is cluster-scoped — no namespace.
 	var cb armadav1.ConfigBundle
-	if err := s.Client.Get(ctx, types.NamespacedName{
-		Name:      fullSpec.Datacenter,
-		Namespace: s.namespace,
-	}, &cb); err != nil {
+	if err := s.Client.Get(ctx, types.NamespacedName{Name: fullSpec.Datacenter}, &cb); err != nil {
 		return fmt.Errorf("re-fetch CR for managedFields read: %w", err)
 	}
 
@@ -194,12 +192,12 @@ func (s *ConsumeServer) releaseOtherClaims(ctx context.Context, fullSpec armadav
 		// reporting the manager even though every leaf was released. Omitting
 		// spec lets release-on-omit drop the f:spec claim too — zero residual
 		// ownership, manager entry disappears from managedFields.
+		// ConfigBundle is cluster-scoped — no namespace in metadata.
 		applyObj := map[string]any{
 			"apiVersion": armadav1.GroupVersion.String(),
 			"kind":       "ConfigBundle",
 			"metadata": map[string]any{
-				"name":      fullSpec.Datacenter,
-				"namespace": s.namespace,
+				"name": fullSpec.Datacenter,
 			},
 		}
 		if len(newSpec) > 0 {

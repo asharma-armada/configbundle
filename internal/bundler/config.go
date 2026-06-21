@@ -6,10 +6,15 @@ import (
 
 // Config holds all bundler configuration. Defaults are set for local development.
 type Config struct {
-	Port               string `envconfig:"BUNDLER_PORT"              default:"8020"`
-	OrbitalGraphQLURL  string `envconfig:"ORBITAL_GRAPHQL_URL"       default:"http://localhost:8001/graphql"`
-	OrbitalAPIURL      string `envconfig:"ORBITAL_API_URL"           default:"http://localhost:8001"`
-	OrbitalBearerToken string `envconfig:"ORBITAL_BEARER_TOKEN"      default:""`
+	Port string `envconfig:"BUNDLER_PORT" default:"8020"`
+
+	// OrbitalBaseURL is the single root URL for orbital — both GraphQL
+	// (`<base>/graphql`) and REST (`<base>/api/v1/...`) are derived from it.
+	// Must include any base path orbital is mounted under
+	// (e.g. AKS: `http://localhost:8001/orbital`, local: `http://localhost:8001`).
+	// Trailing slashes are trimmed at use sites.
+	OrbitalBaseURL     string `envconfig:"ORBITAL_BASE_URL"     default:"http://localhost:8001"`
+	OrbitalBearerToken string `envconfig:"ORBITAL_BEARER_TOKEN" default:""`
 
 	// OAuth2 client credentials (Azure AD). Reuses orbital's own OIDC app registration.
 	// Token URL is derived from OIDCIssuerURL; scope is derived from OIDCClientID.

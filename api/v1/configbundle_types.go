@@ -24,9 +24,18 @@ import (
 // All fields are desired state — not observed state. The ServerConfig controller
 // actuates these via Redfish PATCH calls to the OOB IP.
 //
-// All leaf fields are pointers with omitempty so SSA partial patches can omit
-// admin-owned fields. See ADR-007.
+// All admin-overridable leaf fields are pointers with omitempty so SSA partial
+// patches can omit admin-owned fields. See ADR-007. OrbID is identity metadata,
+// not a configurable field — it's a required string set by the bundler from
+// orbital's GraphQL and never overridden by local:admin.
 type IdracSpec struct {
+	// OrbID is the immutable Orbital identifier for this IdracSettings node
+	// (e.g. "colo:srv-001-idrac"). Set by the bundler; identity-only, never
+	// admin-overridable. Required so a malformed bundle (bundler bug — forgot
+	// to set orbId on an idrac block) fails at apply time, not later.
+	// +kubebuilder:validation:Required
+	OrbID string `json:"orbId"`
+
 	// FirmwareVersion is the desired iDRAC firmware version (e.g. "7.20.10.05").
 	// Controller reads current version via Redfish GET and upgrades/downgrades to match.
 	// +optional
@@ -53,6 +62,12 @@ type IdracSpec struct {
 	// +optional
 	RacadmEnabled *bool `json:"racadmEnabled,omitempty"`
 }
+
+// IdracTypeName is the orbital GraphQL type name for IdracSpec nodes. Used in
+// OverrideEntry.Type when the divergence reporter emits an entry for a local
+// override on an idrac field. One constant per nested struct that has its own
+// orbital identity; when adding a new nested type, add a sibling constant.
+const IdracTypeName = "IdracSettings"
 
 // ServerSpec describes one server's desired configuration within a ConfigBundle.
 //
@@ -221,7 +236,7 @@ type ConfigBundleStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Namespaced,shortName=cb
+// +kubebuilder:resource:scope=Cluster,shortName=cb
 // +kubebuilder:printcolumn:name="Datacenter",type=string,JSONPath=`.spec.datacenter`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

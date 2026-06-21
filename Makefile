@@ -1,10 +1,18 @@
 # Registry and per-component versioning.
 # Controller: controller/v* tags. Bundler: bundler/v* tags.
 # Tag with: git tag controller/v0.1.0  or  git tag bundler/v0.0.2
+#
+# Manual override at the trailing position (conventional Make form):
+#   make push-controller CONTROLLER_VERSION=v0.1.0
+#   make push-bundler    BUNDLER_VERSION=v0.0.4
+# Or use the VERSION umbrella to set both components at once:
+#   make push-controller VERSION=v0.1.0
+#   make push-bundler    VERSION=v0.0.4
 ACR                := armadaeksatest.azurecr.io
 MODULE             := github.com/armada/configbundle
-CONTROLLER_VERSION := $(shell (git describe --tags --match 'controller/v*' --dirty 2>/dev/null || echo "controller/v0.0.0-dev") | sed 's|^controller/||')
-BUNDLER_VERSION    := $(shell (git describe --tags --match 'bundler/v*' --dirty 2>/dev/null || echo "bundler/v0.0.0-dev") | sed 's|^bundler/||')
+VERSION            ?=
+CONTROLLER_VERSION ?= $(or $(VERSION),$(shell (git describe --tags --match 'controller/v*' --dirty 2>/dev/null || echo "controller/v0.0.0-dev") | sed 's|^controller/||'))
+BUNDLER_VERSION    ?= $(or $(VERSION),$(shell (git describe --tags --match 'bundler/v*' --dirty 2>/dev/null || echo "bundler/v0.0.0-dev") | sed 's|^bundler/||'))
 BUNDLER_LDFLAGS    := -ldflags "-X $(MODULE)/internal/version.Version=$(BUNDLER_VERSION)"
 
 # Image URLs
@@ -149,28 +157,28 @@ run-controller: ## Run the controller from your host (set NAMESPACE=default for 
 	go run ./cmd/main.go
 
 .PHONY: run-bundler
-run-bundler: ## Run the bundler service locally (BUNDLER_PORT=8020, ORBITAL_GRAPHQL_URL=http://localhost:8001/graphql).
+run-bundler: ## Run the bundler service locally (BUNDLER_PORT=8020, ORBITAL_BASE_URL=http://localhost:8001).
 	go run $(BUNDLER_LDFLAGS) ./cmd/bundler/main.go
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
-.PHONY: docker-build-controller
-docker-build-controller: ## Build and push controller image (requires: az acr login --name armadaeksatest).
+.PHONY: push-controller
+push-controller: ## Build and push controller image to ACR (e.g. make push-controller CONTROLLER_VERSION=v0.1.0). Requires: az acr login --name armadaeksatest
 	@echo "Building $(IMG)"
 	docker buildx build --platform linux/amd64 --target controller -t $(IMG) --push .
 
-.PHONY: docker-build-bundler
-docker-build-bundler: ## Build and push bundler image (requires: az acr login --name armadaeksatest).
+.PHONY: push-bundler
+push-bundler: ## Build and push bundler image to ACR (e.g. make push-bundler BUNDLER_VERSION=v0.0.4). Requires: az acr login --name armadaeksatest
 	@echo "Building $(BUNDLER_IMG)"
 	docker buildx build --platform linux/amd64 --target bundler \
 		--build-arg BUNDLER_VERSION=$(BUNDLER_VERSION) \
 		-t $(BUNDLER_IMG) --push .
 
-.PHONY: version
-version: ## Show current versions for both components.
-	@echo "controller: $(CONTROLLER_VERSION)"
-	@echo "bundler:    $(BUNDLER_VERSION)"
+.PHONY: versions
+versions: ## Show the image tags that would be built / pushed right now.
+	@echo "controller: $(CONTROLLER_VERSION)  →  $(IMG)"
+	@echo "bundler:    $(BUNDLER_VERSION)  →  $(BUNDLER_IMG)"
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:

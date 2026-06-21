@@ -38,7 +38,6 @@ import (
 	"sigs.k8s.io/yaml"
 
 	armadav1 "github.com/armada/configbundle/api/v1"
-	"github.com/armada/configbundle/bundle"
 )
 
 var _ = Describe("ConfigBundle Controller", func() {
@@ -63,6 +62,17 @@ var _ = Describe("ConfigBundle Controller", func() {
 	})
 
 	AfterEach(func() {
+		// Clean up cluster-scoped CRs created in this test (they survive namespace deletion; envtest does not run GC).
+		var scList armadav1.ServerConfigList
+		Expect(k8sClient.List(ctx, &scList)).To(Succeed())
+		for i := range scList.Items {
+			Expect(k8sClient.Delete(ctx, &scList.Items[i])).To(Succeed())
+		}
+		var cbList armadav1.ConfigBundleList
+		Expect(k8sClient.List(ctx, &cbList)).To(Succeed())
+		for i := range cbList.Items {
+			Expect(k8sClient.Delete(ctx, &cbList.Items[i])).To(Succeed())
+		}
 		Expect(k8sClient.Delete(ctx, &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: ns},
 		})).To(Succeed())
@@ -70,12 +80,12 @@ var _ = Describe("ConfigBundle Controller", func() {
 
 	Describe("child CR decomposition", func() {
 		It("creates a ServerConfig named by lowercase hostname", func() {
-			cb := singleServerBundle("test-bundle", ns, "colo-r740-01", "3RK3V64", "10.10.1.45")
+			cb := singleServerBundle("test-bundle", "colo-r740-01", "3RK3V64", "10.10.1.45")
 			Expect(k8sClient.Create(ctx, cb)).To(Succeed())
 
 			sc := &armadav1.ServerConfig{}
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01", Namespace: ns}, sc)
+				return k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01"}, sc)
 			}, timeout, interval).Should(Succeed())
 
 			Expect(sc.Spec.ServiceTag).To(Equal("3RK3V64"))
@@ -84,8 +94,9 @@ var _ = Describe("ConfigBundle Controller", func() {
 		})
 
 		It("propagates all idrac fields to the child CR", func() {
-			cb := singleServerBundle("test-bundle", ns, "colo-r740-01", "3RK3V64", "10.10.1.45")
+			cb := singleServerBundle("test-bundle", "colo-r740-01", "3RK3V64", "10.10.1.45")
 			cb.Spec.Servers[0].Idrac = armadav1.IdracSpec{
+				OrbID:                       "colo:srv-3rk3v64-idrac",
 				FirmwareVersion:             ptr.To("7.20.10.05"),
 				SSHEnabled:                  ptr.To(false),
 				IPMIEnabled:                 ptr.To(false),
@@ -99,7 +110,7 @@ var _ = Describe("ConfigBundle Controller", func() {
 
 			sc := &armadav1.ServerConfig{}
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01", Namespace: ns}, sc)
+				return k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01"}, sc)
 			}, timeout, interval).Should(Succeed())
 
 			Expect(sc.Spec.Idrac.FirmwareVersion).To(Equal(ptr.To("7.20.10.05")))
@@ -114,7 +125,7 @@ var _ = Describe("ConfigBundle Controller", func() {
 
 		It("creates one ServerConfig per server in a multi-server bundle", func() {
 			cb := &armadav1.ConfigBundle{
-				ObjectMeta: metav1.ObjectMeta{Name: "multi-galleon", Namespace: ns},
+				ObjectMeta: metav1.ObjectMeta{Name: "multi-galleon"},
 				Spec: armadav1.ConfigBundleSpec{
 					OrbID:      "colo:colo",
 					Datacenter: "colo",
@@ -129,7 +140,7 @@ var _ = Describe("ConfigBundle Controller", func() {
 			for _, hostname := range []string{"colo-r740-01", "colo-r740-02"} {
 				sc := &armadav1.ServerConfig{}
 				Eventually(func() error {
-					return k8sClient.Get(ctx, types.NamespacedName{Name: hostname, Namespace: ns}, sc)
+					return k8sClient.Get(ctx, types.NamespacedName{Name: hostname}, sc)
 				}, timeout, interval).Should(Succeed(), "expected ServerConfig %s to exist", hostname)
 			}
 		})
@@ -137,14 +148,14 @@ var _ = Describe("ConfigBundle Controller", func() {
 
 	Describe("desired state enforcement", func() {
 		It("restores a child CR field mutated out-of-band", func() {
-			cb := singleServerBundle("test-bundle", ns, "colo-r740-01", "3RK3V64", "10.10.1.45")
+			cb := singleServerBundle("test-bundle", "colo-r740-01", "3RK3V64", "10.10.1.45")
 			cb.Spec.Servers[0].Idrac.SSHEnabled = ptr.To(false)
 			Expect(k8sClient.Create(ctx, cb)).To(Succeed())
 
 			// Wait for the child CR to be created.
 			sc := &armadav1.ServerConfig{}
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01", Namespace: ns}, sc)
+				return k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01"}, sc)
 			}, timeout, interval).Should(Succeed())
 
 			// Simulate unauthorized drift: patch sshEnabled to true directly on the child.
@@ -154,30 +165,30 @@ var _ = Describe("ConfigBundle Controller", func() {
 
 			// The controller (triggered by Owns watch) should restore sshEnabled to false.
 			Eventually(func(g Gomega) {
-				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01", Namespace: ns}, sc)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01"}, sc)).To(Succeed())
 				g.Expect(sc.Spec.Idrac.SSHEnabled).To(Equal(ptr.To(false)))
 			}, timeout, interval).Should(Succeed())
 		})
 
 		It("propagates a ConfigBundle spec update to the child CR", func() {
-			cb := singleServerBundle("test-bundle", ns, "colo-r740-01", "3RK3V64", "10.10.1.45")
+			cb := singleServerBundle("test-bundle", "colo-r740-01", "3RK3V64", "10.10.1.45")
 			cb.Spec.Servers[0].Idrac.SSHEnabled = ptr.To(false)
 			Expect(k8sClient.Create(ctx, cb)).To(Succeed())
 
 			// Wait for child CR.
 			sc := &armadav1.ServerConfig{}
 			Eventually(func() error {
-				return k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01", Namespace: ns}, sc)
+				return k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01"}, sc)
 			}, timeout, interval).Should(Succeed())
 
 			// Update the ConfigBundle spec — desired state changes.
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-bundle", Namespace: ns}, cb)).To(Succeed())
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-bundle"}, cb)).To(Succeed())
 			cb.Spec.Servers[0].Idrac.SSHEnabled = ptr.To(true)
 			Expect(k8sClient.Update(ctx, cb)).To(Succeed())
 
 			// Child CR must reflect the updated desired state.
 			Eventually(func(g Gomega) {
-				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01", Namespace: ns}, sc)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01"}, sc)).To(Succeed())
 				g.Expect(sc.Spec.Idrac.SSHEnabled).To(Equal(ptr.To(true)))
 			}, timeout, interval).Should(Succeed())
 		})
@@ -224,6 +235,17 @@ var _ = Describe("ConsumeServer", func() {
 	})
 
 	AfterEach(func() {
+		// Clean up cluster-scoped CRs created in this test (they survive namespace deletion; envtest does not run GC).
+		var scList armadav1.ServerConfigList
+		Expect(k8sClient.List(ctx, &scList)).To(Succeed())
+		for i := range scList.Items {
+			Expect(k8sClient.Delete(ctx, &scList.Items[i])).To(Succeed())
+		}
+		var cbList armadav1.ConfigBundleList
+		Expect(k8sClient.List(ctx, &cbList)).To(Succeed())
+		for i := range cbList.Items {
+			Expect(k8sClient.Delete(ctx, &cbList.Items[i])).To(Succeed())
+		}
 		Expect(k8sClient.Delete(ctx, &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: ns},
 		})).To(Succeed())
@@ -238,7 +260,7 @@ var _ = Describe("ConsumeServer", func() {
 		Expect(server.applyManifest(ctx, body, "sha256:abc123", "import-uuid-1")).To(Succeed())
 
 		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cb)).To(Succeed())
 		Expect(cb.Spec.Datacenter).To(Equal(datacenter))
 		Expect(cb.Spec.Servers).To(HaveLen(1))
 		Expect(cb.Spec.Servers[0].ServiceTag).To(Equal("3RK3V64"))
@@ -258,7 +280,7 @@ var _ = Describe("ConsumeServer", func() {
 		Expect(server.applyManifest(ctx, body, "sha256:abc", "import-1")).To(Succeed())
 
 		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cb)).To(Succeed())
 		Expect(cb.Spec.Servers).To(HaveLen(1))
 	})
 
@@ -274,7 +296,7 @@ var _ = Describe("ConsumeServer", func() {
 		), "sha256:v2", "import-2")).To(Succeed())
 
 		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cb)).To(Succeed())
 		Expect(cb.Spec.Servers).To(HaveLen(2))
 		Expect(cb.Status.LastAppliedDigest).To(Equal("sha256:v2"))
 		Expect(cb.Status.LastOrbImportID).To(Equal("import-2"))
@@ -286,7 +308,7 @@ var _ = Describe("ConsumeServer", func() {
 		// Step 1: controller seeds the CR with server A's full state.
 		seed := testManifest(datacenter,
 			armadav1.ServerSpec{OrbID: "colo:srv-aaa0001", ServiceTag: "AAA0001", Hostname: ptr.To("colo-r740-01"), OobIP: ptr.To("10.10.1.45"),
-				Idrac: armadav1.IdracSpec{SSHEnabled: ptr.To(false), FirmwareVersion: ptr.To("7.0.0"), RacadmEnabled: ptr.To(false)}},
+				Idrac: armadav1.IdracSpec{OrbID: "colo:srv-aaa0001-idrac", SSHEnabled: ptr.To(false), FirmwareVersion: ptr.To("7.0.0"), RacadmEnabled: ptr.To(false)}},
 		)
 		Expect(server.applyManifest(ctx, seed, "sha256:seed", "import-0")).To(Succeed())
 
@@ -296,7 +318,7 @@ var _ = Describe("ConsumeServer", func() {
 		adminApply := &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": armadav1.GroupVersion.String(),
 			"kind":       "ConfigBundle",
-			"metadata":   map[string]any{"name": datacenter, "namespace": ns},
+			"metadata":   map[string]any{"name": datacenter},
 			"spec": map[string]any{
 				"servers": []any{
 					map[string]any{
@@ -316,13 +338,13 @@ var _ = Describe("ConsumeServer", func() {
 		// but the other fields on A must take the controller's new values.
 		body := testManifest(datacenter,
 			armadav1.ServerSpec{OrbID: "colo:srv-aaa0001", ServiceTag: "AAA0001", Hostname: ptr.To("colo-r740-01"), OobIP: ptr.To("10.10.1.99"),
-				Idrac: armadav1.IdracSpec{SSHEnabled: ptr.To(false), FirmwareVersion: ptr.To("7.20.10.05"), RacadmEnabled: ptr.To(true)}},
+				Idrac: armadav1.IdracSpec{OrbID: "colo:srv-aaa0001-idrac", SSHEnabled: ptr.To(false), FirmwareVersion: ptr.To("7.20.10.05"), RacadmEnabled: ptr.To(true)}},
 			armadav1.ServerSpec{OrbID: "colo:srv-bbb0002", ServiceTag: "BBB0002", Hostname: ptr.To("colo-r740-02"), OobIP: ptr.To("10.10.1.46")},
 		)
 		Expect(server.applyManifest(ctx, body, "sha256:newdigest", "import-1")).To(Succeed())
 
 		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cb)).To(Succeed())
 
 		serverB := findServerByTag(cb.Spec.Servers, "BBB0002")
 		Expect(serverB).NotTo(BeNil(), "server B must be present")
@@ -349,7 +371,7 @@ var _ = Describe("ConsumeServer", func() {
 		const datacenter = "colo"
 		Expect(server.applyManifest(ctx, testManifest(datacenter), "sha256:empty", "import-1")).To(Succeed())
 		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cb)).To(Succeed())
 		Expect(cb.Spec.Servers).To(BeEmpty())
 	})
 
@@ -392,7 +414,7 @@ var _ = Describe("ConsumeServer", func() {
 		}
 
 		var final armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &final)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &final)).To(Succeed())
 		Expect(final.Status.LastAppliedDigest).To(HavePrefix("sha256:digest-"),
 			"status must reflect one of the concurrent writers")
 	})
@@ -430,6 +452,17 @@ var _ = Describe("SSA list merge-key isolation on servers[]", func() {
 	})
 
 	AfterEach(func() {
+		// Clean up cluster-scoped CRs created in this test (they survive namespace deletion; envtest does not run GC).
+		var scList armadav1.ServerConfigList
+		Expect(k8sClient.List(ctx, &scList)).To(Succeed())
+		for i := range scList.Items {
+			Expect(k8sClient.Delete(ctx, &scList.Items[i])).To(Succeed())
+		}
+		var cbList armadav1.ConfigBundleList
+		Expect(k8sClient.List(ctx, &cbList)).To(Succeed())
+		for i := range cbList.Items {
+			Expect(k8sClient.Delete(ctx, &cbList.Items[i])).To(Succeed())
+		}
 		Expect(k8sClient.Delete(ctx, &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: ns},
 		})).To(Succeed())
@@ -445,7 +478,7 @@ var _ = Describe("SSA list merge-key isolation on servers[]", func() {
 				APIVersion: armadav1.GroupVersion.String(),
 				Kind:       "ConfigBundle",
 			},
-			ObjectMeta: metav1.ObjectMeta{Name: "ssa-isolation-test", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: "ssa-isolation-test"},
 			Spec: armadav1.ConfigBundleSpec{
 				OrbID:      "colo:colo",
 				Datacenter: "colo",
@@ -455,7 +488,7 @@ var _ = Describe("SSA list merge-key isolation on servers[]", func() {
 						ServiceTag: "AAA0001",
 						Hostname:   ptr.To("colo-r740-01"),
 						OobIP:      ptr.To("10.10.1.45"),
-						Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(true)},
+						Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-aaa0001-idrac", SSHEnabled: ptr.To(true)},
 					},
 				},
 			},
@@ -473,7 +506,7 @@ var _ = Describe("SSA list merge-key isolation on servers[]", func() {
 				APIVersion: armadav1.GroupVersion.String(),
 				Kind:       "ConfigBundle",
 			},
-			ObjectMeta: metav1.ObjectMeta{Name: "ssa-isolation-test", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: "ssa-isolation-test"},
 			Spec: armadav1.ConfigBundleSpec{
 				OrbID:      "colo:colo",
 				Datacenter: "colo",
@@ -483,7 +516,7 @@ var _ = Describe("SSA list merge-key isolation on servers[]", func() {
 						ServiceTag: "BBB0002",
 						Hostname:   ptr.To("colo-r740-02"),
 						OobIP:      ptr.To("10.10.1.46"),
-						Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(false)},
+						Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-bbb0002-idrac", SSHEnabled: ptr.To(false)},
 					},
 				},
 			},
@@ -493,7 +526,7 @@ var _ = Describe("SSA list merge-key isolation on servers[]", func() {
 		)).To(Succeed(), "+listType=map must scope ownership to individual entries — Puller apply of server B must not 409")
 
 		result := &armadav1.ConfigBundle{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "ssa-isolation-test", Namespace: ns}, result)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "ssa-isolation-test"}, result)).To(Succeed())
 
 		serverA := findServerByTag(result.Spec.Servers, "AAA0001")
 		Expect(serverA).NotTo(BeNil(), "server A (admin-owned) must still be present")
@@ -531,6 +564,17 @@ var _ = Describe("DivergenceReporter", func() {
 	})
 
 	AfterEach(func() {
+		// Clean up cluster-scoped CRs created in this test (they survive namespace deletion; envtest does not run GC).
+		var scList armadav1.ServerConfigList
+		Expect(k8sClient.List(ctx, &scList)).To(Succeed())
+		for i := range scList.Items {
+			Expect(k8sClient.Delete(ctx, &scList.Items[i])).To(Succeed())
+		}
+		var cbList armadav1.ConfigBundleList
+		Expect(k8sClient.List(ctx, &cbList)).To(Succeed())
+		for i := range cbList.Items {
+			Expect(k8sClient.Delete(ctx, &cbList.Items[i])).To(Succeed())
+		}
 		Expect(k8sClient.Delete(ctx, &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: ns},
 		})).To(Succeed())
@@ -542,7 +586,7 @@ var _ = Describe("DivergenceReporter", func() {
 		// Step 1: configbundle-controller applies the initial spec (cloud intent).
 		controllerApply := &armadav1.ConfigBundle{
 			TypeMeta:   metav1.TypeMeta{APIVersion: armadav1.GroupVersion.String(), Kind: "ConfigBundle"},
-			ObjectMeta: metav1.ObjectMeta{Name: datacenter, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: datacenter},
 			Spec: armadav1.ConfigBundleSpec{
 				OrbID:      "colo:colo",
 				Datacenter: datacenter,
@@ -552,7 +596,7 @@ var _ = Describe("DivergenceReporter", func() {
 						ServiceTag: "3RK3V64",
 						Hostname:   ptr.To("colo-r740-01"),
 						OobIP:      ptr.To("10.10.1.45"),
-						Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(false), RacadmEnabled: ptr.To(true)},
+						Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(false), RacadmEnabled: ptr.To(true)},
 					},
 				},
 			},
@@ -566,7 +610,7 @@ var _ = Describe("DivergenceReporter", func() {
 		adminApply := &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": armadav1.GroupVersion.String(),
 			"kind":       "ConfigBundle",
-			"metadata":   map[string]any{"name": datacenter, "namespace": ns},
+			"metadata":   map[string]any{"name": datacenter},
 			"spec": map[string]any{
 				"servers": []any{
 					map[string]any{
@@ -583,10 +627,9 @@ var _ = Describe("DivergenceReporter", func() {
 
 		// Step 3: Read the CR back to get managedFields.
 		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cb)).To(Succeed())
 
 		// Step 4: Build a reporter with a mapping and set the last manifest.
-		mapping := envtestMapping(GinkgoT())
 		reporter := NewDivergenceReporter(k8sClient,
 			WithDivergenceNamespace(ns),
 			WithDivergenceEnabled(true),
@@ -594,7 +637,7 @@ var _ = Describe("DivergenceReporter", func() {
 		reporter.SetLastManifest(datacenter, controllerApply.Spec)
 
 		// Step 5: Extract overrides and verify orbital-native fields.
-		overrides := reporter.extractOverrides(&cb, mapping, controllerApply.Spec)
+		overrides := reporter.extractOverrides(&cb, controllerApply.Spec)
 		Expect(overrides).NotTo(BeEmpty(), "should detect at least one override")
 
 		var found *OverrideEntry
@@ -617,7 +660,7 @@ var _ = Describe("DivergenceReporter", func() {
 
 		controllerApply := &armadav1.ConfigBundle{
 			TypeMeta:   metav1.TypeMeta{APIVersion: armadav1.GroupVersion.String(), Kind: "ConfigBundle"},
-			ObjectMeta: metav1.ObjectMeta{Name: datacenter, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: datacenter},
 			Spec: armadav1.ConfigBundleSpec{
 				OrbID:      "colo:colo",
 				Datacenter: datacenter,
@@ -631,16 +674,15 @@ var _ = Describe("DivergenceReporter", func() {
 		)).To(Succeed())
 
 		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cb)).To(Succeed())
 
-		mapping := envtestMapping(GinkgoT())
 		reporter := NewDivergenceReporter(k8sClient,
 			WithDivergenceNamespace(ns),
 			WithDivergenceEnabled(true),
 		)
 		reporter.SetLastManifest(datacenter, controllerApply.Spec)
 
-		overrides := reporter.extractOverrides(&cb, mapping, controllerApply.Spec)
+		overrides := reporter.extractOverrides(&cb, controllerApply.Spec)
 		Expect(overrides).To(BeEmpty(), "no local:admin fields → no overrides")
 	})
 
@@ -659,7 +701,7 @@ var _ = Describe("DivergenceReporter", func() {
 		// Step 1: controller applies initial spec.
 		controllerApply := &armadav1.ConfigBundle{
 			TypeMeta:   metav1.TypeMeta{APIVersion: armadav1.GroupVersion.String(), Kind: "ConfigBundle"},
-			ObjectMeta: metav1.ObjectMeta{Name: datacenter, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: datacenter},
 			Spec: armadav1.ConfigBundleSpec{
 				OrbID:      "colo:colo",
 				Datacenter: datacenter,
@@ -669,7 +711,7 @@ var _ = Describe("DivergenceReporter", func() {
 						ServiceTag: "3RK3V64",
 						Hostname:   ptr.To("colo-r740-01"),
 						OobIP:      ptr.To("10.10.1.45"),
-						Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(false)},
+						Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(false)},
 					},
 				},
 			},
@@ -680,10 +722,11 @@ var _ = Describe("DivergenceReporter", func() {
 
 		// Step 2: local:admin overrides sshEnabled.
 		// Build as unstructured so we claim only the leaf we set.
+		// ConfigBundle is cluster-scoped — no namespace in metadata.
 		adminApply := &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": armadav1.GroupVersion.String(),
 			"kind":       "ConfigBundle",
-			"metadata":   map[string]any{"name": datacenter, "namespace": ns},
+			"metadata":   map[string]any{"name": datacenter},
 			"spec": map[string]any{
 				"servers": []any{
 					map[string]any{
@@ -698,27 +741,15 @@ var _ = Describe("DivergenceReporter", func() {
 			client.ForceOwnership,
 		)).To(Succeed())
 
-		// Update status with a digest so the reporter can find the ConfigBundle.
+		// Update status with a digest (informational; divergence reporter no
+		// longer reads a mapping CM under ADR-011, but the status field is
+		// still part of the contract).
 		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cb)).To(Succeed())
 		cb.Status.LastAppliedDigest = "sha256:test-digest"
 		Expect(k8sClient.Status().Update(ctx, &cb)).To(Succeed())
 
-		// Step 3: Write the mapping ConfigMap (simulating what handleMappingBody does).
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
-		mappingJSON, err := json.Marshal(envtestMapping(GinkgoT()))
-		Expect(err).NotTo(HaveOccurred())
-		ownerRef := metav1.OwnerReference{
-			APIVersion:         armadav1.GroupVersion.String(),
-			Kind:               "ConfigBundle",
-			Name:               cb.Name,
-			UID:                cb.UID,
-			Controller:         ptr.To(true),
-			BlockOwnerDeletion: ptr.To(true),
-		}
-		Expect(writeMappingConfigMap(ctx, k8sClient, ns, datacenter, "sha256:test-digest", mappingJSON, ownerRef)).To(Succeed())
-
-		// Step 4: Run reporter.Reconcile() directly (lastEventAt is zero → startup case, no debounce).
+		// Step 3: Run reporter.Reconcile() directly (lastEventAt is zero → startup case, no debounce).
 		reporter := NewDivergenceReporter(k8sClient,
 			WithDivergenceNamespace(ns),
 			WithDivergenceEnabled(true),
@@ -726,8 +757,8 @@ var _ = Describe("DivergenceReporter", func() {
 		)
 		reporter.SetLastManifest(datacenter, controllerApply.Spec)
 
-		_, err = reporter.Reconcile(ctx, reconcile.Request{
-			NamespacedName: types.NamespacedName{Name: datacenter, Namespace: ns},
+		_, err := reporter.Reconcile(ctx, reconcile.Request{
+			NamespacedName: types.NamespacedName{Name: datacenter},
 		})
 		Expect(err).NotTo(HaveOccurred())
 
@@ -745,136 +776,6 @@ var _ = Describe("DivergenceReporter", func() {
 		Expect(sshOverride.Type).To(Equal("IdracSettings"))
 		Expect(sshOverride.OverrideValue).To(Equal(true))
 		Expect(sshOverride.IntendedValue).To(Equal(false))
-	})
-})
-
-// ---------------------------------------------------------------------------
-// Mapping ConfigMap envtest tests
-// ---------------------------------------------------------------------------
-
-var _ = Describe("DispatchServer mapping via ConfigMap", func() {
-	const (
-		timeout  = 10 * time.Second
-		interval = 250 * time.Millisecond
-	)
-
-	ctx := context.Background()
-
-	var (
-		ns        string
-		nsCounter int
-		server    *ConsumeServer
-	)
-
-	BeforeEach(func() {
-		nsCounter++
-		ns = fmt.Sprintf("mapping-cm-%d", nsCounter)
-		Expect(k8sClient.Create(ctx, &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{Name: ns},
-		})).To(Succeed())
-		server = NewConsumeServer(k8sClient,
-			WithNamespace(ns),
-			WithRetry(1, 0),
-		)
-	})
-
-	AfterEach(func() {
-		Expect(k8sClient.Delete(ctx, &corev1.Namespace{
-			ObjectMeta: metav1.ObjectMeta{Name: ns},
-		})).To(Succeed())
-	})
-
-	It("stores mapping in a ConfigMap with OwnerReference on dispatch", func() {
-		const datacenter = "colo"
-		body := testManifest(datacenter,
-			armadav1.ServerSpec{OrbID: "colo:srv-3rk3v64", ServiceTag: "3RK3V64", Hostname: ptr.To("colo-r740-01"), OobIP: ptr.To("10.10.1.45")},
-		)
-
-		// Apply manifest to create the CR.
-		Expect(server.applyManifest(ctx, body, "sha256:v1", "import-1")).To(Succeed())
-
-		// Fetch CR to get UID.
-		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
-
-		// Write mapping ConfigMap with OwnerReference (simulating handleMappingBody).
-		mappingRaw, err := json.Marshal(envtestMapping(GinkgoT()))
-		Expect(err).NotTo(HaveOccurred())
-		ownerRef := metav1.OwnerReference{
-			APIVersion:         armadav1.GroupVersion.String(),
-			Kind:               "ConfigBundle",
-			Name:               cb.Name,
-			UID:                cb.UID,
-			Controller:         ptr.To(true),
-			BlockOwnerDeletion: ptr.To(true),
-		}
-		Expect(writeMappingConfigMap(ctx, k8sClient, ns, datacenter, "sha256:v1", mappingRaw, ownerRef)).To(Succeed())
-
-		// Verify ConfigMap exists with correct labels and data.
-		var cm corev1.ConfigMap
-		Expect(k8sClient.Get(ctx, types.NamespacedName{
-			Name:      MappingConfigMapName(datacenter),
-			Namespace: ns,
-		}, &cm)).To(Succeed())
-
-		Expect(cm.Labels).To(HaveKeyWithValue("armada.ai/configbundle", datacenter))
-		Expect(cm.Labels).To(HaveKeyWithValue("armada.ai/component", "mapping"))
-		Expect(cm.Data).To(HaveKey("digest"))
-		Expect(cm.Data["digest"]).To(Equal("sha256:v1"))
-		Expect(cm.Data).To(HaveKey("mapping.json"))
-		Expect(cm.OwnerReferences).To(HaveLen(1))
-		Expect(cm.OwnerReferences[0].Name).To(Equal(datacenter))
-		Expect(cm.OwnerReferences[0].UID).To(Equal(cb.UID))
-
-		// Read it back with readMappingConfigMap and verify parse.
-		m, err := readMappingConfigMap(ctx, k8sClient, ns, datacenter)
-		Expect(err).NotTo(HaveOccurred())
-		Expect(m.Rules).NotTo(BeEmpty())
-	})
-
-	It("sets a blocking OwnerReference on the ConfigMap pointing to the ConfigBundle CR", func() {
-		const datacenter = "colo"
-		body := testManifest(datacenter,
-			armadav1.ServerSpec{OrbID: "colo:srv-3rk3v64", ServiceTag: "3RK3V64", Hostname: ptr.To("colo-r740-01"), OobIP: ptr.To("10.10.1.45")},
-		)
-
-		// Apply manifest to create the CR.
-		Expect(server.applyManifest(ctx, body, "sha256:v1", "import-1")).To(Succeed())
-
-		var cb armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cb)).To(Succeed())
-
-		// Write mapping ConfigMap with OwnerReference.
-		mappingRaw, err := json.Marshal(envtestMapping(GinkgoT()))
-		Expect(err).NotTo(HaveOccurred())
-		ownerRef := metav1.OwnerReference{
-			APIVersion:         armadav1.GroupVersion.String(),
-			Kind:               "ConfigBundle",
-			Name:               cb.Name,
-			UID:                cb.UID,
-			Controller:         ptr.To(true),
-			BlockOwnerDeletion: ptr.To(true),
-		}
-		Expect(writeMappingConfigMap(ctx, k8sClient, ns, datacenter, "sha256:v1", mappingRaw, ownerRef)).To(Succeed())
-
-		// Verify OwnerReference is set correctly.
-		// In a real cluster the GC would delete the ConfigMap when the CR is deleted.
-		// Envtest does not run the garbage collector, so we verify the OwnerReference
-		// is set with Controller=true and BlockOwnerDeletion=true which is sufficient
-		// to enable cascading deletion in production.
-		var cm corev1.ConfigMap
-		Expect(k8sClient.Get(ctx, types.NamespacedName{
-			Name:      MappingConfigMapName(datacenter),
-			Namespace: ns,
-		}, &cm)).To(Succeed())
-
-		Expect(cm.OwnerReferences).To(HaveLen(1))
-		or := cm.OwnerReferences[0]
-		Expect(or.Kind).To(Equal("ConfigBundle"))
-		Expect(or.Name).To(Equal(datacenter))
-		Expect(or.UID).To(Equal(cb.UID))
-		Expect(or.Controller).To(Equal(ptr.To(true)))
-		Expect(or.BlockOwnerDeletion).To(Equal(ptr.To(true)))
 	})
 })
 
@@ -909,6 +810,17 @@ var _ = Describe("Takeover", func() {
 	})
 
 	AfterEach(func() {
+		// Clean up cluster-scoped CRs created in this test (they survive namespace deletion; envtest does not run GC).
+		var scList armadav1.ServerConfigList
+		Expect(k8sClient.List(ctx, &scList)).To(Succeed())
+		for i := range scList.Items {
+			Expect(k8sClient.Delete(ctx, &scList.Items[i])).To(Succeed())
+		}
+		var cbList armadav1.ConfigBundleList
+		Expect(k8sClient.List(ctx, &cbList)).To(Succeed())
+		for i := range cbList.Items {
+			Expect(k8sClient.Delete(ctx, &cbList.Items[i])).To(Succeed())
+		}
 		Expect(k8sClient.Delete(ctx, &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{Name: ns},
 		})).To(Succeed())
@@ -920,7 +832,7 @@ var _ = Describe("Takeover", func() {
 		// Step 1: configbundle-controller applies the initial spec.
 		controllerApply := &armadav1.ConfigBundle{
 			TypeMeta:   metav1.TypeMeta{APIVersion: armadav1.GroupVersion.String(), Kind: "ConfigBundle"},
-			ObjectMeta: metav1.ObjectMeta{Name: datacenter, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: datacenter},
 			Spec: armadav1.ConfigBundleSpec{
 				OrbID:      "colo:colo",
 				Datacenter: datacenter,
@@ -948,7 +860,7 @@ var _ = Describe("Takeover", func() {
 		adminApply := &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": armadav1.GroupVersion.String(),
 			"kind":       "ConfigBundle",
-			"metadata":   map[string]any{"name": datacenter, "namespace": ns},
+			"metadata":   map[string]any{"name": datacenter},
 			"spec": map[string]any{
 				"servers": []any{
 					map[string]any{
@@ -968,7 +880,7 @@ var _ = Describe("Takeover", func() {
 
 		// Verify admin owns at least one field on the server before takeover.
 		var cbBefore armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cbBefore)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cbBefore)).To(Succeed())
 		Expect(hasAdminEntryFor(cbBefore.ManagedFields, "colo:srv-3rk3v64")).To(BeTrue(),
 			"admin should own at least one field on the server entry")
 
@@ -995,14 +907,14 @@ var _ = Describe("Takeover", func() {
 		// processTakeover now consumes the admin-omitted patchSpec produced by
 		// the normal-apply pass; compute it here for the test.
 		var cbForPatch armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cbForPatch)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cbForPatch)).To(Succeed())
 		patchSpec, err := omitAdminOwnedFields(spec, cbForPatch.Spec, cbForPatch.ManagedFields)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(server.processTakeover(ctx, spec, patchSpec)).To(Succeed())
 
 		// Step 4: Read the CR back and verify field values.
 		var cbAfter armadav1.ConfigBundle
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter, Namespace: ns}, &cbAfter)).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: datacenter}, &cbAfter)).To(Succeed())
 
 		srv := findServerByTag(cbAfter.Spec.Servers, "3RK3V64")
 		Expect(srv).NotTo(BeNil())
@@ -1040,7 +952,7 @@ var _ = Describe("Takeover", func() {
 
 		controllerApply := &armadav1.ConfigBundle{
 			TypeMeta:   metav1.TypeMeta{APIVersion: armadav1.GroupVersion.String(), Kind: "ConfigBundle"},
-			ObjectMeta: metav1.ObjectMeta{Name: datacenter, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: datacenter},
 			Spec: armadav1.ConfigBundleSpec{
 				OrbID:      "colo:colo",
 				Datacenter: datacenter,
@@ -1068,33 +980,12 @@ var _ = Describe("Takeover", func() {
 	})
 })
 
-// envtestMapping returns a MappingPayload matching the server entries used in envtests.
-// One rule per nested type (today: just IdracSettings). DC and Server orbIds
-// live in the spec directly — they don't appear in the mapping anymore.
-func envtestMapping(t interface {
-	Helper()
-	Fatalf(string, ...interface{})
-}) *bundle.MappingPayload {
-	t.Helper()
-	m, err := ParseMapping([]byte(`{
-		"bundleDigest": "sha256:test-digest",
-		"rules": [
-			{"listField": "spec.servers", "itemKey": "orbId", "field": "idrac", "type": "IdracSettings", "orbIdSuffix": "-idrac"}
-		]
-	}`))
-	if err != nil {
-		t.Fatalf("ParseMapping: %v", err)
-	}
-	return m
-}
-
 // singleServerBundle returns a ConfigBundle with one server entry for use in tests.
 // Bundle orbId is derived from name; server orbId is derived from serviceTag.
-func singleServerBundle(name, ns, hostname, serviceTag, oobIP string) *armadav1.ConfigBundle {
+func singleServerBundle(name, hostname, serviceTag, oobIP string) *armadav1.ConfigBundle {
 	return &armadav1.ConfigBundle{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: ns,
+			Name: name,
 		},
 		Spec: armadav1.ConfigBundleSpec{
 			OrbID:      "colo:" + name,

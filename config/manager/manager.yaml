@@ -65,9 +65,26 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        env:
+        # OPERATOR_NAMESPACE is where cb-controller writes its own state
+        # ConfigMaps (mapping + last-applied-spec). ConfigBundle and ServerConfig
+        # are cluster-scoped; only the operator's internal state is namespaced.
+        # Default to the pod's own namespace via downward API so state co-locates
+        # with the controller.
+        - name: OPERATOR_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: ORB_DIVERGENCE_INTAKE_URL
+          value: http://orb:8010/api/v1/divergence
+        - name: CB_CONTROLLER_PORT
+          value: ":8095"
         ports:
         - containerPort: 8081
           name: health
+          protocol: TCP
+        - containerPort: 8095
+          name: dispatch
           protocol: TCP
         securityContext:
           readOnlyRootFilesystem: true

@@ -128,18 +128,6 @@ func TestHandleDispatch_UnsupportedMediaType(t *testing.T) {
 	}
 }
 
-func TestHandleDispatch_MappingMissingDigest(t *testing.T) {
-	s := NewConsumeServer(nil)
-	req := httptest.NewRequest(http.MethodPost, "/dispatch", bytes.NewBufferString(`{"items":[]}`))
-	req.Header.Set("Content-Type", bundle.MediaTypeMapping)
-	// No X-Orb-Digest header
-	w := httptest.NewRecorder()
-	s.handleDispatch(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", w.Code)
-	}
-}
-
 func TestHandleDispatch_ManifestRouted(t *testing.T) {
 	s := NewConsumeServer(nil)
 	done := make(chan struct{})
@@ -407,10 +395,11 @@ func TestOmitAdminOwnedFields_IgnoredAlwaysOmittedEvenOnValueMatch(t *testing.T)
 	}
 }
 
-func TestOmitAdminOwnedFields_IgnoredOmittedEvenWithoutLocalClaim(t *testing.T) {
-	// Edge case: spec.Ignored names a field but no local:* manager has claimed
-	// it yet. The controller must still bow out — Ignore is a forward-looking
-	// directive ("if local takes this, leave them alone").
+func TestOmitAdminOwnedFields_IgnoredWithoutLocalClaim_StaysInApplyForReclaim(t *testing.T) {
+	// Under ADR-009, an Ignored field with no active local:* claim is reclaimed
+	// by cb-controller with intent value. The Ignore directive is meaningless
+	// without an active override — the operator either never claimed the field,
+	// or released it (handback). Either way, intent should land.
 	intent := armadav1.ConfigBundleSpec{
 		Datacenter: "colo:test",
 		Servers: []armadav1.ServerSpec{{
@@ -435,9 +424,11 @@ func TestOmitAdminOwnedFields_IgnoredOmittedEvenWithoutLocalClaim(t *testing.T) 
 	if err != nil {
 		t.Fatalf("omit: %v", err)
 	}
-	if len(out.Servers) > 0 && out.Servers[0].Idrac.RacadmEnabled != nil {
-		t.Errorf("ignored field must be omitted even when local:* hasn't claimed yet; got %v",
-			*out.Servers[0].Idrac.RacadmEnabled)
+	if len(out.Servers) == 0 || out.Servers[0].Idrac.RacadmEnabled == nil {
+		t.Fatalf("ignored field with no local:* claim must be RETAINED in apply body (ADR-009 reclaim semantic); got nil")
+	}
+	if *out.Servers[0].Idrac.RacadmEnabled != true {
+		t.Errorf("expected intent value true to flow through; got %v", *out.Servers[0].Idrac.RacadmEnabled)
 	}
 }
 
@@ -495,5 +486,73 @@ func TestOmitAdminOwnedFields_BatchSiblingsOnSameServer(t *testing.T) {
 	}
 	if srv.Idrac.IPMIEnabled == nil || *srv.Idrac.IPMIEnabled != true {
 		t.Errorf("ipmiEnabled (values match post-Accept) must stay for auto-claim; got %v", srv.Idrac.IPMIEnabled)
+	}
+}
+
+// --- Unit tests for collectLocalClaimedKeys + filterActiveIgnored (ADR-009) ---
+
+func TestCollectLocalClaimedKeys_LocalIdracClaim(t *testing.T) {
+	mf := managedFieldsClaim(t, "local:admin", map[string]any{
+		"f:spec": map[string]any{
+			"f:servers": map[string]any{
+				`k:{"orbId":"colo:srv-1"}`: map[string]any{
+					"f:idrac": map[string]any{"f:racadmEnabled": map[string]any{}},
+				},
+			},
+		},
+	})
+	got := collectLocalClaimedKeys(mf)
+	if !got["colo:srv-1|racadmEnabled"] {
+		t.Errorf("expected key colo:srv-1|racadmEnabled, got %v", got)
+	}
+}
+
+func TestCollectLocalClaimedKeys_IgnoresControllerManager(t *testing.T) {
+	mf := managedFieldsClaim(t, "configbundle-controller", map[string]any{
+		"f:spec": map[string]any{
+			"f:servers": map[string]any{
+				`k:{"orbId":"colo:srv-1"}`: map[string]any{
+					"f:idrac": map[string]any{"f:racadmEnabled": map[string]any{}},
+				},
+			},
+		},
+	})
+	got := collectLocalClaimedKeys(mf)
+	if len(got) != 0 {
+		t.Errorf("controller-owned fields must not appear; got %v", got)
+	}
+}
+
+func TestFilterActiveIgnored_DropsStaleEntry(t *testing.T) {
+	entries := []armadav1.IgnoredEntry{
+		{ServerOrbID: "colo:srv-1", Field: "racadmEnabled"},
+		{ServerOrbID: "colo:srv-2", Field: "sshEnabled"},
+	}
+	claimed := map[string]bool{
+		"colo:srv-2|sshEnabled": true,
+	}
+	got := filterActiveIgnored(entries, claimed)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 kept entry, got %d: %v", len(got), got)
+	}
+	if got[0].ServerOrbID != "colo:srv-2" {
+		t.Errorf("wrong entry kept: %v", got[0])
+	}
+}
+
+func TestFilterActiveIgnored_AllStale(t *testing.T) {
+	entries := []armadav1.IgnoredEntry{
+		{ServerOrbID: "colo:srv-1", Field: "racadmEnabled"},
+	}
+	got := filterActiveIgnored(entries, map[string]bool{})
+	if len(got) != 0 {
+		t.Errorf("expected all entries dropped (no claims); got %v", got)
+	}
+}
+
+func TestFilterActiveIgnored_EmptyInputPassthrough(t *testing.T) {
+	got := filterActiveIgnored(nil, map[string]bool{"colo:srv-1|sshEnabled": true})
+	if got != nil {
+		t.Errorf("nil input should pass through unchanged; got %v", got)
 	}
 }

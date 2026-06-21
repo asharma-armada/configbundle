@@ -26,14 +26,14 @@
 - **Enrichment is all-or-nothing.** A non-2xx response from the bundler causes Orbital to mark the publish failed and push nothing. Partial artifacts are never produced.
 - **Orbital never imports configbundle.** Dependency flows one way: configbundle calls Orbital's GraphQL API. No reverse imports.
 - **CMDB is not in the reconciliation path.** After a ConfigBundle lands on a Galleon, Orbital has no further role. ConfigBundle Controller and X Config Controllers run locally and reconcile from the CRD.
-- **Orb is the single artifact ingress at the edge.** Orb pulls from Zot, cosign-verifies, imports graph layers to DGraph, then dispatches each remaining layer to registered consumers by media type. CB Controller is a consumer — it receives layers via `POST /dispatch` (content-routed: manifest → apply CR, mapping → write ConfigMap). CB Controller never holds OCI credentials.
+- **Orb is the single artifact ingress at the edge.** Orb pulls from Zot, cosign-verifies, imports graph layers to DGraph, then dispatches each remaining layer to registered consumers by media type. CB Controller is a consumer — it receives the manifest layer via `POST /dispatch` (content-routed by `Content-Type`). After ADR-011 the mapping layer no longer exists; the manifest is the sole layer dispatched to CB Controller. CB Controller never holds OCI credentials.
 - **Orb owns Dgraph import.** Configbundle never calls orb's import API. Orb is responsible for getting graph data into its own database. The ConfigBundle CR is the handoff artifact — orb reacts to it independently.
 
 ## Current State
 
 **Phase:** Prototype
-**Active work:** Dispatch rewrite shipped; divergence pipeline complete and e2e-validated
-**Next priority:** Bundler e2e validation against live Orbital (Spike 3 acceptance); Spike 8 (full pipeline e2e); orbital e2e script update (`DIVERGENCE_REPORTER_INTERVAL` → removed, `DIVERGENCE_REPORTER_DEBOUNCE=2s` if needed)
+**Active work:** ADR-011 shipped — mapping OCI layer + `bundle.MappingPayload` deleted; `idrac.orbId` saturated on the ConfigBundle CR; bundler returns 1 layer (was 2); e2e-validated on minikube. Drift-detection metrics live in serverconfig-controller (separate repo): intent/observed/ignored Prom gauges, feature-gated via `IDRAC_OBSERVE_INTERVAL` (default disabled; 5m in k8s Deployment).
+**Next priority:** Spike 8 (full pipeline e2e); PrometheusRule + Alertmanager wiring for drift gauges; orbital-side cleanup of orphan Ignore resolutions after edge handback.
 
 *Update this section at each session wrap-up.*
 
@@ -92,6 +92,7 @@ Architecture decisions with full rationale. Read when the context would otherwis
 | Divergence mapping layer (D2 decision) | `docs/decisions/005-divergence-mapping-layer.md` |
 | Takeover pipeline ordering in consume handler | `docs/decisions/006-divergence-takeover-pipeline.md` |
 | Releasing stale managedFields claims after takeover | `docs/decisions/008-managedfields-release.md` |
+| Local release auto-reverts to last-imported intent (handback) | `docs/decisions/009-edge-handback-via-release.md` |
 | OCI bundler pipeline, ConfigBundle integration | `~/armada/orbital/docs/configbundle-integration.md` |
 | Divergence contract (cb-controller obligations) | `docs/plans/divergence-cb-controller-contract.md` |
 
@@ -166,7 +167,8 @@ These are cross-cutting platform decisions. **Domain-specific decisions live in 
 - **CB Controller validates synchronously, applies asynchronously** — bad payloads return 4xx; valid payloads return 200; K8s apply runs in background
 - **CB Bundler deploys as a sidecar container in the Orbital pod for prototype/MVP** — separate container image, shared pod network, enricher URL `http://localhost:8020/bundle`
 - **ConfigBundle is a separate project, built after orbital** — orbital's APIs are the contract; do not add ConfigBundle awareness to orbital
-- **Local dev defaults must point to local services** — `ORBITAL_GRAPHQL_URL`, `BUNDLER_PORT`, etc. all default to local values in config structs. Production credentials must never appear as code defaults.
+- **Local dev defaults must point to local services** — `ORBITAL_BASE_URL`, `BUNDLER_PORT`, etc. all default to local values in config structs. Production credentials must never appear as code defaults.
+- **Single base URL for orbital — `ORBITAL_BASE_URL`** — cb-bundler derives `/graphql` and `/api/v1/...` from this one root. Must include orbital's base path (e.g. AKS: `http://localhost:8001/orbital`, local: `http://localhost:8001`). Do NOT reintroduce separate `ORBITAL_GRAPHQL_URL`/`ORBITAL_API_URL` env vars — that two-URL design caused base-path drift across local/AKS that took two rounds of debugging to surface. See `cmd/bundler/main.go` and `internal/bundler/orbital.go` for the helpers (`graphqlURL()`, `divergencesURL()`).
 - **Single `Dockerfile`, two targets** — `--target controller` and `--target bundler` produce two images from one Dockerfile with a shared builder stage
 
 ## Development Status

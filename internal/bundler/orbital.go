@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 )
 
 // OrbitalQuerier fetches datacenter configuration from Orbital's GraphQL API
@@ -133,10 +134,21 @@ type graphqlResponse struct {
 
 // HTTPOrbitalClient queries Orbital's GraphQL and REST APIs over HTTP.
 // Auth is handled by the injected HTTPClient transport (OAuth2 or static bearer).
+//
+// BaseURL is the single root for orbital — both GraphQL and REST paths are
+// derived from it. Local dev: `http://localhost:8001`. AKS (with orbital
+// mounted under a base path): `http://localhost:8001/orbital`.
 type HTTPOrbitalClient struct {
-	URL        string // GraphQL endpoint
-	APIURL     string // REST API base (e.g. "http://localhost:8001")
+	BaseURL    string
 	HTTPClient *http.Client
+}
+
+func (c *HTTPOrbitalClient) graphqlURL() string {
+	return strings.TrimRight(c.BaseURL, "/") + "/graphql"
+}
+
+func (c *HTTPOrbitalClient) divergencesURL() string {
+	return strings.TrimRight(c.BaseURL, "/") + "/api/v1/divergences"
 }
 
 func (c *HTTPOrbitalClient) QueryDataCenter(ctx context.Context, orbID string) ([]DataCenterResult, error) {
@@ -148,7 +160,7 @@ func (c *HTTPOrbitalClient) QueryDataCenter(ctx context.Context, orbID string) (
 		return nil, fmt.Errorf("marshal query: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.graphqlURL(), bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
@@ -177,7 +189,7 @@ func (c *HTTPOrbitalClient) QueryDataCenter(ctx context.Context, orbID string) (
 }
 
 func (c *HTTPOrbitalClient) QueryPendingForce(ctx context.Context) ([]PendingForceResolution, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.APIURL+"/api/v1/divergences", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.divergencesURL(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
@@ -211,7 +223,7 @@ func (c *HTTPOrbitalClient) QueryPendingForce(ctx context.Context) ([]PendingFor
 // for ignore resolution. The bundler must remove these from the cb-manifest apply
 // config on every bundle build (they persist until the resolution row is deleted).
 func (c *HTTPOrbitalClient) QueryOmissions(ctx context.Context) ([]Omission, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.APIURL+"/api/v1/divergences", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.divergencesURL(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}

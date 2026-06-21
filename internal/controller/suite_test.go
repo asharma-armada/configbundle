@@ -48,6 +48,12 @@ var (
 	testEnv   *envtest.Environment
 	cfg       *rest.Config
 	k8sClient client.Client
+
+	// testReconciler is the live ConfigBundleReconciler running in this suite's
+	// manager. Per-test BeforeEach blocks reassign testReconciler.ChildNamespace
+	// to the dynamic test ns so that child ServerConfigs land in the
+	// per-test namespace (preserving isolation across Describe blocks).
+	testReconciler *ConfigBundleReconciler
 )
 
 func TestControllers(t *testing.T) {
@@ -96,10 +102,12 @@ var _ = BeforeSuite(func() {
 	})
 	Expect(err).NotTo(HaveOccurred())
 
-	err = (&ConfigBundleReconciler{
+	testReconciler = &ConfigBundleReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr)
+		// ChildNamespace is overwritten per-test by BeforeEach blocks.
+	}
+	err = testReconciler.SetupWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 
 	reporter := NewDivergenceReporter(mgr.GetClient(),

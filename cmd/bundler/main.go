@@ -17,15 +17,14 @@ func main() {
 	httpClient := buildHTTPClient(cfg)
 
 	orbital := &bundler.HTTPOrbitalClient{
-		URL:        cfg.OrbitalGraphQLURL,
-		APIURL:     cfg.OrbitalAPIURL,
+		BaseURL:    cfg.OrbitalBaseURL,
 		HTTPClient: httpClient,
 	}
 
 	mux := http.NewServeMux()
 	mux.Handle("POST /bundle", &bundler.Handler{Orbital: orbital, Resolutions: orbital})
 
-	log.Printf("bundler starting version=%s port=%s orbital=%s", version.Version, cfg.Port, cfg.OrbitalGraphQLURL)
+	log.Printf("bundler starting version=%s port=%s orbital=%s", version.Version, cfg.Port, cfg.OrbitalBaseURL)
 	if err := http.ListenAndServe(":"+cfg.Port, mux); err != nil {
 		log.Fatalf("bundler: %v", err)
 	}
