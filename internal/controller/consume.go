@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -43,8 +44,41 @@ type ConsumeServer struct {
 	ctx       context.Context // lifecycle context set by Start(); defaults to Background()
 	reporter  *DivergenceReporter
 
+	// inFlight tracks ConfigBundles whose applyManifest is currently executing.
+	// ReclaimController consults this to defer its replay path when a release
+	// event arrives mid-apply — the controller's own ForceOwnership and
+	// processTakeover passes strip local:* claims, which would otherwise
+	// trigger reclaim and replay a stale manifest on top of a half-landed one.
+	// Keyed by ConfigBundle name.
+	inFlightMu sync.Mutex
+	inFlight   map[string]bool
+
 	// applyFn overrides applyManifest in tests.
 	applyFn func(ctx context.Context, body []byte, digest, importID string) error
+}
+
+// IsInFlight reports whether applyManifest is currently executing for the
+// named ConfigBundle. ReclaimController checks this before doing its replay
+// pass to avoid racing with an in-progress consume.
+func (s *ConsumeServer) IsInFlight(name string) bool {
+	s.inFlightMu.Lock()
+	defer s.inFlightMu.Unlock()
+	return s.inFlight[name]
+}
+
+func (s *ConsumeServer) markInFlight(name string) {
+	s.inFlightMu.Lock()
+	if s.inFlight == nil {
+		s.inFlight = map[string]bool{}
+	}
+	s.inFlight[name] = true
+	s.inFlightMu.Unlock()
+}
+
+func (s *ConsumeServer) markComplete(name string) {
+	s.inFlightMu.Lock()
+	delete(s.inFlight, name)
+	s.inFlightMu.Unlock()
 }
 
 // ConsumeServerOption configures a ConsumeServer.
@@ -210,6 +244,22 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 		return fmt.Errorf("manifest has empty datacenter field")
 	}
 
+	// Mark this CB as having an apply in flight so ReclaimController defers any
+	// release events fired by our own ForceOwnership / processTakeover passes.
+	// Cleared at the very end (after the durable ConfigMap write) so reclaim's
+	// next attempt reads a consistent ConfigMap if it falls back to that path.
+	s.markInFlight(spec.Datacenter)
+	defer s.markComplete(spec.Datacenter)
+
+	// Update the in-memory last-manifest BEFORE any K8s write that can trigger
+	// a reclaim event. ReclaimController prefers this in-memory value over the
+	// persisted ConfigMap (which is only written at the end of this function),
+	// so a release fired mid-apply replays the FRESH manifest, not the previous
+	// one. The persisted ConfigMap remains the durable bootstrap baseline.
+	if s.reporter != nil {
+		s.reporter.SetLastManifest(spec.Datacenter, spec)
+	}
+
 	// Fetch the current CR to read managedFields for omitAdminOwnedServers.
 	// ConfigBundle is cluster-scoped — no namespace.
 	var cb armadav1.ConfigBundle
@@ -294,12 +344,11 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 		return fmt.Errorf("takeover: %w", takeoverErr)
 	}
 
-	// Record the last-applied manifest for divergence comparison — both in
-	// memory (fast path for the reporter) and durably in the CR's ConfigMap
-	// (survives controller restart). Persist failure is non-fatal: the
-	// in-memory state is still correct; only post-restart recovery degrades.
+	// Persist the manifest to the per-CR ConfigMap as the durable bootstrap
+	// baseline. In-memory was already updated above (before any K8s write that
+	// could fire reclaim). Persist failure is non-fatal: in-memory is correct;
+	// only post-restart recovery degrades until the next dispatch.
 	if s.reporter != nil {
-		s.reporter.SetLastManifest(spec.Datacenter, spec)
 		if err := writeLastAppliedSpec(ctx, s.Client, s.namespace, spec.Datacenter, spec); err != nil {
 			log.FromContext(ctx).WithName("consume").Info("persist last-applied-spec failed (non-fatal)", "err", err.Error())
 		}

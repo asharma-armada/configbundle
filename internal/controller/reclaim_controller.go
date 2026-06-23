@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -18,6 +19,12 @@ import (
 
 	armadav1 "github.com/armada/configbundle/api/v1"
 )
+
+// reclaimInFlightRequeue is how long ReclaimController waits before retrying
+// when ConsumeServer.applyManifest is currently executing for the same CB.
+// Short enough that a deferred reclaim still feels responsive; long enough
+// that we don't busy-loop while a normal apply (~hundreds of ms) finishes.
+const reclaimInFlightRequeue = 2 * time.Second
 
 // ReclaimController watches ConfigBundle CRs for SSA-release events from
 // local:* managers. When a field that previously had a local:* claim has no
@@ -46,12 +53,25 @@ func (r *ReclaimController) SetupWithManager(mgr ctrl.Manager) error {
 func (r *ReclaimController) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	logger := log.FromContext(ctx).WithName("reclaim")
 
-	spec, err := readLastAppliedSpec(ctx, r.Client, r.namespace, req.Name)
-	if err != nil {
-		return reconcile.Result{}, fmt.Errorf("read last-applied-spec: %w", err)
+	// If consume.applyManifest is mid-flight for this CB, the local:* release
+	// we just observed was almost certainly caused by consume's own
+	// ForceOwnership / processTakeover passes — not a real operator release.
+	// Defer; the in-flight apply will finish and reach steady state. A genuine
+	// operator release that happens to land in the same window also gets
+	// caught by this requeue and replayed against the freshly-applied spec.
+	if r.consume.IsInFlight(req.Name) {
+		logger.V(1).Info("consume in flight; deferring reclaim", "configbundle", req.Name)
+		return reconcile.Result{RequeueAfter: reclaimInFlightRequeue}, nil
 	}
-	if spec == nil {
-		logger.Info("no last-applied-spec; reclaim deferred to next bundle import", "configbundle", req.Name)
+
+	// Read from the in-memory reporter cache (live truth) rather than the
+	// persisted ConfigMap, which is only written at the end of applyManifest
+	// and would lag by up to one apply if a release fires during processTakeover.
+	// The ConfigMap remains the bootstrap-only baseline (loaded into the
+	// reporter at controller startup).
+	spec, ok := r.consume.reporter.GetLastManifest(req.Name)
+	if !ok {
+		logger.Info("no last-applied manifest in memory; reclaim deferred to next bundle import", "configbundle", req.Name)
 		return reconcile.Result{}, nil
 	}
 

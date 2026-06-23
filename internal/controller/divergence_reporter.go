@@ -246,6 +246,18 @@ func resolveOrbital(spec armadav1.ConfigBundleSpec, path string) (orbID, field, 
 	}
 }
 
+// GetLastManifest returns the most recently applied manifest spec for a
+// ConfigBundle and whether it's known. Live truth — always at least as fresh
+// as the persisted ConfigMap because applyManifest calls SetLastManifest
+// before any K8s API write that can trigger downstream reconciles.
+// Consumed by ReclaimController to avoid reading a stale ConfigMap mid-apply.
+func (r *DivergenceReporter) GetLastManifest(name string) (armadav1.ConfigBundleSpec, bool) {
+	r.lastManifestsMu.RLock()
+	defer r.lastManifestsMu.RUnlock()
+	spec, ok := r.lastManifests[name]
+	return spec, ok
+}
+
 // SetLastManifest records the last-applied manifest for a ConfigBundle so the
 // reporter can compare current values against intended values.
 func (r *DivergenceReporter) SetLastManifest(name string, spec armadav1.ConfigBundleSpec) {
