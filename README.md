@@ -136,7 +136,7 @@ test/                       e2e tests
 
 ## Stack
 
-- **Language:** Go 1.25.5, module `github.com/armada/configbundle`
+- **Language:** Go 1.26.4, module `github.com/armada/configbundle`
 - **Framework:** kubebuilder / controller-runtime
 - **Kubernetes:** client-go, envtest, Ginkgo v2
 - **Registries:** ACR (cloud, Orbital pushes), Zot (edge mirror, orb pulls). This repo holds **no** OCI write credentials — Orbital is the sole producer.

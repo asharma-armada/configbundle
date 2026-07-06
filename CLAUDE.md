@@ -13,7 +13,7 @@
 
 ## Stack
 
-- **Language:** Go 1.25.5 (module: `github.com/armada/configbundle`; go.mod pinned to 1.25.5 — homebrew install is 1.25.5, do not bump without upgrading homebrew first)
+- **Language:** Go 1.26.4 (module: `github.com/armada/configbundle`; go.mod pinned to 1.26.4 to match orbital and sibling controllers — homebrew must be at ≥1.26.4)
 - **Framework:** kubebuilder / controller-runtime (CRD definitions, controllers)
 - **Deployment:** AKS (cloud: bundler service); Galleon Mgmt Cluster (ConfigBundle Controller)
 - **Key libraries:** `k8s.io/client-go`, `sigs.k8s.io/controller-runtime`
