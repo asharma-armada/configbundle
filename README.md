@@ -52,12 +52,10 @@ Blue = owned by this repo. Everything else is an external boundary — Orbital c
 
 | Repo | Role |
 |---|---|
-| `~/armada/configbundle` (this repo) | ConfigBundle CRD types, cb-bundler service, cb-controller |
+| `~/armada/configbundle` (this repo) | ConfigBundle CRD family + cb-bundler + cb-controller + sc-controller + bc-controller (one Go module) |
 | `~/armada/orbital` | Cloud CMDB (GraphQL, DGraph, OCI signing/push) + orb edge service |
-| `~/armada/serverconfig-controller` | Sibling controller: watches ServerConfig CRs, PATCHes iDRAC via Redfish |
-| `~/armada/backupconfig-controller` | Sibling controller: watches BackupConfig CRs, SSA-patches Velero Schedule + etcd CronJob |
 
-The two sibling controllers import CRD types from this repo (`github.com/armada/configbundle/api/v1`) via a `replace` directive in their `go.mod`. If you're editing the CRD schema for ServerConfig or BackupConfig, that happens **here**, not in the sibling repos.
+All four services (cb-controller, cb-bundler, sc-controller, bc-controller) live in this single module and ship as four distinct images built from one Dockerfile with four targets. This follows the cert-manager / cluster-api monorepo pattern — related controllers, shared types, coupled release cadence. See `cmd/{controller,bundler,serverconfig,backupconfig}/` and `internal/{controller,bundler,serverconfig,backupconfig}/`.
 
 ## Running locally
 
@@ -126,10 +124,17 @@ The README is intentionally thin. Detailed context lives in structured domain fi
 ```
 api/v1/                     CRD type definitions (ConfigBundle, ServerConfig, BackupConfig)
 bundle/                     OCI media type constants
-cmd/                        Entry points: main.go (controller), bundler/main.go (enricher)
-internal/bundler/           Enricher HTTP service (POST /bundle)
-internal/controller/        Controller logic — consume, decompose, divergence, reclaim, takeover
-config/                     Kubebuilder / kustomize manifests
+cmd/
+  controller/               cb-controller entry point
+  bundler/                  cb-bundler entry point
+  serverconfig/             sc-controller entry point
+  backupconfig/             bc-controller entry point
+internal/
+  controller/               cb-controller logic — consume, decompose, divergence, reclaim, takeover
+  bundler/                  cb-bundler HTTP service (POST /bundle)
+  serverconfig/             sc-controller logic — Redfish PATCH, drift metrics
+  backupconfig/             bc-controller logic — Velero Schedule + etcd CronJob reconcile
+config/                     Kubebuilder / kustomize manifests (per-controller overlays under config/serverconfig, config/backupconfig)
 docs/                       Domain reference files, ADRs, deploy guides
 test/                       e2e tests
 ```

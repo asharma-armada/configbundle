@@ -45,6 +45,7 @@ type ConfigBundleReconciler struct {
 // +kubebuilder:rbac:groups=armada.ai,resources=configbundles/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=armada.ai,resources=configbundles/finalizers,verbs=update
 // +kubebuilder:rbac:groups=armada.ai,resources=serverconfigs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=armada.ai,resources=backupconfigs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ConfigBundleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -53,7 +54,7 @@ func (r *ConfigBundleReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	var cb armadav1.ConfigBundle
 	if err := r.Get(ctx, req.NamespacedName, &cb); err != nil {
 		if apierrors.IsNotFound(err) {
-			log.Info("ConfigBundle deleted; child ServerConfigs cleaned up by GC", "name", req.Name)
+			log.Info("ConfigBundle deleted; children cleaned up by GC", "name", req.Name)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -62,7 +63,8 @@ func (r *ConfigBundleReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	isSpecChange := cb.Generation != cb.Status.ObservedGeneration
 	if isSpecChange {
 		log.Info("reconciling ConfigBundle",
-			"name", cb.Name, "generation", cb.Generation, "servers", len(cb.Spec.Servers))
+			"name", cb.Name, "generation", cb.Generation,
+			"servers", len(cb.Spec.Servers), "clusters", len(cb.Spec.Clusters))
 	} else {
 		log.V(1).Info("reconciling ConfigBundle (drift/owns event)",
 			"name", cb.Name, "generation", cb.Generation)
@@ -75,8 +77,18 @@ func (r *ConfigBundleReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
+	for _, cluster := range cb.Spec.Clusters {
+		if err := r.applyBackupConfig(ctx, &cb, cluster); err != nil {
+			log.Error(err, "failed to apply BackupConfig", "clusterOrbID", cluster.OrbID)
+			return ctrl.Result{}, err
+		}
+	}
+
 	if isSpecChange {
-		log.Info("applied ServerConfigs", "count", len(cb.Spec.Servers), "generation", cb.Generation)
+		log.Info("applied child CRs",
+			"servers", len(cb.Spec.Servers),
+			"clusters", len(cb.Spec.Clusters),
+			"generation", cb.Generation)
 		// Retry on conflict: ConsumeServer also writes Status (LastAppliedDigest, etc.)
 		// which races our ObservedGeneration update. RetryOnConflict refetches and reapplies.
 		err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
@@ -96,9 +108,48 @@ func (r *ConfigBundleReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return ctrl.Result{}, err
 		}
 	} else {
-		log.V(1).Info("applied ServerConfigs (idempotent)", "count", len(cb.Spec.Servers))
+		log.V(1).Info("applied child CRs (idempotent)",
+			"servers", len(cb.Spec.Servers), "clusters", len(cb.Spec.Clusters))
 	}
 	return ctrl.Result{}, nil
+}
+
+// applyBackupConfig creates or updates a BackupConfig CR for the given cluster
+// using Server-Side Apply with field manager "configbundle-controller". CR name
+// is derived from the cluster's orbId — colons replaced with dashes so the name
+// conforms to RFC 1123. Identity stays in spec.orbId; only the K8s resource
+// name is transformed for syntactic compliance. Mirror of applyServerConfig.
+func (r *ConfigBundleReconciler) applyBackupConfig(ctx context.Context, cb *armadav1.ConfigBundle, cluster armadav1.ClusterSpec) error {
+	bc := &armadav1.BackupConfig{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: armadav1.GroupVersion.String(),
+			Kind:       "BackupConfig",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: orbIDToK8sName(cluster.OrbID),
+		},
+		Spec: armadav1.BackupConfigSpec{
+			OrbID:  cluster.OrbID,
+			Velero: cluster.Velero,
+			Etcd:   cluster.Etcd,
+		},
+	}
+
+	if err := ctrl.SetControllerReference(cb, bc, r.Scheme); err != nil {
+		return err
+	}
+
+	return r.Patch(ctx, bc, client.Apply,
+		client.FieldOwner("configbundle-controller"),
+		client.ForceOwnership,
+	)
+}
+
+// orbIDToK8sName converts an Orbital orbId (e.g. "colo:cluster-001") into a
+// valid RFC 1123 K8s resource name — replaces colon with dash, lowercases.
+// Identity remains in spec.orbId; the name is just a label for kubectl listing.
+func orbIDToK8sName(orbID string) string {
+	return strings.ToLower(strings.ReplaceAll(orbID, ":", "-"))
 }
 
 // applyServerConfig creates or updates a ServerConfig CR for the given server
@@ -149,6 +200,9 @@ func (r *ConfigBundleReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&armadav1.ConfigBundle{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&armadav1.ServerConfig{}, builder.WithPredicates(predicate.Funcs{
+			DeleteFunc: func(e event.DeleteEvent) bool { return false },
+		})).
+		Owns(&armadav1.BackupConfig{}, builder.WithPredicates(predicate.Funcs{
 			DeleteFunc: func(e event.DeleteEvent) bool { return false },
 		})).
 		Named("configbundle").

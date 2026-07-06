@@ -1,10 +1,18 @@
 # Image versions for this deploy. Bump `newTag` here when rolling out a new
-# build — kustomize rewrites every `controller:latest` placeholder in the
-# manager Deployment. Source of truth: per-component git tags (controller/v*).
+# build — kustomize rewrites the matching placeholder in each Deployment.
+# Source of truth: per-component git tags (controller/v*, serverconfig/v*,
+# backupconfig/v*). Each Deployment uses a distinct placeholder token so
+# entries do not cross-contaminate.
 images:
 - name: controller
   newName: armadaeksatest.azurecr.io/configbundle-controller
   newTag: v0.0.3
+- name: serverconfig
+  newName: armadaeksatest.azurecr.io/serverconfig-controller
+  newTag: v0.0.1
+- name: backupconfig
+  newName: armadaeksatest.azurecr.io/backupconfig-controller
+  newTag: v0.0.1
 
 # Adds namespace to all resources.
 namespace: configbundle-system
@@ -26,6 +34,8 @@ resources:
 - ../crd
 - ../rbac
 - ../manager
+- ../serverconfig
+- ../backupconfig
 # [WEBHOOK] To enable webhook, uncomment all the sections with [WEBHOOK] prefix including the one in
 # crd/kustomization.yaml
 #- ../webhook

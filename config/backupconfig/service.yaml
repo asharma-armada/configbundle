@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: backupconfig-controller-metrics
+  namespace: system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: backupconfig-controller
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  type: ClusterIP
+  selector:
+    control-plane: controller-manager
+    app.kubernetes.io/name: backupconfig-controller
+  ports:
+  - name: metrics
+    port: 8096
+    targetPort: metrics
+    protocol: TCP

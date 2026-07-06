@@ -1,0 +1,263 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.1
+  name: backupconfigs.armada.ai
+spec:
+  group: armada.ai
+  names:
+    kind: BackupConfig
+    listKind: BackupConfigList
+    plural: backupconfigs
+    shortNames:
+    - bc
+    singular: backupconfig
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.orbId
+      name: OrbID
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          BackupConfig is a domain child CR owned by a ConfigBundle.
+          Created and updated by the ConfigBundle Controller via SSA (field manager:
+          "configbundle-controller"). The BackupConfig Controller (separate repo)
+          actuates the spec by SSA-patching Velero Schedule CRDs and an etcd backup
+          CronJob in the same cluster.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              BackupConfigSpec describes one Kubernetes cluster's desired backup configuration.
+              Created and updated by the ConfigBundle Controller via SSA. BackupConfig is
+              derived state — admin overrides happen on the parent ConfigBundle CR only.
+            properties:
+              etcd:
+                description: |-
+                  Etcd holds desired etcd backup configuration. Absent = the controller does
+                  not manage etcd backups for this cluster.
+                properties:
+                  enabled:
+                    description: Enabled toggles the backup mechanism on or off.
+                    type: boolean
+                  location:
+                    description: |-
+                      Location is the storage location the backup writes to (e.g. an S3 URL or a
+                      Velero BackupStorageLocation name). Free-form; mechanism-specific.
+                    type: string
+                  orbId:
+                    description: |-
+                      OrbID is the immutable Orbital identifier for the backup-node this block
+                      represents (e.g. "colo:cluster-001-velero"). Set by the bundler.
+                      Identity-only; admin overrides never touch it.
+                    type: string
+                  schedule:
+                    description: Schedule is a cron expression for when the backup
+                      runs (e.g. "0 2 * * *").
+                    type: string
+                required:
+                - orbId
+                type: object
+              orbId:
+                description: |-
+                  OrbID is the immutable Orbital identifier for this cluster
+                  (mirrors ConfigBundle.spec.clusters[].orbId). Carried on the child so
+                  cross-system grep, audit logs, and downstream telemetry can correlate
+                  without a parent round-trip.
+                type: string
+              velero:
+                description: |-
+                  Velero holds desired Velero backup configuration. Absent = the controller
+                  does not manage Velero for this cluster.
+                properties:
+                  enabled:
+                    description: Enabled toggles the backup mechanism on or off.
+                    type: boolean
+                  location:
+                    description: |-
+                      Location is the storage location the backup writes to (e.g. an S3 URL or a
+                      Velero BackupStorageLocation name). Free-form; mechanism-specific.
+                    type: string
+                  orbId:
+                    description: |-
+                      OrbID is the immutable Orbital identifier for the backup-node this block
+                      represents (e.g. "colo:cluster-001-velero"). Set by the bundler.
+                      Identity-only; admin overrides never touch it.
+                    type: string
+                  schedule:
+                    description: Schedule is a cron expression for when the backup
+                      runs (e.g. "0 2 * * *").
+                    type: string
+                required:
+                - orbId
+                type: object
+            required:
+            - orbId
+            type: object
+          status:
+            description: |-
+              BackupConfigStatus records the controller's observed state. Mirrors the
+              ServerConfigStatus shape so operators can reason about both child kinds the
+              same way (Phase, ObservedGeneration, Conditions, per-field Observed ledger,
+              bounded RecentPatches action history).
+            properties:
+              conditions:
+                description: Conditions records detailed status conditions.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observed:
+                description: |-
+                  Observed holds the controller's per-field confirmed values — values the
+                  controller has successfully landed on the target (Velero Schedule PATCH
+                  success, or etcd CronJob PATCH success), or confirmed already match on a
+                  no-op reconcile. Absence of a field means the controller has never
+                  confirmed it.
+                properties:
+                  etcd:
+                    description: Etcd holds controller-confirmed etcd backup field
+                      values.
+                    properties:
+                      enabled:
+                        type: boolean
+                      location:
+                        type: string
+                      schedule:
+                        type: string
+                    type: object
+                  velero:
+                    description: Velero holds controller-confirmed Velero backup field
+                      values.
+                    properties:
+                      enabled:
+                        type: boolean
+                      location:
+                        type: string
+                      schedule:
+                        type: string
+                    type: object
+                type: object
+              observedGeneration:
+                description: |-
+                  ObservedGeneration is the spec.generation the controller last successfully
+                  reconciled. K8s-standard "are we converged?" signal.
+                format: int64
+                type: integer
+              phase:
+                description: Phase is the current lifecycle phase.
+                enum:
+                - Pending
+                - Applied
+                - Diverged
+                type: string
+              recentPatches:
+                description: |-
+                  RecentPatches is a bounded list of the last few PATCH actions, newest
+                  first. Capped at 5 entries to keep the status object small.
+                items:
+                  description: RecentPatch is one entry in ServerConfigStatus.RecentPatches.
+                  properties:
+                    message:
+                      description: |-
+                        Message describes which fields were PATCHed, e.g.
+                        "PATCHed 2 attribute(s): IPMILan.1.Enable=Disabled, SSH.1.Enable=Disabled".
+                        Same format as the Reconciled condition's message.
+                      type: string
+                    time:
+                      description: Time is when the PATCH succeeded against the iDRAC.
+                      format: date-time
+                      type: string
+                  required:
+                  - message
+                  - time
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

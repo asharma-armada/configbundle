@@ -69,6 +69,32 @@ type IdracSpec struct {
 // orbital identity; when adding a new nested type, add a sibling constant.
 const IdracTypeName = "IdracSettings"
 
+// ClusterSpec describes one Kubernetes cluster's desired backup configuration
+// within a ConfigBundle. The bundler populates this from the orbital
+// KubernetesCluster → ClusterBackup → {EtcdBackup, VeleroBackup} subgraph.
+// The decomposer projects each entry into a BackupConfig child CR.
+// BackupBlock and its type-name constants live in backupconfig_types.go so the
+// child-shape declaration stays adjacent to its consumer.
+type ClusterSpec struct {
+	// OrbID is the immutable Orbital identifier for this cluster (e.g.
+	// "colo:cluster-001"). Used as the SSA listMapKey for spec.clusters[].
+	// +kubebuilder:validation:Required
+	OrbID string `json:"orbId"`
+
+	// Name is the cluster's display name. Informational — not used for routing
+	// or identity.
+	// +optional
+	Name *string `json:"name,omitempty"`
+
+	// Velero holds desired Velero backup configuration.
+	// +optional
+	Velero *BackupBlock `json:"velero,omitempty"`
+
+	// Etcd holds desired etcd backup configuration.
+	// +optional
+	Etcd *BackupBlock `json:"etcd,omitempty"`
+}
+
 // ServerSpec describes one server's desired configuration within a ConfigBundle.
 //
 // Hostname and OobIP are pointers so SSA partial patches can omit admin-owned
@@ -163,6 +189,13 @@ type ConfigBundleSpec struct {
 	// +listType=map
 	// +listMapKey=orbId
 	Servers []ServerSpec `json:"servers,omitempty"`
+
+	// Clusters is the list of Kubernetes cluster backup configurations for this
+	// datacenter. The decomposer projects each entry into a BackupConfig child CR.
+	// +optional
+	// +listType=map
+	// +listMapKey=orbId
+	Clusters []ClusterSpec `json:"clusters,omitempty"`
 
 	// Takeover contains force-resolution directives from the cloud admin.
 	// Each entry triggers a ForceOwnership SSA apply to reclaim the field from local:admin.

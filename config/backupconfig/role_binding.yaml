@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: backupconfig-manager-rolebinding
+  labels:
+    app.kubernetes.io/name: backupconfig-controller
+    app.kubernetes.io/managed-by: kustomize
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: backupconfig-manager-role
+subjects:
+- kind: ServiceAccount
+  name: backupconfig-controller
+  namespace: system

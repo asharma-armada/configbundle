@@ -4,6 +4,7 @@
 resources:
 - bases/armada.ai_configbundles.yaml
 - bases/armada.ai_serverconfigs.yaml
+- bases/armada.ai_backupconfigs.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

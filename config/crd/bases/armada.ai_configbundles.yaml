@@ -56,6 +56,86 @@ spec:
               ConfigBundleSpec holds the full intended configuration for a datacenter.
               The ConfigBundle controller decomposes this into domain child CRs via SSA.
             properties:
+              clusters:
+                description: |-
+                  Clusters is the list of Kubernetes cluster backup configurations for this
+                  datacenter. The decomposer projects each entry into a BackupConfig child CR.
+                items:
+                  description: |-
+                    ClusterSpec describes one Kubernetes cluster's desired backup configuration
+                    within a ConfigBundle. The bundler populates this from the orbital
+                    KubernetesCluster → ClusterBackup → {EtcdBackup, VeleroBackup} subgraph.
+                    The decomposer projects each entry into a BackupConfig child CR.
+                    BackupBlock and its type-name constants live in backupconfig_types.go so the
+                    child-shape declaration stays adjacent to its consumer.
+                  properties:
+                    etcd:
+                      description: Etcd holds desired etcd backup configuration.
+                      properties:
+                        enabled:
+                          description: Enabled toggles the backup mechanism on or
+                            off.
+                          type: boolean
+                        location:
+                          description: |-
+                            Location is the storage location the backup writes to (e.g. an S3 URL or a
+                            Velero BackupStorageLocation name). Free-form; mechanism-specific.
+                          type: string
+                        orbId:
+                          description: |-
+                            OrbID is the immutable Orbital identifier for the backup-node this block
+                            represents (e.g. "colo:cluster-001-velero"). Set by the bundler.
+                            Identity-only; admin overrides never touch it.
+                          type: string
+                        schedule:
+                          description: Schedule is a cron expression for when the
+                            backup runs (e.g. "0 2 * * *").
+                          type: string
+                      required:
+                      - orbId
+                      type: object
+                    name:
+                      description: |-
+                        Name is the cluster's display name. Informational — not used for routing
+                        or identity.
+                      type: string
+                    orbId:
+                      description: |-
+                        OrbID is the immutable Orbital identifier for this cluster (e.g.
+                        "colo:cluster-001"). Used as the SSA listMapKey for spec.clusters[].
+                      type: string
+                    velero:
+                      description: Velero holds desired Velero backup configuration.
+                      properties:
+                        enabled:
+                          description: Enabled toggles the backup mechanism on or
+                            off.
+                          type: boolean
+                        location:
+                          description: |-
+                            Location is the storage location the backup writes to (e.g. an S3 URL or a
+                            Velero BackupStorageLocation name). Free-form; mechanism-specific.
+                          type: string
+                        orbId:
+                          description: |-
+                            OrbID is the immutable Orbital identifier for the backup-node this block
+                            represents (e.g. "colo:cluster-001-velero"). Set by the bundler.
+                            Identity-only; admin overrides never touch it.
+                          type: string
+                        schedule:
+                          description: Schedule is a cron expression for when the
+                            backup runs (e.g. "0 2 * * *").
+                          type: string
+                      required:
+                      - orbId
+                      type: object
+                  required:
+                  - orbId
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - orbId
+                x-kubernetes-list-type: map
               datacenter:
                 description: Datacenter is the identifier of the target datacenter
                   (matches Orbital namespace name).

@@ -1,0 +1,13 @@
+# serverconfig-controller overlay — included from config/default.
+#
+# Resources here use unique names (serverconfig-controller,
+# serverconfig-manager-role, etc.) hard-coded in each YAML rather than a child
+# namePrefix. Nested namePrefixes cause kustomize name-reference resolution to
+# see multiple SA candidates ("controller") and error out with "too many
+# possible referral targets" on the ClusterRoleBinding subject.
+resources:
+- manager.yaml
+- service.yaml
+- role.yaml
+- role_binding.yaml
+- service_account.yaml

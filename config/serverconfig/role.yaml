@@ -1,0 +1,46 @@
+---
+# ClusterRole — ServerConfig is cluster-scoped, so list/watch/get/patch
+# requires cluster-level permissions. Status writes also at cluster scope.
+# Secret read is broad here (any namespace) to keep the deploy flexible —
+# operators wanting tighter scoping can replace this with a namespaced Role
+# in the configured CredentialsNamespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: serverconfig-manager-role
+rules:
+- apiGroups:
+  - armada.ai
+  resources:
+  - serverconfigs
+  verbs:
+  - get
+  - list
+  - watch
+# Read-only access to the parent ConfigBundle so the reconciler can mirror
+# spec.ignored[] entries into the `armada_idrac_field_ignored` metric for
+# drift-alert suppression. Never writes back.
+- apiGroups:
+  - armada.ai
+  resources:
+  - configbundles
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - armada.ai
+  resources:
+  - serverconfigs/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch

@@ -19,6 +19,7 @@ rules:
 - apiGroups:
   - armada.ai
   resources:
+  - backupconfigs
   - configbundles
   - serverconfigs
   verbs:
@@ -32,14 +33,39 @@ rules:
 - apiGroups:
   - armada.ai
   resources:
-  - configbundles/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - armada.ai
-  resources:
+  - backupconfigs/status
   - configbundles/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - armada.ai
+  resources:
+  - configbundles/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - batch
+  resources:
+  - cronjobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - velero.io
+  resources:
+  - schedules
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch

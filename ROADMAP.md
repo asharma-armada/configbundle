@@ -2,11 +2,11 @@
 
 ## Recent accomplishments
 
+- **2026-07-06** — Monorepo consolidation: sc-controller + bc-controller folded into configbundle; one Go module, one Dockerfile with 4 targets (controller / bundler / serverconfig / backupconfig), one `kubectl apply -k config/default/`; BackupConfig CRD cherry-extracted onto main; cluster-api / cert-manager pattern
 - **2026-07-03** — Phase 2: reporter dedup on `cb.Status.DivergenceReporting` (pointer-int nil/*0/*N fixes cold-start orb-stuck); managedFields cleanup unified to one `reconcileLocalClaims` pass; README ConfigBundle-first rewrite
 - **2026-06-22** — Race fix: reclaim defers when consume.applyManifest is in-flight, reads in-memory manifest not stale CM; divergence reporter silent at steady state (skip POST when overrides=0); ServerConfig status.observed + recentPatches[] for race-proof per-field ledger
 - **2026-06-20** — ADR-011: dropped mapping OCI layer, idrac.orbId now saturated on CR (1-layer bundle); e2e-validated minikube. Drift-detection (serverconfig-controller): intent/observed/ignored Prom gauges, feature-gated via IDRAC_OBSERVE_INTERVAL
 - **2026-06-18** — Edge handback shipped: local:* SSA release triggers new ReclaimController to replay the last-imported manifest; `applyManifest` scrubs `spec.Ignored` entries with no active local:* claim (invariant: Ignore is meaningless without an override); deleted defensive Ignored strip; controller deploy manifests (kustomize, `configbundle-system` namespace, dispatch Service on :8095); Makefile `VERSION`/`BUNDLER_VERSION`/`CONTROLLER_VERSION` overrides for image builds; e2e-validated round-trip on minikube
-- **2026-06-16** — Divergence reporter heartbeat path now logs failures at Error severity (parity with controller-runtime's event path); added Error log at the `postToOrb` call site naming the intake URL so orb-down failures surface regardless of caller
 
 ## Development Timeline
 

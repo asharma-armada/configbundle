@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: serverconfig-controller-config
+  namespace: system
+  labels:
+    app.kubernetes.io/name: serverconfig-controller
+    app.kubernetes.io/managed-by: kustomize
+data:
+  # Comma-separated list of iDRAC OOB IPs the controller may reconcile against.
+  # Empty = controller reconciles NOTHING (paranoid default).
+  oobIPs: "10.20.21.44"
+  # Comma-separated CRD field names (JSON tag form) the controller may PATCH.
+  fields: "sshEnabled,racadmEnabled,ipmiEnabled"
+  # Namespace + name of the Secret carrying iDRAC credentials.
+  # Secret data keys MUST be 'username' and 'password'.
+  # Create the Secret out-of-band — never committed. See docs/edge-deploy.md.
+  credentialsNamespace: "configbundle-system"
+  credentialsSecret: "idrac-credentials"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: serverconfig-controller
+  namespace: system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: serverconfig-controller
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: serverconfig-controller
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        control-plane: controller-manager
+        app.kubernetes.io/name: serverconfig-controller
+    spec:
+      # hostNetwork lets the pod inherit the node's routing table so it can
+      # reach the OOB management VLAN (e.g. 10.20.21.0/24) where iDRACs live.
+      # The CNI pod network typically can't see that subnet. Trade-off: the
+      # pod can no longer reach in-cluster ClusterIP Services for itself, and
+      # the metrics port (8093) binds on the host network namespace (so a
+      # cluster-internal Prometheus scrape goes via the node IP). DNS still
+      # works thanks to dnsPolicy: ClusterFirstWithHostNet.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: manager
+        image: serverconfig:latest
+        # Always re-pull on rollout — we ship dev iterations against mutable
+        # tags (e.g. v0.0.1 gets overwritten in ACR). Without this, kubelet's
+        # default for non-:latest tags is IfNotPresent and the cached image
+        # sticks. Switch back to IfNotPresent once tags are immutable.
+        imagePullPolicy: Always
+        args:
+          - --health-probe-bind-address=:8092
+        env:
+        - name: IDRAC_OOB_ALLOWLIST
+          valueFrom:
+            configMapKeyRef:
+              name: serverconfig-controller-config
+              key: oobIPs
+        - name: IDRAC_FIELD_ALLOWLIST
+          valueFrom:
+            configMapKeyRef:
+              name: serverconfig-controller-config
+              key: fields
+        - name: IDRAC_CREDENTIALS_NAMESPACE
+          valueFrom:
+            configMapKeyRef:
+              name: serverconfig-controller-config
+              key: credentialsNamespace
+        - name: IDRAC_CREDENTIALS_SECRET
+          valueFrom:
+            configMapKeyRef:
+              name: serverconfig-controller-config
+              key: credentialsSecret
+        # Drift-detection polling: re-reads iDRAC every interval regardless of
+        # CR changes so out-of-band edits show up in metrics. Empty/unset =
+        # disabled (event-driven only) — safe for local `go run`. K8s deploy
+        # enables it explicitly. Aggressive values cost iDRAC load; 1-5min is
+        # the conventional band.
+        - name: IDRAC_OBSERVE_INTERVAL
+          value: "5m"
+        ports:
+        - containerPort: 8092
+          name: health
+          protocol: TCP
+        - containerPort: 8093
+          name: metrics
+          protocol: TCP
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - "ALL"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8092
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8092
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+      serviceAccountName: serverconfig-controller
+      terminationGracePeriodSeconds: 10

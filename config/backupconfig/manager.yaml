@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backupconfig-controller-config
+  namespace: system
+  labels:
+    app.kubernetes.io/name: backupconfig-controller
+    app.kubernetes.io/managed-by: kustomize
+data:
+  # Namespace where Velero Schedule CRDs are written. `velero` is conventional.
+  veleroNamespace: "velero"
+  # Namespace where the etcd-backup CronJob is written. `kube-system` is
+  # conventional for control-plane infrastructure.
+  etcdBackupNamespace: "kube-system"
+  # Placeholder image for the etcd snapshot job. Swap to the real snapshot
+  # image (or override via `kustomize edit set image`) once it ships.
+  etcdBackupImage: "armadaeksatest.azurecr.io/etcd-snapshot:TBD"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backupconfig-controller
+  namespace: system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: backupconfig-controller
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: backupconfig-controller
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        control-plane: controller-manager
+        app.kubernetes.io/name: backupconfig-controller
+    spec:
+      # No hostNetwork — this controller talks only to the local K8s apiserver
+      # (Velero Schedule CRDs in `velero`, CronJob in `kube-system`). The pod
+      # CNI network is sufficient.
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: manager
+        image: backupconfig:latest
+        # Always re-pull on rollout — we ship dev iterations against mutable
+        # tags. Switch back to IfNotPresent once tags are immutable.
+        imagePullPolicy: Always
+        args:
+          - --health-probe-bind-address=:8094
+        env:
+        - name: VELERO_NAMESPACE
+          valueFrom:
+            configMapKeyRef:
+              name: backupconfig-controller-config
+              key: veleroNamespace
+        - name: ETCD_BACKUP_NAMESPACE
+          valueFrom:
+            configMapKeyRef:
+              name: backupconfig-controller-config
+              key: etcdBackupNamespace
+        - name: ETCD_BACKUP_IMAGE
+          valueFrom:
+            configMapKeyRef:
+              name: backupconfig-controller-config
+              key: etcdBackupImage
+        # Drift-detection polling: re-reads live state every interval. Empty/unset =
+        # disabled (event-driven only). K8s deploy enables it explicitly.
+        - name: BACKUP_OBSERVE_INTERVAL
+          value: "5m"
+        ports:
+        - containerPort: 8094
+          name: health
+          protocol: TCP
+        - containerPort: 8096
+          name: metrics
+          protocol: TCP
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - "ALL"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8094
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8094
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+      serviceAccountName: backupconfig-controller
+      terminationGracePeriodSeconds: 10

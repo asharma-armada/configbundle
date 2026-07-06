@@ -1,4 +1,5 @@
-# Shared builder — builds both the controller and bundler binaries from the same module.
+# Shared builder — builds all four binaries (cb-controller, bundler,
+# sc-controller, bc-controller) from the same module.
 #
 # Pinned to $BUILDPLATFORM so the Go compiler runs natively on the host arch
 # (e.g. arm64 on Apple Silicon) and cross-compiles for $TARGETPLATFORM via
@@ -24,13 +25,21 @@ COPY . .
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go build -o manager cmd/main.go
+    go build -o manager cmd/controller/main.go
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go build \
     -ldflags "-X github.com/armada/configbundle/internal/version.Version=${BUNDLER_VERSION}" \
     -o bundler cmd/bundler/main.go
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -o serverconfig cmd/serverconfig/main.go
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -o backupconfig cmd/backupconfig/main.go
 
 # ---- controller image ----
 FROM gcr.io/distroless/static:nonroot AS controller
@@ -45,3 +54,17 @@ WORKDIR /
 COPY --from=builder /workspace/bundler .
 USER 65532:65532
 ENTRYPOINT ["/bundler"]
+
+# ---- serverconfig-controller image ----
+FROM gcr.io/distroless/static:nonroot AS serverconfig
+WORKDIR /
+COPY --from=builder /workspace/serverconfig .
+USER 65532:65532
+ENTRYPOINT ["/serverconfig"]
+
+# ---- backupconfig-controller image ----
+FROM gcr.io/distroless/static:nonroot AS backupconfig
+WORKDIR /
+COPY --from=builder /workspace/backupconfig .
+USER 65532:65532
+ENTRYPOINT ["/backupconfig"]

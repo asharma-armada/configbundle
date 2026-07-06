@@ -1,6 +1,10 @@
 # Registry and per-component versioning.
-# Controller: controller/v* tags. Bundler: bundler/v* tags.
-# Tag with: git tag controller/v0.1.0  or  git tag bundler/v0.0.2
+# Component tag namespaces:
+#   controller/v*    → cb-controller
+#   bundler/v*       → cb-bundler
+#   serverconfig/v*  → sc-controller
+#   backupconfig/v*  → bc-controller
+# Tag with: git tag controller/v0.1.0  (or serverconfig/v0.1.0, etc.)
 #
 # Versions resolve from per-component git tags. Override one explicitly with
 # the matching var on the trailing position:
@@ -10,13 +14,17 @@
 # the tag-derived version when exported in the shell. Tag the commit instead.)
 ACR                := armadaeksatest.azurecr.io
 MODULE             := github.com/armada/configbundle
-CONTROLLER_VERSION ?= $(shell (git describe --tags --match 'controller/v*' --dirty 2>/dev/null || echo "controller/v0.0.0-dev") | sed 's|^controller/||')
-BUNDLER_VERSION    ?= $(shell (git describe --tags --match 'bundler/v*' --dirty 2>/dev/null || echo "bundler/v0.0.0-dev") | sed 's|^bundler/||')
-BUNDLER_LDFLAGS    := -ldflags "-X $(MODULE)/internal/version.Version=$(BUNDLER_VERSION)"
+CONTROLLER_VERSION   ?= $(shell (git describe --tags --match 'controller/v*' --dirty 2>/dev/null || echo "controller/v0.0.0-dev") | sed 's|^controller/||')
+BUNDLER_VERSION      ?= $(shell (git describe --tags --match 'bundler/v*' --dirty 2>/dev/null || echo "bundler/v0.0.0-dev") | sed 's|^bundler/||')
+SERVERCONFIG_VERSION ?= $(shell (git describe --tags --match 'serverconfig/v*' --dirty 2>/dev/null || echo "serverconfig/v0.0.0-dev") | sed 's|^serverconfig/||')
+BACKUPCONFIG_VERSION ?= $(shell (git describe --tags --match 'backupconfig/v*' --dirty 2>/dev/null || echo "backupconfig/v0.0.0-dev") | sed 's|^backupconfig/||')
+BUNDLER_LDFLAGS      := -ldflags "-X $(MODULE)/internal/version.Version=$(BUNDLER_VERSION)"
 
 # Image URLs
-IMG         ?= $(ACR)/configbundle-controller:$(CONTROLLER_VERSION)
-BUNDLER_IMG ?= $(ACR)/configbundle-bundler:$(BUNDLER_VERSION)
+IMG              ?= $(ACR)/configbundle-controller:$(CONTROLLER_VERSION)
+BUNDLER_IMG      ?= $(ACR)/configbundle-bundler:$(BUNDLER_VERSION)
+SERVERCONFIG_IMG ?= $(ACR)/serverconfig-controller:$(SERVERCONFIG_VERSION)
+BACKUPCONFIG_IMG ?= $(ACR)/backupconfig-controller:$(BACKUPCONFIG_VERSION)
 
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
@@ -132,8 +140,11 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 ##@ Build
 
 .PHONY: build
-build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+build: manifests generate fmt vet ## Build all manager binaries.
+	go build -o bin/manager cmd/controller/main.go
+	go build $(BUNDLER_LDFLAGS) -o bin/bundler cmd/bundler/main.go
+	go build -o bin/serverconfig cmd/serverconfig/main.go
+	go build -o bin/backupconfig cmd/backupconfig/main.go
 
 .PHONY: up
 up: ## Start minikube and install CRDs — ready for 'make run-controller'.
@@ -152,12 +163,20 @@ down: ## Stop minikube.
 	minikube stop
 
 .PHONY: run-controller
-run-controller: ## Run the controller from your host (set NAMESPACE=default for local testing).
-	go run ./cmd/main.go
+run-controller: ## Run the cb-controller from your host (set NAMESPACE=default for local testing).
+	go run ./cmd/controller/main.go
 
 .PHONY: run-bundler
 run-bundler: ## Run the bundler service locally (BUNDLER_PORT=8020, ORBITAL_BASE_URL=http://localhost:8001).
 	go run $(BUNDLER_LDFLAGS) ./cmd/bundler/main.go
+
+.PHONY: run-serverconfig
+run-serverconfig: ## Run the sc-controller locally (:8092 health, :8093 metrics; requires IDRAC_OOB_ALLOWLIST + IDRAC_FIELD_ALLOWLIST set).
+	go run ./cmd/serverconfig/main.go
+
+.PHONY: run-backupconfig
+run-backupconfig: ## Run the bc-controller locally (:8094 health, :8096 metrics).
+	go run ./cmd/backupconfig/main.go
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
@@ -173,6 +192,16 @@ push-bundler: ## Build and push bundler image to ACR (e.g. make push-bundler BUN
 	docker buildx build --platform linux/amd64 --target bundler \
 		--build-arg BUNDLER_VERSION=$(BUNDLER_VERSION) \
 		-t $(BUNDLER_IMG) --push .
+
+.PHONY: push-serverconfig
+push-serverconfig: ## Build and push sc-controller image to ACR (e.g. make push-serverconfig SERVERCONFIG_VERSION=v0.1.0). Requires: az acr login --name armadaeksatest
+	@echo "Building $(SERVERCONFIG_IMG)"
+	docker buildx build --platform linux/amd64 --target serverconfig -t $(SERVERCONFIG_IMG) --push .
+
+.PHONY: push-backupconfig
+push-backupconfig: ## Build and push bc-controller image to ACR (e.g. make push-backupconfig BACKUPCONFIG_VERSION=v0.1.0). Requires: az acr login --name armadaeksatest
+	@echo "Building $(BACKUPCONFIG_IMG)"
+	docker buildx build --platform linux/amd64 --target backupconfig -t $(BACKUPCONFIG_IMG) --push .
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:

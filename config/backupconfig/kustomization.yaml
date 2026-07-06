@@ -1,0 +1,11 @@
+# backupconfig-controller overlay — included from config/default.
+#
+# Resources here use unique names (backupconfig-controller,
+# backupconfig-manager-role, etc.) hard-coded in each YAML rather than a child
+# namePrefix. See config/serverconfig/kustomization.yaml for the rationale.
+resources:
+- manager.yaml
+- service.yaml
+- role.yaml
+- role_binding.yaml
+- service_account.yaml

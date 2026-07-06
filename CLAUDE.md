@@ -32,7 +32,7 @@
 ## Current State
 
 **Phase:** Prototype
-**Active work:** Divergence reporter dedup state migrated to `cb.Status.DivergenceReporting` subresource (Phase 2); the earlier in-memory `lastPostedHash`/`lastPostedHadOverrides` maps had a cold-start conflation (empty map == "posted empty last time") that stuck orb after takeovers. Now uses pointer-int `LastPostedOverrideCount` so nil (never posted) is distinguishable from `*0` (posted empty). BackupConfig CRD + sibling controller (`~/armada/backupconfig-controller`) shipped in same period; ConfigBundle now decomposes to ServerConfig + BackupConfig children. Drift-detection metrics remain in serverconfig-controller (Prom gauges via `IDRAC_OBSERVE_INTERVAL`).
+**Active work:** Monorepo consolidation complete. sc-controller and bc-controller sources are now folded into this repo under `cmd/{serverconfig,backupconfig}/` and `internal/{serverconfig,backupconfig}/`; the `replace ../configbundle` directives are gone. All four services (cb-controller, cb-bundler, sc-controller, bc-controller) ship from one Go module and one Dockerfile with four targets. Deploy is one `kubectl apply -k config/default/` — CRDs + 3 Deployments + per-controller RBAC. This follows the cert-manager / cluster-api pattern for related controllers with shared types.
 **Next priority:** Spike 8 (full pipeline e2e); PrometheusRule + Alertmanager wiring for drift gauges; orbital-side cleanup of orphan Ignore resolutions after edge handback.
 
 *Update this section at each session wrap-up.*
