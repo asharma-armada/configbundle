@@ -232,6 +232,44 @@ type ConfigBundleStatus struct {
 	// LastAppliedAt is the time the last successful apply completed.
 	// +optional
 	LastAppliedAt *metav1.Time `json:"lastAppliedAt,omitempty"`
+
+	// DivergenceReporting captures the divergence-reporter's dedup state so a
+	// restarted controller resumes without either wiping orb's known state or
+	// missing a state-clearing POST. Written only by the divergence-reporter.
+	//
+	// A nil value means "no POST has ever landed for this CB" — the reporter
+	// treats this as unknown and posts once on the next reconcile (biased
+	// toward orb-sync-correctness over one avoidable POST). See ADR notes and
+	// docs/claude/edge-context.md for the cold-start semantics.
+	// +optional
+	DivergenceReporting *DivergenceReportingStatus `json:"divergenceReporting,omitempty"`
+}
+
+// DivergenceReportingStatus records what the divergence-reporter last sent to
+// orb. Persisting this on the CR (instead of in-process memory) makes the
+// reporter fully restart-resilient: a cold-started reporter can distinguish
+// "never posted" (nil) from "posted empty last time" (LastPostedOverrideCount
+// pointer to 0) from "posted N overrides" — the exact distinction the
+// steady-state-quiet optimization needs to make correct decisions.
+type DivergenceReportingStatus struct {
+	// LastPostedAt is the timestamp of the last successful POST to orb.
+	// +optional
+	LastPostedAt *metav1.Time `json:"lastPostedAt,omitempty"`
+
+	// LastPostedHash is the SHA-256 hex of the last POST payload. Reconcile
+	// skips the POST when the freshly-computed payload hash matches this value.
+	// Cleared by the heartbeat to force periodic re-syncs against orb-wipe.
+	// +optional
+	LastPostedHash string `json:"lastPostedHash,omitempty"`
+
+	// LastPostedOverrideCount is the number of override entries in the last
+	// POST. Pointer type distinguishes "never posted" (nil) from "posted an
+	// empty set" (*0). The steady-state-quiet skip only fires when the current
+	// count is 0 AND this is non-nil and *this == 0. That combination means
+	// "empty now, and last time we told orb we were empty" — the only case
+	// where skipping the POST is safe.
+	// +optional
+	LastPostedOverrideCount *int `json:"lastPostedOverrideCount,omitempty"`
 }
 
 // +kubebuilder:object:root=true

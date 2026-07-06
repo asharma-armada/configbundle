@@ -285,6 +285,38 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              divergenceReporting:
+                description: |-
+                  DivergenceReporting captures the divergence-reporter's dedup state so a
+                  restarted controller resumes without either wiping orb's known state or
+                  missing a state-clearing POST. Written only by the divergence-reporter.
+
+                  A nil value means "no POST has ever landed for this CB" — the reporter
+                  treats this as unknown and posts once on the next reconcile (biased
+                  toward orb-sync-correctness over one avoidable POST). See ADR notes and
+                  docs/claude/edge-context.md for the cold-start semantics.
+                properties:
+                  lastPostedAt:
+                    description: LastPostedAt is the timestamp of the last successful
+                      POST to orb.
+                    format: date-time
+                    type: string
+                  lastPostedHash:
+                    description: |-
+                      LastPostedHash is the SHA-256 hex of the last POST payload. Reconcile
+                      skips the POST when the freshly-computed payload hash matches this value.
+                      Cleared by the heartbeat to force periodic re-syncs against orb-wipe.
+                    type: string
+                  lastPostedOverrideCount:
+                    description: |-
+                      LastPostedOverrideCount is the number of override entries in the last
+                      POST. Pointer type distinguishes "never posted" (nil) from "posted an
+                      empty set" (*0). The steady-state-quiet skip only fires when the current
+                      count is 0 AND this is non-nil and *this == 0. That combination means
+                      "empty now, and last time we told orb we were empty" — the only case
+                      where skipping the POST is safe.
+                    type: integer
+                type: object
               lastAppliedAt:
                 description: LastAppliedAt is the time the last successful apply completed.
                 format: date-time

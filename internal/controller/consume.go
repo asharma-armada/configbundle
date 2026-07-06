@@ -344,6 +344,16 @@ func (s *ConsumeServer) applyManifest(ctx context.Context, body []byte, digest, 
 		return fmt.Errorf("takeover: %w", takeoverErr)
 	}
 
+	// Reconcile every local:* manager's claim tree so managedFields reflects
+	// only meaningful ownership: takeover-target leaves get released, listMap
+	// identity residuals get dropped, and managers with no real claims left
+	// disappear entirely. Runs unconditionally — the same code path handles
+	// takeover cleanup, post-release residuals, and true no-ops (SSA idempotent
+	// when the reconstructed body matches current claims). Non-fatal.
+	if err := s.reconcileLocalClaims(ctx, spec); err != nil {
+		log.FromContext(ctx).WithName("consume").Info("reconcile local:* manager claims failed (non-fatal)", "err", err.Error())
+	}
+
 	// Persist the manifest to the per-CR ConfigMap as the durable bootstrap
 	// baseline. In-memory was already updated above (before any K8s write that
 	// could fire reclaim). Persist failure is non-fatal: in-memory is correct;

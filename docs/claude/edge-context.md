@@ -6,7 +6,7 @@
 
 ## Overview
 
-There is no separate edge agent binary. The ConfigBundle Controller is a passive consumer: it does not poll Zot, does not pull OCI artifacts, and does not call orb's import API. Instead, orb's dispatch pipeline handles all OCI mechanics (poll Zot, cosign verify, graph import) and then POSTs the manifest layer bytes to the ConfigBundle Controller via `POST /consume`. The ConfigBundle Controller receives the manifest, applies the ConfigBundle CR via SSA (respecting local admin overrides), and updates status.
+There is no separate edge agent binary. The ConfigBundle Controller is a passive consumer: it does not poll Zot, does not pull OCI artifacts, and does not call orb's import API. Instead, orb's dispatch pipeline handles all OCI mechanics (poll Zot, cosign verify, graph import) and then POSTs the manifest layer bytes to the ConfigBundle Controller via `POST /dispatch`. The ConfigBundle Controller receives the manifest, applies the ConfigBundle CR via SSA (respecting local admin overrides), and updates status.
 
 ---
 
@@ -38,8 +38,6 @@ sequenceDiagram
 
     orb->>CB: POST /dispatch (manifest layer)
     Note over orb,CB: Content-Type: vnd.armada.configbundle.manifest.v1+yaml<br/>X-Orb-Digest, X-Orb-Import-ID, X-Orb-Tag
-    orb->>CB: POST /dispatch (mapping layer)
-    Note over orb,CB: Content-Type: vnd.armada.configbundle.mapping.v1+json<br/>X-Orb-Digest
 
     CB->>K8s: Get ConfigBundle CR (inspect managedFields)
     K8s-->>CB: CR or NotFound
@@ -52,7 +50,7 @@ sequenceDiagram
     CB-->>orb: 200 OK
 
     K8s->>CB: ConfigBundle CR change event
-    CB->>K8s: SSA Patch child CRs (ServerConfig, etc.)
+    CB->>K8s: SSA Patch child CRs (ServerConfig, BackupConfig, etc.)
 ```
 
 ---
@@ -60,23 +58,22 @@ sequenceDiagram
 ## Key decisions
 
 - **No separate edge agent** — The ConfigBundle Controller, ConsumeServer, and Divergence Reporter are all part of the same binary on the Mgmt Cluster. Do not create an `edge-agent` binary.
-- **Single dispatch endpoint, content-routed** — `POST /dispatch` is the only inbound HTTP endpoint. Routes by `Content-Type`; manifest → apply CR; mapping → write ConfigMap; else 415. Do NOT add `/consume` or `/mapping` back.
-- **Mapping persists in a per-CR ConfigMap** — `<cb-name>-mapping` with OwnerReference to the CR (`controller: true`). K8s GC deletes it when the CR is deleted. Do NOT store mapping in-memory or in CR status.
+- **Single dispatch endpoint, content-routed** — `POST /dispatch` is the only inbound HTTP endpoint. Only `manifest.v1+yaml` is accepted; any other Content-Type returns 415. Do NOT add `/consume` or `/mapping` back.
+- **No mapping layer** — Post-ADR-011, orbIds are saturated directly on the ConfigBundle CR (every ConfigItem carries its own `orbId`). The bundler returns a single OCI layer (manifest only); orb dispatches that one layer to CB Controller. The `<cb-name>-mapping` ConfigMap is retained by name for backward compatibility but only holds `last-applied-spec.yaml` — no more `mapping.json`.
 - **CB Controller is a passive consumer** — it never polls Zot, never pulls OCI artifacts, and never calls cosign. Orb owns the full OCI pipeline including cosign verification.
 - **CB Controller never needs OCI credentials** — orb handles all OCI mechanics including cosign verification. The ConfigBundle Controller receives plain manifest bytes over HTTP.
-- **omitAdminOwnedServers is mandatory in the consume path** — the ConsumeServer handler must inspect `managedFields` and omit fields owned by `local:admin` before applying the SSA patch.
+- **omitAdminOwnedFields is mandatory in the consume path** — the ConsumeServer handler must inspect `managedFields` and strip `local:*`-owned "bow-out" fields (intent differs from live) before applying the SSA patch.
 - **If orb is down, CB Controller receives no updates until orb recovers and re-dispatches** — there is no fallback polling mechanism.
 - **Single field manager** — `configbundle-controller` owns all fields it writes on both the ConfigBundle CR and child CRs. Local admin overrides use `local:admin` — but ONLY on the ConfigBundle CR, never on child CRs.
-- **Local overrides are at ConfigBundle CR level only** — child CRs are derived state, not an override surface. The ConsumeServer applies the ConfigBundle CR spec WITHOUT `ForceOwnership` so SSA preserves locally-owned fields. The Decomposition Reconciler applies child CR specs WITH `ForceOwnership` because child CRs always faithfully reflect the ConfigBundle CR (including any local overrides already merged into it).
+- **Local overrides are at ConfigBundle CR level only** — child CRs are derived state, not an override surface. The ConsumeServer applies the ConfigBundle CR spec with `ForceOwnership` on stripped-and-then-included fields (see ADR-008); locally-overridden fields with divergent values are omitted from the apply, preserving admin ownership. The Decomposition Reconciler applies child CR specs WITH `ForceOwnership` because child CRs always faithfully reflect the ConfigBundle CR (including any local overrides already merged into it).
 - **Divergence is data, not an error** — a disconnected Galleon that hasn't received a dispatch is in a valid (diverged) state. Do not block or error on lack of convergence.
 - **Divergence Reporter fires on `local:*` managedFields change only** — the predicate ignores spec-only changes. Quiet-state: zero reconciles, zero POSTs to orb.
-- **Orb dispatches manifest before mapping** — the mapping handler returns 409 if the CR isn't found by digest; orb retries. This is the intended ordering protocol.
 
 ---
 
 ## ConfigBundle Controller — full responsibility list
 
-The controller is a single binary (Mgmt Cluster) with three goroutines managed by controller-runtime:
+The controller is a single binary (Mgmt Cluster) with multiple goroutines managed by controller-runtime:
 
 ### ConsumeServer (`ctrl.Runnable`) — HTTP-driven, not time-driven
 
@@ -89,62 +86,71 @@ Listens on `CB_CONTROLLER_PORT` (default `:8095`).
 | Content-Type | Action |
 |---|---|
 | `application/vnd.armada.configbundle.manifest.v1+yaml` | Apply ConfigBundle CR via SSA |
-| `application/vnd.armada.configbundle.mapping.v1+json` | Write `<cb-name>-mapping` ConfigMap |
 | anything else | `415 Unsupported Media Type` |
 
-`X-Orb-Digest` is required on all requests (400 if absent). `X-Orb-Import-ID` and `X-Orb-Tag` are read for the manifest path only (for status and traceability).
+`X-Orb-Digest` is required (400 if absent). `X-Orb-Import-ID` and `X-Orb-Tag` are read for traceability.
 
 **Manifest apply pipeline (in order):**
 1. **Parse manifest** bytes into ConfigBundle CR spec fields
-2. **Inspect `managedFields`** on the existing ConfigBundle CR — identify fields owned by `local:admin`
-3. **`omitAdminOwnedServers`** — remove any server entries (or server fields) from the patch that are owned by `local:admin` to avoid SSA 409 conflicts
-4. **SSA patch** WITHOUT `ForceOwnership`, field manager `configbundle-controller` — SSA preserves locally-owned fields. See crd-context.md § SSA conflict resolution.
-5. **Process `spec.takeover[]`** — for each entry, submit a narrow SSA apply containing only that field with `ForceOwnership`, reclaiming ownership from `local:admin`. Runs regardless of step 4 success (ADR-006).
-6. **Record last-applied manifest** for the Divergence Reporter to compare against
-7. **Update ConfigBundle CR status** (status subresource): `lastAppliedDigest` (`X-Orb-Digest`), `lastOrbImportID` (`X-Orb-Import-ID`), `lastAppliedAt`, `Reconciled=True` condition
+2. **Mark in-flight** so ReclaimController defers if a release event fires mid-apply
+3. **Update in-memory `lastManifest`** BEFORE any K8s write (source-of-truth for reclaim replay)
+4. **Fetch current CR** and inspect `managedFields` — identify fields owned by `local:*` managers
+5. **`filterActiveIgnored`** — drop `spec.ignored[]` entries whose target field has no active `local:*` claim (ADR-009 invariant)
+6. **`omitAdminOwnedFields`** — strip "bow-out" leaves: `local:*`-owned fields where intent value differs from live value AND the field isn't in `spec.takeover[]`. Values-match fields stay in the apply and get force-claimed below (no steady-state co-ownership)
+7. **SSA patch** with `ForceOwnership`, field manager `configbundle-controller`. See crd-context.md § SSA conflict resolution
+8. **`processTakeover`** — for each `spec.takeover[]` entry, submit a narrow SSA apply with `ForceOwnership` reclaiming that field from `local:admin` (ADR-006). Runs regardless of step 7 success
+9. **Write `<cb-name>-mapping` ConfigMap** — persist `last-applied-spec.yaml` under this CM (OwnerReference to the CR, `controller: true`). Same CM name as pre-ADR-011 for backward compatibility; the old `mapping.json` key is scrubbed if present
+10. **Update ConfigBundle CR status** (status subresource): `lastAppliedDigest` (`X-Orb-Digest`), `lastOrbImportID` (`X-Orb-Import-ID`), `lastAppliedAt`, `Reconciled=True` condition
 
-**Mapping store pipeline:**
-1. **Look up ConfigBundle CR** by scanning all CRs in the namespace for `status.lastAppliedDigest == X-Orb-Digest`; returns 409 if not found (manifest must arrive first — orb retries)
-2. **Write `<cb-name>-mapping` ConfigMap** with OwnerReference to the CR (`controller: true, blockOwnerDeletion: true`) so K8s GC deletes the ConfigMap when the CR is deleted
-3. ConfigMap shape: `data["digest"]` = digest, `data["mapping.json"]` = raw mapping bytes
-
-**Response codes (both paths):**
-- `200` — applied/stored successfully
-- `409` — mapping arrived before manifest (CR not yet visible); orb retries
+**Response codes:**
+- `200` — applied successfully
+- `400` — missing `X-Orb-Digest` or malformed manifest
 - `415` — unknown Content-Type
-- `500` — apply/write failed; orb records failure and may retry
+- `500` — apply failed; orb records failure and may retry
 
 ### Decomposition Reconciler (`ctrl.Reconciler`) — event-driven, triggered by ConfigBundle CR changes
-1. **Decompose ConfigBundle CR** into domain child CRs via SSA WITH `ForceOwnership` — child CRs faithfully reflect the ConfigBundle CR (including any local overrides already merged into it)
-2. **Set ownerReferences** on child CRs so deletion cascades when ConfigBundle is deleted
-3. **Update ConfigBundle CR status**: `phase`, `Reconciled` condition
+1. **Decompose ConfigBundle CR** into domain child CRs (ServerConfig, BackupConfig) via SSA WITH `ForceOwnership` — child CRs faithfully reflect the ConfigBundle CR
+2. **Set OwnerReferences** on child CRs so deletion cascades when ConfigBundle is deleted
+3. **Update ConfigBundle CR status**: `phase`, `Reconciled` condition, `observedGeneration`
 
 ### Divergence Reporter (`ctrl.Reconciler`) — event-driven with debounce + heartbeat + bootstrap
-1. **Predicate fires on `local:*` managedFields change** — compares `FieldsV1.Raw` bytes for any `local:*` manager between old and new CR; non-local-admin changes are ignored
+1. **Predicate fires on `local:*` managedFields change** — compares `FieldsV1.Raw` bytes for any `local:*` manager between old and new CR; non-local changes are ignored
 2. **Debounce:** `lastEventAt[key]` set on predicate match; reconciler returns `RequeueAfter(remaining)` until `DIVERGENCE_REPORTER_DEBOUNCE` (default `5s`) of quiet time has elapsed
-3. **Compute overrides** from current CR's `managedFields` vs last-applied manifest; read mapping from `<cb-name>-mapping` ConfigMap
-4. **Cold-start guard:** if `lastManifests[cb.Name]` has no entry (controller hasn't seen a manifest dispatch for this CR yet), **skip the POST** — posting nil would wipe orb's store (replace-not-merge). Wait for next bundle dispatch to populate intent, OR for the bootstrap loader to rehydrate from K8s state (see below).
-5. **Content-hash dedup:** SHA-256 of canonical JSON; skip POST if override set is unchanged since last POST (in-memory)
-6. **POST the full override set** to orb's divergence intake (`ORB_DIVERGENCE_INTAKE_URL`) — replace-not-merge semantics; exponential backoff via controller-runtime work queue on error
+3. **Compute overrides** from current CR's `managedFields` vs last-applied spec (in-memory `lastManifests`, bootstrapped from the per-CR ConfigMap). orbIDs are walked directly from the spec (no mapping layer) — the CR itself is the identity manifest
+4. **Cold-start guard for intent:** if `lastManifests[cb.Name]` has no entry (controller hasn't seen a manifest dispatch for this CR yet), **skip the POST** — posting nil would wipe orb's store (replace-not-merge). Wait for next bundle dispatch to populate intent, OR for the bootstrap loader to rehydrate from the persisted ConfigMap
+5. **Content-hash dedup (from CR status):** SHA-256 hex of the canonical payload; if `cb.Status.DivergenceReporting.LastPostedHash` matches, skip the POST — orb already has this exact payload
+6. **Steady-state quiet:** if `overrides=0` AND `LastPostedOverrideCount` is non-nil and `*0`, skip the POST — the last POST was also empty, orb's view doesn't need refreshing. The pointer-int distinction is load-bearing: `nil` (never posted) forces a POST; `*0` (posted empty) allows the skip. This closes the earlier cold-start bug where an empty in-memory map silently claimed "last post was empty" after a restart
+7. **POST the full override set** to orb's divergence intake (`ORB_DIVERGENCE_INTAKE_URL`) — replace-not-merge semantics; exponential backoff via controller-runtime work queue on error
+8. **Persist dedup state** to `cb.Status.DivergenceReporting` (via `Status().Update` + `RetryOnConflict`) so a restarted reporter reads correct dedup state on cold start
 
-#### Restart durability — three guards work together
+#### Restart durability — resilient-not-stateless
 
-The reporter's `lastManifests` (intent baseline) and `lastPostedHash` (dedup cache) were originally in-memory only, causing two failure modes:
+The reporter is designed to be *resilient* (recovers to correct state on restart), not *stateless* in the strict sense. Two categories of state:
 
-| Failure | Without guards | With guards |
-|---|---|---|
-| **Controller restart loses intent baseline** | Reporter posts empty set → wipes orb | Bootstrap rehydrates `lastManifests` from per-CR ConfigMap on startup; cold-start guard skips POST if still empty |
-| **orb store wiped (PVC failure, fresh edge)** | Controller's dedup cache says "already posted" → never re-sends → orb stays empty | Heartbeat ticker clears dedup cache periodically → next reconcile re-posts |
+**Domain state (durable, in Kubernetes)**
+- `lastManifests` (intent baseline) — persisted per-CB in `<cb-name>-mapping` ConfigMap under `last-applied-spec.yaml`. Rehydrated on startup by `lastManifestLoader`.
+- `cb.Status.DivergenceReporting.{LastPostedAt, LastPostedHash, LastPostedOverrideCount}` — persisted on the CR's status subresource after every successful POST. Read fresh on every reconcile via the informer cache.
 
-**The three guards:**
+**Ephemeral state (in-memory, purely operational)**
+- `lastEventAt` (debounce timers) — per-process; loss = extra fraction of debounce
+- `inFlight` in ConsumeServer (reclaim race guard) — inherently per-process
 
-1. **Persistence (write side):** On every successful manifest apply (`consume.go`), the spec is written to the per-CR ConfigMap (`<cb-name>-mapping`) under `last-applied-spec.yaml`. Same CM as the path-mapping; lifecycle tied via OwnerReference.
+Two historical failure modes and how each is now closed:
 
-2. **Bootstrap rehydration (read side):** At controller startup, `lastManifestLoader` (a `manager.Runnable`) lists ConfigBundles in the configured namespace, reads each one's persisted spec, and calls `SetLastManifest`. Log line: `divergence-reporter.bootstrap rehydrated lastManifests {"configbundles": N, "loaded": M}`.
+| Failure | How it's handled |
+|---|---|
+| **Controller restart loses intent baseline** | Bootstrap rehydrates `lastManifests` from per-CR ConfigMap on startup. Cold-start intent guard (step 4) skips POST if rehydration failed |
+| **orb store wiped (PVC failure, fresh edge)** | Heartbeat clears `cb.Status.DivergenceReporting.LastPostedHash` for CBs with `local:*` claims; next reconcile computes fresh hash, sees mismatch, re-POSTs. Bounds recovery latency to one heartbeat interval |
+| **Controller restart mid-flow through takeover** (fixed by moving dedup state to CR status) | On restart, `cb.Status.DivergenceReporting` is either nil (unknown — force POST) or populated (known — trust it). Neither state can silently degrade to the "was empty last time" default that the earlier in-memory design collapsed to on cold start |
 
-3. **Heartbeat ticker:** Every `DIVERGENCE_REPORTER_HEARTBEAT` (default `5m`), `divergenceHeartbeat` (a `manager.Runnable`) lists CRs, clears `lastPostedHash` for each, and triggers `Reconcile` directly. Bounds orb-wipe recovery latency to one interval. Set `0` to disable.
+#### Design note: why `LastPostedOverrideCount` is a pointer
 
-The cold-start guard (step 4 above) is the safety net: if persistence/bootstrap both failed somehow and `lastManifests` is empty, the reporter refuses to wipe orb. It waits for a real intent dispatch.
+The pointer-int distinguishes three states cleanly:
+- `nil` → never posted (or CRD upgrade wrote nil, or manual clear) → treat as unknown; POST on next reconcile regardless
+- `*0` → last POST was empty → steady-state quiet may skip
+- `*N` (N > 0) → last POST had N overrides → transitions to empty must POST
+
+Using a plain `int` would collapse `nil` and `*0` into the same value (`0`), which is exactly the bug the earlier in-memory `map[key]bool` design had. Go's zero-value defaults for missing keys are a cache-miss lie: `false` (or `0`) reads the same whether the state is "we haven't decided yet" or "we decided no last time." The pointer forces callers to distinguish.
 
 ---
 
@@ -155,7 +161,7 @@ The cold-start guard (step 4 above) is the safety net: if persistence/bootstrap 
 | `CB_CONTROLLER_PORT` | `:8095` | Listen address for `POST /dispatch` (ConsumeServer) |
 | `ORB_DIVERGENCE_INTAKE_URL` | `http://localhost:8010/api/v1/divergence` | Where the Divergence Reporter POSTs override entries |
 | `DIVERGENCE_REPORTER_DEBOUNCE` | `5s` | Quiet window after last `local:*` managedFields change before reporting |
-| `DIVERGENCE_REPORTER_HEARTBEAT` | `5m` | Periodic re-send interval. On each tick, clears the per-CR posted-hash cache and triggers reconcile. Bounds recovery latency for the "orb wipe" failure mode. Set `0` to disable. |
+| `DIVERGENCE_REPORTER_HEARTBEAT` | `5m` | Periodic re-send interval. On each tick, clears `cb.Status.DivergenceReporting.LastPostedHash` on CBs with `local:*` claims and triggers reconcile. Bounds recovery latency for the "orb wipe" failure mode. Set `0` to disable. |
 | `DIVERGENCE_REPORTER_ENABLED` | `true` | Set `false` to disable all divergence POSTs (local dev without orb) |
 | `NAMESPACE` | `default` | Namespace the ConsumeServer watches for ConfigBundle CRs |
 
@@ -164,35 +170,33 @@ The cold-start guard (step 4 above) is the safety net: if persistence/bootstrap 
 ## Divergence tracking
 
 - The Divergence Reporter inspects `managedFields` on the **ConfigBundle CR only** — not child CRs
-- Fields owned by `local:admin` on the ConfigBundle CR are local overrides
-- Divergence report contains: field path, intended value, override value, who (`local:admin`), when (`managedFields[].time`)
-- Reports POSTed to orb's divergence intake (`ORB_DIVERGENCE_INTAKE_URL`) — orb translates K8s paths to orbId+field via the mapping layer and relays to S3 for orbital ingestion
-- Each POST is a full replace-not-merge snapshot — if a field is no longer owned by `local:admin`, it disappears from the next report
-- `overrides: []` is valid and means "no local overrides" — orbital interprets this as all divergence resolved
+- Fields owned by `local:*` (typically `local:admin`) on the ConfigBundle CR are local overrides
+- Divergence report contains: field path, intended value, override value, orbId of the owning ConfigItem (walked directly from the spec — no mapping layer), who (`local:admin`), when (`managedFields[].time`)
+- Reports POSTed to orb's divergence intake (`ORB_DIVERGENCE_INTAKE_URL`) — orb relays to S3 for orbital ingestion
+- Each POST is a full replace-not-merge snapshot — if a field is no longer owned by `local:*`, it disappears from the next report
+- `overrides: []` is valid and means "no local overrides" — orbital interprets this as all divergence resolved. Steady-state quiet: reporter skips the POST if `cb.Status.DivergenceReporting.LastPostedOverrideCount` is non-nil and `*0` (previous POST was also empty)
 - A Galleon with no dispatches from orb (disconnected) still publishes divergence reports — time since last apply is tracked
-- **Prerequisite:** `servers[]` has `+listType=map +listMapKey=serviceTag` (done) so SSA tracks per-entry field ownership
+- **Prerequisite:** `servers[]` has `+listType=map +listMapKey=orbId` (post-ADR-011) so SSA tracks per-entry field ownership
 
 ---
 
 ## Gotchas
 
-- **`DIVERGENCE_REPORTER_INTERVAL`/`DIVERGENCE_REPORTER_SCHEDULE` no longer exist** — replaced by `DIVERGENCE_REPORTER_DEBOUNCE` (default `5s`). The reporter is now event-driven, not ticker-driven. Update any deployment configs or e2e scripts that set the old vars.
-- **omitAdminOwnedServers is mandatory in the dispatch/manifest path** — the ConsumeServer handler is a trigger for the full apply pipeline. All override-aware logic still applies; skipping it causes 409s that block legitimate config changes.
-- **CB Controller never needs OCI credentials** — orb handles all OCI mechanics including cosign verification. Do not add OCI pull or cosign logic to the CB Controller.
-- **If orb is down, CB Controller receives no updates until orb recovers and re-dispatches** — there is no fallback polling mechanism. Design orb's dispatch pipeline to handle retries and re-dispatch on recovery.
-- **Local overrides are at ConfigBundle CR level only** — do not implement or support `local:admin` field managers on child CRs (ServerConfig, ClusterConfig, etc.). Child CRs are derived state. Overrides belong on the ConfigBundle CR where they are visible and tracked.
-- **ConsumeServer must NOT use ForceOwnership on ConfigBundle CR** — this is what allows local overrides to persist across dispatch cycles. SSA conflict detection handles the rest.
+- **`DIVERGENCE_REPORTER_INTERVAL` / `DIVERGENCE_REPORTER_SCHEDULE` no longer exist** — replaced by `DIVERGENCE_REPORTER_DEBOUNCE` (default `5s`). The reporter is event-driven, not ticker-driven.
+- **omitAdminOwnedFields is mandatory in the dispatch/manifest path** — skipping it steals ownership from `local:*` managers via the ForceOwnership apply and breaks the divergence loop.
+- **CB Controller never needs OCI credentials** — orb handles all OCI mechanics including cosign verification.
+- **If orb is down, CB Controller receives no updates until orb recovers and re-dispatches** — no fallback polling.
+- **Local overrides are at ConfigBundle CR level only** — do not implement or support `local:*` field managers on child CRs (ServerConfig, BackupConfig, etc.). Child CRs are derived state.
 - **Decomposition Reconciler MUST use ForceOwnership on child CRs** — child CRs always reflect the ConfigBundle CR faithfully. There is no case where a child CR field should diverge from what the ConfigBundle CR says.
 - **Divergence tracking is on ConfigBundle CR managedFields only** — do not inspect child CR managedFields for divergence. The ConfigBundle CR is the single source of divergence truth.
 - **Decomposition must be idempotent** — applying the same ConfigBundle manifest twice must produce the same child CRs with no side effects. SSA guarantees this if field managers are used correctly.
-- **Return 500 on apply failure** — a 500 response is visible in orb's import history, giving operators a clear audit trail. Do not swallow errors and return 200.
-- **Always wrap `Status().Update`/`Status().Patch` and spec writes on owned objects (e.g. the mapping ConfigMap) in `client-go/util/retry.RetryOnConflict`** — multiple writers race the same resourceVersion (ConsumeServer ↔ ConfigBundleReconciler's `ObservedGeneration` write is the canonical case). Without retry, a single losing race surfaces as a 409 in orb's import history and the write is dropped. Re-fetch inside the closure; do not re-submit the stale object.
+- **Return 500 on apply failure** — a 500 response is visible in orb's import history, giving operators a clear audit trail.
+- **Wrap `Status().Update`/`Status().Patch` and spec writes on owned objects in `retry.RetryOnConflict`** — multiple writers race the same resourceVersion (ConsumeServer ↔ ConfigBundleReconciler's `ObservedGeneration` write is the canonical case).
 
 ---
 
 ## External references
 
-- [SDD §3.2 — Edge Architecture diagram](../../SDD%20DCIM%20%26%20CMBD%20for%20Galleon%20Digital%20Twin%20in%20Atlas%20%283%29.pdf)
 - [OCI artifact layer reference](bundle-context.md)
 - [ConfigBundle CR structure](crd-context.md)
 - [Local override / divergence model](orbital-context.md)
@@ -203,7 +207,7 @@ The cold-start guard (step 4 above) is the safety net: if persistence/bootstrap 
 
 Update this file when:
 - The ConsumeServer HTTP interface changes (headers, response codes, endpoint path)
-- The apply pipeline steps change (e.g. new managedFields inspection logic)
+- The apply pipeline steps change
 - The divergence report format or transport is finalized
 - Environment variables are added or renamed
 

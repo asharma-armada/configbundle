@@ -75,19 +75,11 @@ func (s *ConsumeServer) processTakeover(ctx context.Context, fullSpec armadav1.C
 		return fmt.Errorf("takeover apply: %w", err)
 	}
 
-	// Release stale managedFields claims on takeover-target fields held by
-	// other managers (typically local:<id>). K8s SSA's ForceOwnership only
-	// transfers ownership when there's a VALUE conflict; on accept-divergence
-	// the controller-intent now matches the local override, so no conflict
-	// fires and the local manager's claim persists. Orbital's divergence model
-	// requires the local claim to be released on both accept and reject — only
-	// `ignore` retains local ownership. See docs/decisions/008-managedfields-release.md.
-	if err := s.releaseOtherClaims(ctx, fullSpec); err != nil {
-		logger.Error(err, "release of stale managedFields claims failed; takeover apply itself succeeded")
-		// Non-fatal: the takeover apply succeeded, values are correct, only the
-		// managedFields cleanup is incomplete. Reporting this as a hard error
-		// would mask the successful value transfer.
-	}
+	// managedFields cleanup for local:* managers is now the responsibility of
+	// reconcileLocalClaims (called from applyManifest, unconditional). Keeping
+	// it out of processTakeover means one uniform pass whether or not there's
+	// takeover in this bundle — same code path for takeover cleanup and inert-
+	// residual cleanup. See docs/decisions/008-managedfields-release.md.
 
 	if len(errs) > 0 {
 		return fmt.Errorf("%d of %d takeover entries failed", len(errs), len(fullSpec.Takeover))
@@ -95,14 +87,25 @@ func (s *ConsumeServer) processTakeover(ctx context.Context, fullSpec armadav1.C
 	return nil
 }
 
-// releaseOtherClaims completes ownership transfer on takeover-target fields
-// using K8s SSA's documented "transferring ownership between managers"
-// protocol: the controller's force-conflicts Apply (just above) already wrote
-// the same value as the local override, so both managers co-own. This step
-// re-issues an SSA as each other manager with the takeover-target leaves
-// OMITTED — release-on-omit then strips just those claims, leaving the
-// manager's other claims intact (so Ignore-resolved and pending-divergence
-// fields they still legitimately own are preserved).
+// reconcileLocalClaims sweeps every local:* manager on the CR and rewrites
+// their managedFields entry to reflect only meaningful ownership — i.e. real
+// leaf-field claims that aren't takeover targets and aren't bare listMap
+// identity residuals.
+//
+// One rule, one loop, unconditional. Runs after every applyManifest whether or
+// not the current bundle carries takeover directives. The same code path
+// handles:
+//   - takeover cleanup (release-on-omit strips the takeover-target fields)
+//   - inert-residual cleanup (listMap items with only . / orbId / serviceTag
+//     claims get dropped from the reconstruction, letting release-on-omit
+//     retire the entire item claim)
+//   - full manager release (if the reconstruction is empty, we apply
+//     metadata-only and SSA drops the manager entry entirely)
+//
+// SSA is idempotent when the reconstructed claim set matches the manager's
+// current claims, so managers whose claims don't need to change take one
+// no-op HTTP round-trip per apply. Fine for the handful of local:* managers
+// we ever expect per CR.
 //
 // Mechanism (per https://kubernetes.io/docs/reference/using-api/server-side-apply/#transferring-ownership-between-managers):
 //
@@ -111,23 +114,14 @@ func (s *ConsumeServer) processTakeover(ctx context.Context, fullSpec armadav1.C
 //     shared ownership.
 //  3. Manager A re-Applies a body that omits F → SSA releases A's claim on F.
 //     A's other claims (fields still in the new body with current values)
-//     persist.
+//     persist. If A's new body claims nothing, A's entry is removed entirely.
 //  4. B is now sole owner of F.
-//
-// Steps 1-2 happened earlier in processTakeover. This function runs step 3
-// for every non-self manager that claims any takeover target. The Apply body
-// is reconstructed from live spec values at the paths the manager currently
-// claims, minus the takeover targets.
 //
 // We Apply as field-owner=<that manager's name>. K8s does not authenticate
 // the FieldManager string — the controller's ServiceAccount can submit Apply
-// requests on behalf of any manager name. This is by design and is the
-// recommended pattern when a controller mediates ownership transfer.
-func (s *ConsumeServer) releaseOtherClaims(ctx context.Context, fullSpec armadav1.ConfigBundleSpec) error {
-	if len(fullSpec.Takeover) == 0 {
-		return nil
-	}
-
+// requests on behalf of any manager name. This is the recommended pattern
+// when a controller mediates ownership transfer.
+func (s *ConsumeServer) reconcileLocalClaims(ctx context.Context, fullSpec armadav1.ConfigBundleSpec) error {
 	// ConfigBundle is cluster-scoped — no namespace.
 	var cb armadav1.ConfigBundle
 	if err := s.Client.Get(ctx, types.NamespacedName{Name: fullSpec.Datacenter}, &cb); err != nil {
@@ -144,7 +138,9 @@ func (s *ConsumeServer) releaseOtherClaims(ctx context.Context, fullSpec armadav
 		return fmt.Errorf("unmarshal live spec: %w", err)
 	}
 
-	// Index takeover targets: serverOrbId -> set of field names.
+	// Index takeover targets: serverOrbId -> set of field names. May be empty
+	// (no takeover in this bundle); reconstruction still runs to strip any
+	// listMap identity residuals left behind by prior release cycles.
 	exclude := make(map[string]map[string]bool)
 	for _, te := range fullSpec.Takeover {
 		if exclude[te.ServerOrbID] == nil {
@@ -153,13 +149,13 @@ func (s *ConsumeServer) releaseOtherClaims(ctx context.Context, fullSpec armadav
 		exclude[te.ServerOrbID][te.Field] = true
 	}
 
-	logger := log.FromContext(ctx).WithName("takeover")
+	logger := log.FromContext(ctx).WithName("release")
 	for _, mf := range cb.ManagedFields {
-		if mf.Manager == controllerFieldManager {
-			continue // self — controller's own claims stay
+		if !strings.HasPrefix(mf.Manager, "local:") {
+			continue // only touch local:* managers — controller/kubectl/etc are not our concern
 		}
 		if mf.Subresource == "status" {
-			continue // status writers (K8s "main") don't touch spec
+			continue // status writers don't touch spec
 		}
 		if mf.FieldsV1 == nil {
 			continue
@@ -170,13 +166,17 @@ func (s *ConsumeServer) releaseOtherClaims(ctx context.Context, fullSpec armadav
 		}
 		specOwned, _ := owned["f:spec"].(map[string]any)
 		if specOwned == nil {
-			continue
+			continue // manager holds no spec claims (metadata-only)
 		}
 
-		newSpec, touched := reconstructApplyExcluding(specMap, specOwned, exclude)
-		if !touched {
-			continue // this manager doesn't claim any takeover targets
-		}
+		// Reconstruction returns the manager's meaningful spec ownership.
+		// Takeover-target leaves are excluded; listMap items reduced to bare
+		// identity are dropped (see reconstructServerList line ~350).
+		// The `touched` return value is intentionally ignored — the
+		// reconstruction is the desired state regardless of whether it
+		// excluded anything. When reconstruction matches current claims,
+		// SSA no-ops on the apply.
+		newSpec, _ := reconstructApplyExcluding(specMap, specOwned, exclude)
 
 		// Use unstructured so the Apply body contains EXACTLY the keys we put
 		// into newSpec — nothing else. A typed armadav1.ConfigBundle would

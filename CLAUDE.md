@@ -32,7 +32,7 @@
 ## Current State
 
 **Phase:** Prototype
-**Active work:** ADR-011 shipped — mapping OCI layer + `bundle.MappingPayload` deleted; `idrac.orbId` saturated on the ConfigBundle CR; bundler returns 1 layer (was 2); e2e-validated on minikube. Drift-detection metrics live in serverconfig-controller (separate repo): intent/observed/ignored Prom gauges, feature-gated via `IDRAC_OBSERVE_INTERVAL` (default disabled; 5m in k8s Deployment).
+**Active work:** Divergence reporter dedup state migrated to `cb.Status.DivergenceReporting` subresource (Phase 2); the earlier in-memory `lastPostedHash`/`lastPostedHadOverrides` maps had a cold-start conflation (empty map == "posted empty last time") that stuck orb after takeovers. Now uses pointer-int `LastPostedOverrideCount` so nil (never posted) is distinguishable from `*0` (posted empty). BackupConfig CRD + sibling controller (`~/armada/backupconfig-controller`) shipped in same period; ConfigBundle now decomposes to ServerConfig + BackupConfig children. Drift-detection metrics remain in serverconfig-controller (Prom gauges via `IDRAC_OBSERVE_INTERVAL`).
 **Next priority:** Spike 8 (full pipeline e2e); PrometheusRule + Alertmanager wiring for drift gauges; orbital-side cleanup of orphan Ignore resolutions after edge handback.
 
 *Update this section at each session wrap-up.*

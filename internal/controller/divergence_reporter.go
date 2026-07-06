@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +24,15 @@ import (
 
 // DivergenceReporter is a controller-runtime reconciler that watches ConfigBundle CRs
 // for changes in "local:*" field managers and reports divergences to orb's intake.
+//
+// Dedup state (last-posted hash, override count) lives on the ConfigBundle CR's
+// `status.divergenceReporting` subresource — not in this struct. That makes the
+// reporter fully restart-resilient: a cold-started reporter reads status from
+// the informer cache and immediately knows what it last told orb (including
+// distinguishing "never posted" from "posted empty"). The two in-memory maps
+// below are genuinely ephemeral: lastEventAt is per-process debounce state,
+// and lastManifests is the intent baseline (bootstrapped from the per-CB
+// ConfigMap by lastManifestLoader — see divergence_reporter_controller.go).
 type DivergenceReporter struct {
 	Client            client.Client
 	HTTPClient        *http.Client
@@ -32,15 +42,8 @@ type DivergenceReporter struct {
 	heartbeatInterval time.Duration
 	enabled           bool
 
-	mu             sync.Mutex
-	lastEventAt    map[types.NamespacedName]time.Time
-	lastPostedHash map[types.NamespacedName][32]byte
-	// lastPostedHadOverrides tracks whether the most recent POST to orb carried
-	// a non-empty override set. Used to silently skip steady-state empty-empty
-	// reconciles — there's nothing to report and orb's view doesn't need refreshing.
-	// Empty→non-empty and non-empty→empty transitions still POST and log, since
-	// those are meaningful state changes.
-	lastPostedHadOverrides map[types.NamespacedName]bool
+	mu          sync.Mutex
+	lastEventAt map[types.NamespacedName]time.Time
 
 	lastManifestsMu sync.RWMutex
 	lastManifests   map[string]armadav1.ConfigBundleSpec
@@ -83,10 +86,8 @@ func NewDivergenceReporter(c client.Client, opts ...DivergenceReporterOption) *D
 		debounceWindow:    5 * time.Second,
 		heartbeatInterval: 5 * time.Minute,
 		enabled:           false,
-		lastEventAt:            make(map[types.NamespacedName]time.Time),
-		lastPostedHash:         make(map[types.NamespacedName][32]byte),
-		lastPostedHadOverrides: make(map[types.NamespacedName]bool),
-		lastManifests:          make(map[string]armadav1.ConfigBundleSpec),
+		lastEventAt:       make(map[types.NamespacedName]time.Time),
+		lastManifests:     make(map[string]armadav1.ConfigBundleSpec),
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -266,9 +267,11 @@ func (r *DivergenceReporter) SetLastManifest(name string, spec armadav1.ConfigBu
 	r.lastManifests[name] = spec
 }
 
-// contentHash returns a stable SHA-256 hash of a DivergencePayload by sorting
-// overrides before hashing so order-invariant payloads produce the same hash.
-func contentHash(payload DivergencePayload) [32]byte {
+// contentHash returns a stable hex-encoded SHA-256 hash of a DivergencePayload
+// by sorting overrides before hashing so order-invariant payloads produce the
+// same hash. Hex-encoded so the value is directly comparable to the string
+// stored in status.divergenceReporting.lastPostedHash.
+func contentHash(payload DivergencePayload) string {
 	sorted := make([]OverrideEntry, len(payload.Overrides))
 	copy(sorted, payload.Overrides)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -278,7 +281,8 @@ func contentHash(payload DivergencePayload) [32]byte {
 		return sorted[i].Field < sorted[j].Field
 	})
 	b, _ := json.Marshal(DivergencePayload{Overrides: sorted})
-	return sha256.Sum256(b)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 type adminPath struct {

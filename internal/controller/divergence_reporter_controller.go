@@ -9,6 +9,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -114,19 +115,23 @@ func (h *divergenceHeartbeat) tick(ctx context.Context, logger logrLogger) {
 	// Only force-repost CBs that actually have local:* claims. The heartbeat's
 	// purpose is recovering from an orb state wipe — but if a CB has no local
 	// overrides, orb's view is "empty" with or without a wipe, so re-posting
-	// an empty payload would be noise. CBs with claims get the dedup hash
-	// cleared so Reconcile re-POSTs even if the override set is unchanged.
+	// an empty payload would be noise. CBs with claims get their status-side
+	// dedup hash cleared so Reconcile re-POSTs even if the override set is
+	// unchanged.
 	var withClaims []armadav1.ConfigBundle
 	for _, cb := range list.Items {
 		if len(extractAdminPaths(cb.ManagedFields)) > 0 {
 			withClaims = append(withClaims, cb)
 		}
 	}
-	h.reporter.mu.Lock()
 	for _, cb := range withClaims {
-		delete(h.reporter.lastPostedHash, types.NamespacedName{Name: cb.Name})
+		if err := h.reporter.clearReportingHash(ctx, cb.Name); err != nil {
+			logger.Info("clear reporting hash failed", "configbundle", cb.Name, "err", err.Error())
+			// Fall through to reconcile — the hash mismatch on next reconcile
+			// will happen anyway when we recompute. The clearReportingHash write
+			// is a belt-and-suspenders reset for the reader.
+		}
 	}
-	h.reporter.mu.Unlock()
 	// Trigger reconcile for each CR with claims. Direct call bypasses the work
 	// queue — acceptable here because we ARE the periodic re-sync; there's no
 	// event debouncing to honor.
@@ -136,7 +141,13 @@ func (h *divergenceHeartbeat) tick(ctx context.Context, logger logrLogger) {
 			logger.Error(err, "reconcile failed", "configbundle", cb.Name)
 		}
 	}
-	logger.Info("heartbeat tick complete", "configbundles", len(list.Items), "withClaims", len(withClaims))
+	// Silent at steady state — only log ticks that actually re-posted. Matches
+	// the A+B steady-state-quiet pattern used by the Reconcile POST path. The
+	// "heartbeat started" line at Start() handles liveness; per-tick noise on
+	// an idle cluster is just log spam.
+	if len(withClaims) > 0 {
+		logger.Info("heartbeat tick complete", "configbundles", len(list.Items), "withClaims", len(withClaims))
+	}
 }
 
 // Reconcile is called when a ConfigBundle CR's local:* managed fields change.
@@ -182,26 +193,34 @@ func (r *DivergenceReporter) Reconcile(ctx context.Context, req reconcile.Reques
 
 	overrides := r.extractOverrides(&cb, lastManifest)
 	payload := DivergencePayload{Overrides: overrides}
-
 	h := contentHash(payload)
-	r.mu.Lock()
-	sameHash := r.lastPostedHash[req.NamespacedName] == h
-	lastHadOverrides := r.lastPostedHadOverrides[req.NamespacedName]
-	r.mu.Unlock()
-	if sameHash {
+
+	// Dedup + steady-state-quiet read from CR status. Nil DivergenceReporting
+	// unambiguously means "no POST has ever landed for this CB" — treat it as
+	// unknown and force a POST on this reconcile (biased toward orb-sync
+	// correctness over one avoidable POST). The pointer LastPostedOverrideCount
+	// distinguishes "never posted" (nil) from "posted empty" (*0), which fixes
+	// the earlier cold-start bug where an empty in-memory map silently claimed
+	// "last post was empty" after a restart.
+	prior := cb.Status.DivergenceReporting
+
+	// Exact-hash dedup: if we've already told orb this exact payload, skip.
+	if prior != nil && prior.LastPostedHash == h {
 		logger.V(1).Info("override set unchanged, skipping POST", "configbundle", req.Name)
 		return reconcile.Result{}, nil
 	}
 
-	// Steady-state quiet: when this Reconcile would just send "still no overrides"
-	// (current empty AND last post was also empty), skip the POST and the log.
-	// Hash mismatch in this case comes from heartbeat clearing or fresh reporter
-	// startup, not from an actual state change. Transitions in either direction
-	// (empty→non-empty, non-empty→empty) still POST and log — those are meaningful.
-	if len(overrides) == 0 && !lastHadOverrides {
-		r.mu.Lock()
-		r.lastPostedHash[req.NamespacedName] = h
-		r.mu.Unlock()
+	// Steady-state quiet: current empty AND the CR's status confirms our last
+	// POST was also empty (LastPostedOverrideCount is *0). Skip the redundant
+	// POST — orb already knows the state is empty.
+	if len(overrides) == 0 && prior != nil && prior.LastPostedOverrideCount != nil && *prior.LastPostedOverrideCount == 0 {
+		// Still update the hash so subsequent same-payload reconciles hit the
+		// dedup fast-path above without re-hashing history.
+		if prior.LastPostedHash != h {
+			if err := r.writeReportingStatus(ctx, req.Name, h, 0); err != nil {
+				logger.Info("update reporting status failed (will retry)", "configbundle", req.Name, "err", err.Error())
+			}
+		}
 		return reconcile.Result{}, nil
 	}
 
@@ -210,20 +229,73 @@ func (r *DivergenceReporter) Reconcile(ctx context.Context, req reconcile.Reques
 		return reconcile.Result{}, fmt.Errorf("POST divergence: %w", err)
 	}
 
-	r.mu.Lock()
-	r.lastPostedHash[req.NamespacedName] = h
-	r.lastPostedHadOverrides[req.NamespacedName] = len(overrides) > 0
-	r.mu.Unlock()
+	if err := r.writeReportingStatus(ctx, req.Name, h, len(overrides)); err != nil {
+		// POST succeeded but status write failed — log and move on. Next
+		// reconcile will re-POST (hash won't match), which is safe because
+		// orb's intake is replace-not-merge and idempotent for identical
+		// payloads.
+		logger.Info("update reporting status failed (next reconcile will re-POST)", "configbundle", req.Name, "err", err.Error())
+	}
 
 	if len(overrides) > 0 {
 		logger.Info("reported divergence", "configbundle", req.Name, "overrides", len(overrides))
 	} else {
-		// Non-empty → empty transition. The override set was just cleared (e.g.
-		// local:admin released the field, or the cloud admin's takeover landed).
-		// Worth surfacing as a distinct log line from the steady-state quiet path.
-		logger.Info("cleared divergence (override set went empty)", "configbundle", req.Name)
+		// Empty payload we sent because prior was nil (cold start) or
+		// non-empty (transition-to-empty). Both are meaningful — log distinctly
+		// from the steady-state quiet path above.
+		logger.Info("cleared divergence (override set went empty or first post-restart POST)", "configbundle", req.Name)
 	}
 	return reconcile.Result{}, nil
+}
+
+// writeReportingStatus persists the just-POSTed hash + override count to
+// cb.status.divergenceReporting. Wrapped in RetryOnConflict because multiple
+// writers (ConsumeServer, ConfigBundleReconciler, this reporter) may race on
+// the same CR's status subresource. Best-effort: a failed write means the next
+// reconcile will re-POST (hash won't match), which is safe because orb's
+// intake is replace-not-merge and idempotent for identical payloads.
+func (r *DivergenceReporter) writeReportingStatus(ctx context.Context, name, hash string, count int) error {
+	countCopy := count
+	now := metav1.Now()
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh armadav1.ConfigBundle
+		if err := r.Client.Get(ctx, types.NamespacedName{Name: name}, &fresh); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		fresh.Status.DivergenceReporting = &armadav1.DivergenceReportingStatus{
+			LastPostedAt:            &now,
+			LastPostedHash:          hash,
+			LastPostedOverrideCount: &countCopy,
+		}
+		return r.Client.Status().Update(ctx, &fresh)
+	})
+}
+
+// clearReportingHash zeroes out the LastPostedHash field of cb.status.divergenceReporting
+// so the next reconcile's hash check misses and a POST fires. Called by the heartbeat
+// for CBs that have local:* claims — the tick's whole purpose is to force a re-sync
+// against a possibly-wiped orb store.
+//
+// Leaves LastPostedOverrideCount intact: if the last known state was "posted N overrides,"
+// we still know that, and the next reconcile will POST current state (whatever it is).
+// Wrapped in RetryOnConflict for the same multi-writer reason as writeReportingStatus.
+func (r *DivergenceReporter) clearReportingHash(ctx context.Context, name string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var fresh armadav1.ConfigBundle
+		if err := r.Client.Get(ctx, types.NamespacedName{Name: name}, &fresh); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		if fresh.Status.DivergenceReporting == nil {
+			// Never posted → nothing to clear. Next reconcile will POST anyway
+			// because prior == nil takes the force-post branch.
+			return nil
+		}
+		if fresh.Status.DivergenceReporting.LastPostedHash == "" {
+			return nil
+		}
+		fresh.Status.DivergenceReporting.LastPostedHash = ""
+		return r.Client.Status().Update(ctx, &fresh)
+	})
 }
 
 func (r *DivergenceReporter) predicate() predicate.Predicate {

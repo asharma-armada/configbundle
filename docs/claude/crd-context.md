@@ -46,14 +46,20 @@ spec:
         dhcpEnabled: false
         racadmEnabled: true
 status:
-  phase: Applied        # Pending | Applying | Applied | Failed
+  phase: Applied            # Pending | Applying | Applied | Failed
+  observedGeneration: 3     # metadata.generation the controller has reconciled
   conditions:
-    - type: ArtifactFetched      # OCI pull succeeded
-    - type: SignatureVerified    # cosign verify passed
-    - type: GraphImported        # orb POST /import/subgraph returned 2xx
-    - type: Reconciled           # decomposition to child CRs complete
+    - type: Reconciled      # decomposition to child CRs complete
   lastAppliedDigest: sha256:abc123...
+  lastOrbImportID: "abc123-def456-..."   # X-Orb-Import-ID for orb correlation
   lastAppliedAt: "2026-05-26T12:00:00Z"
+
+  # Written only by the divergence-reporter. See edge-context.md for the
+  # dedup + steady-state-quiet semantics that read from these fields.
+  divergenceReporting:
+    lastPostedAt: "2026-05-26T12:00:30Z"
+    lastPostedHash: "sha256hex..."       # exact-match dedup key
+    lastPostedOverrideCount: 0           # pointer int: nil=never posted, *0=posted empty, *N=posted N
 ```
 
 ## ServerConfig child CR structure
