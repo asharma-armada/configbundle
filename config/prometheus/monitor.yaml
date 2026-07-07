@@ -1,27 +1,33 @@
-# Prometheus Monitor Service (Metrics)
+# ServiceMonitor for cb-controller (`configbundle-controller-metrics` Service).
+#
+# The `release: kube-prometheus-stack` label is mandatory — it's what the
+# kube-prometheus-stack operator's serviceMonitorSelector matches on. Without
+# it, the ServiceMonitor is invisible to Prometheus and the scrape target
+# never registers.
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
+  name: configbundle-controller
   labels:
     control-plane: controller-manager
     app.kubernetes.io/name: configbundle
     app.kubernetes.io/managed-by: kustomize
-  name: controller-manager-metrics-monitor
-  namespace: system
+    release: kube-prometheus-stack
 spec:
-  endpoints:
-    - path: /metrics
-      port: https # Ensure this is the name of the port that exposes HTTPS metrics
-      scheme: https
-      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
-      tlsConfig:
-        # TODO(user): The option insecureSkipVerify: true is not recommended for production since it disables
-        # certificate verification, exposing the system to potential man-in-the-middle attacks.
-        # For production environments, it is recommended to use cert-manager for automatic TLS certificate management.
-        # To apply this configuration, enable cert-manager and use the patch located at config/prometheus/servicemonitor_tls_patch.yaml,
-        # which securely references the certificate from the 'metrics-server-cert' secret.
-        insecureSkipVerify: true
+  namespaceSelector:
+    matchNames:
+      - configbundle-system
   selector:
     matchLabels:
       control-plane: controller-manager
       app.kubernetes.io/name: configbundle
+  endpoints:
+    - port: https           # matches the port name on configbundle-controller-metrics Service
+      path: /metrics
+      scheme: https
+      interval: 30s
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        # Metrics endpoint uses the controller-runtime self-signed cert.
+        # cert-manager wiring is available via monitor_tls_patch.yaml — enable when ready.
+        insecureSkipVerify: true

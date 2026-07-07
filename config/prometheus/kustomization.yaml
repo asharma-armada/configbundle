@@ -1,5 +1,14 @@
+# Opt-in overlay: apply on clusters that run kube-prometheus-stack
+# (colo-dev-main, adot-w1). Skip on bare Galleons that have no Prometheus
+# operator installed — the ServiceMonitor CRD wouldn't resolve there.
+#
+# Deploy standalone: kubectl apply -k config/prometheus/
+namespace: configbundle-system
+
 resources:
-- monitor.yaml
+- monitor.yaml                 # cb-controller
+- monitor_serverconfig.yaml    # sc-controller
+# bc-controller intentionally omitted — add when we're ready to wire it.
 
 # [PROMETHEUS-WITH-CERTS] The following patch configures the ServiceMonitor in ../prometheus
 # to securely reference certificates created and managed by cert-manager.

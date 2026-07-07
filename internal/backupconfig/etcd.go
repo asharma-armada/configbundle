@@ -13,6 +13,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -65,10 +66,12 @@ az storage blob upload \
 `
 
 // etcdCronJobName builds the deterministic CronJob name for a BackupConfig.
-// Convention: "<bc-name>-etcd-backup" — the BackupConfig.Name is already an
-// RFC 1123–safe form of the ClusterBackup orbId.
+// Convention: "<bc-name>-etcd" — suffix names the spec.etcd domain, matching
+// veleroScheduleName's "<bc-name>-velero" shape. BackupConfig.Name is already
+// an RFC 1123–safe form of the ClusterBackup orbId (which ends in "-backup"),
+// so the suffix must NOT repeat "backup".
 func etcdCronJobName(bc *armadav1.BackupConfig) string {
-	return bc.Name + "-etcd-backup"
+	return bc.Name + "-etcd"
 }
 
 // parseAzureBlobURL parses an Azure Blob HTTPS URL of the form
@@ -123,7 +126,7 @@ func parseAzureBlobURL(location string) (account, container, prefix string, err 
 	return account, container, prefix, nil
 }
 
-// reconcileEtcd applies the desired etcd-backup CronJob from bc.Spec.Etcd.
+// reconcileEtcd applies the desired etcd CronJob from bc.Spec.Etcd.
 // Returns a human-readable summary of the PATCH (empty string = no PATCH
 // needed) or an error if the apply failed.
 //
@@ -157,16 +160,23 @@ func (r *BackupConfigReconciler) reconcileEtcd(ctx context.Context, bc *armadav1
 		Block:            block,
 	}
 
+	// Compute what will change on this reconcile. Used ONLY to produce the
+	// summary written to status.recentPatches — NOT to gate the apply. See
+	// reconcileVelero for the rationale (always-apply is the SSA convention;
+	// gating on spec-delta silently skips metadata reconciliation).
 	deltas, err := etcdDeltas(ctx, r.Client, r.EtcdBackupNamespace, name, block, params)
 	if err != nil {
 		return "", err
 	}
-	if len(deltas) == 0 {
-		logger.V(1).Info("etcd cronjob already matches intent", "name", name)
-		return "", nil
-	}
 
 	cj := buildEtcdCronJob(params)
+	// OwnerReference ties the CronJob's lifecycle to the BackupConfig CR:
+	// deleting the BC cascades to the CronJob via native K8s GC. Cluster-
+	// scoped parent → namespaced child is a documented K8s pattern (see
+	// cert-manager's ClusterIssuer → Certificate).
+	if err := ctrl.SetControllerReference(bc, cj, r.Scheme); err != nil {
+		return "", fmt.Errorf("set owner on etcd cronjob: %w", err)
+	}
 	if err := r.Patch(ctx, cj, client.Apply,
 		client.FieldOwner(fieldManager),
 		client.ForceOwnership,
@@ -174,6 +184,10 @@ func (r *BackupConfigReconciler) reconcileEtcd(ctx context.Context, bc *armadav1
 		return "", fmt.Errorf("ssa patch etcd cronjob %s/%s: %w", r.EtcdBackupNamespace, name, err)
 	}
 
+	if len(deltas) == 0 {
+		logger.V(1).Info("etcd cronjob already matches intent (metadata reconciled)", "name", name)
+		return "", nil
+	}
 	return formatBlockDeltas(fmt.Sprintf("etcd/%s", name), deltas), nil
 }
 
@@ -331,7 +345,7 @@ func buildEtcdCronJob(p etcdCronJobParams) *batchv1.CronJob {
 	return cj
 }
 
-// observeEtcd reads the live etcd-backup CronJob and projects the fields
+// observeEtcd reads the live etcd CronJob and projects the fields
 // bc-controller manages into an ObservedEtcdStatus. Returns nil when the
 // CronJob does not exist (same semantics as observeVelero — nil means "no
 // live resource present," distinct from "present with empty fields").

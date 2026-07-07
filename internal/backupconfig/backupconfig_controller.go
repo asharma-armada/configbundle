@@ -35,9 +35,8 @@ const ConditionReconciled = "Reconciled"
 const ConditionS3SyncSupported = "S3SyncSupported"
 
 // fieldManager is the SSA field-owner string this controller uses when writing
-// Velero Schedule CRDs and the etcd-backup CronJob. Matches the convention
-// used by the sibling serverconfig-controller — single fixed owner per
-// controller.
+// Velero Schedule CRDs and the etcd CronJob. Matches the convention used by
+// the sibling serverconfig-controller — single fixed owner per controller.
 const fieldManager = "controller"
 
 // recentPatchesLimit caps how many PATCH-history entries we keep in
@@ -45,8 +44,8 @@ const fieldManager = "controller"
 const recentPatchesLimit = 5
 
 // BackupConfigReconciler watches BackupConfig CRs and reconciles spec.velero
-// against a Velero Schedule CRD and spec.etcd against an etcd-backup CronJob,
-// both in the same cluster as the controller.
+// against a Velero Schedule CRD and spec.etcd against an etcd CronJob, both
+// in the same cluster as the controller.
 type BackupConfigReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -55,7 +54,7 @@ type BackupConfigReconciler struct {
 	// (conventionally "velero").
 	VeleroNamespace string
 
-	// EtcdBackupNamespace is where the etcd-backup CronJob is written
+	// EtcdBackupNamespace is where the etcd CronJob is written
 	// (conventionally "kube-system").
 	EtcdBackupNamespace string
 

@@ -2,7 +2,7 @@
 
 **Symptom:** `kubectl get backupconfigs` shows the CR, but
 `kubectl -n kube-system get cronjobs` doesn't show the expected
-`<bc-name>-etcd-backup`.
+`<bc-name>-etcd`.
 
 ## Quick diagnosis
 
@@ -74,14 +74,15 @@ kubectl -n configbundle-system get deploy configbundle-backupconfig-controller \
 Then look in that namespace:
 
 ```bash
-kubectl -n <namespace> get cronjobs | grep etcd-backup
+kubectl -n <namespace> get cronjobs | grep -- -etcd
 ```
 
-**Path B: Name is different than you expected.** bc-controller uses
-`<bc-name>-etcd-backup`. The `<bc-name>` is derived from
-`cluster.backup.orbId` (via `orbIDToK8sName`), e.g.
-`colo:cluster-001-backup` → `colo-cluster-001-backup` → CronJob name
-`colo-cluster-001-backup-etcd-backup`. Confirm:
+**Path B: Name is different than you expected.** bc-controller names the
+CronJob `<bc-name>-etcd` (parallel to the Velero Schedule at
+`<bc-name>-velero`). The `<bc-name>` is derived from `cluster.backup.orbId`
+(via `orbIDToK8sName`), e.g. `colo:cluster-001-backup` →
+`colo-cluster-001-backup` → CronJob name `colo-cluster-001-backup-etcd`.
+Confirm:
 
 ```bash
 kubectl -n kube-system get cronjobs -o name
@@ -163,7 +164,7 @@ that runs on schedule is failing. Different runbook (TODO). For now:
 ```bash
 # Trigger the CronJob immediately (skip schedule wait)
 kubectl -n kube-system create job \
-  --from=cronjob/<bc-name>-etcd-backup \
+  --from=cronjob/<bc-name>-etcd \
   etcd-manual-$(date +%s)
 
 # Watch the pod

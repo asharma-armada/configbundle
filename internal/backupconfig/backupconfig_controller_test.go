@@ -177,6 +177,149 @@ func TestReconcile_CreatesVeleroScheduleAndEtcdCronJob(t *testing.T) {
 	}
 }
 
+// TestReconcile_SubResourcesCarryOwnerReference verifies that the Velero
+// Schedule and the etcd CronJob both carry a controller OwnerReference to
+// the parent BackupConfig — so deleting the BackupConfig triggers native
+// K8s GC of both sub-resources instead of leaving them running.
+func TestReconcile_SubResourcesCarryOwnerReference(t *testing.T) {
+	bc := sampleBackupConfig()
+	r, c := newReconciler(t, bc)
+
+	_, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: bc.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// Re-fetch the BackupConfig so UID matches whatever the fake client
+	// assigned on the initial create. Owner references must reference this
+	// exact UID.
+	var parent armadav1.BackupConfig
+	if err := c.Get(context.Background(), types.NamespacedName{Name: bc.Name}, &parent); err != nil {
+		t.Fatalf("get bc: %v", err)
+	}
+
+	assertControllerOwnerRef := func(t *testing.T, kind string, refs []metav1.OwnerReference) {
+		t.Helper()
+		for _, ref := range refs {
+			if ref.Kind != "BackupConfig" {
+				continue
+			}
+			if ref.Name != parent.Name {
+				t.Errorf("%s ownerRef.Name = %q, want %q", kind, ref.Name, parent.Name)
+			}
+			if ref.APIVersion != armadav1.GroupVersion.String() {
+				t.Errorf("%s ownerRef.APIVersion = %q, want %q", kind, ref.APIVersion, armadav1.GroupVersion.String())
+			}
+			if ref.Controller == nil || !*ref.Controller {
+				t.Errorf("%s ownerRef.Controller must be true (marks BC as the controlling owner)", kind)
+			}
+			if ref.BlockOwnerDeletion == nil || !*ref.BlockOwnerDeletion {
+				t.Errorf("%s ownerRef.BlockOwnerDeletion must be true (finalizer safety)", kind)
+			}
+			return
+		}
+		t.Fatalf("%s: no BackupConfig ownerReference found; refs = %+v", kind, refs)
+	}
+
+	sched := &unstructured.Unstructured{}
+	sched.SetGroupVersionKind(veleroScheduleGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: testVeleroNs, Name: veleroScheduleName(bc),
+	}, sched); err != nil {
+		t.Fatalf("get velero schedule: %v", err)
+	}
+	assertControllerOwnerRef(t, "velero Schedule", sched.GetOwnerReferences())
+
+	var cj batchv1.CronJob
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: testEtcdNs, Name: etcdCronJobName(bc),
+	}, &cj); err != nil {
+		t.Fatalf("get etcd cronjob: %v", err)
+	}
+	assertControllerOwnerRef(t, "etcd CronJob", cj.OwnerReferences)
+}
+
+// TestReconcile_BackfillsOwnerReferenceOnPreExistingSubResources catches the
+// class of bug the pre-diff-then-maybe-apply pattern used to have: pre-existing
+// sub-resources whose spec already matched intent would keep missing metadata
+// (OwnerReferences, labels) forever because the delta short-circuit skipped
+// the SSA apply. The convention (cert-manager, cluster-api, kubebuilder
+// samples) is always-apply — SSA is idempotent. This test simulates an upgrade
+// from an older bc-controller by pre-populating a Velero Schedule + etcd
+// CronJob with matching specs but NO OwnerReferences, then asserting the
+// OwnerReferences are backfilled on the next reconcile.
+func TestReconcile_BackfillsOwnerReferenceOnPreExistingSubResources(t *testing.T) {
+	bc := sampleBackupConfig()
+
+	// Velero Schedule: spec matches sampleBackupConfig's intent exactly.
+	sched := &unstructured.Unstructured{}
+	sched.SetGroupVersionKind(veleroScheduleGVK)
+	sched.SetNamespace(testVeleroNs)
+	sched.SetName(veleroScheduleName(bc))
+	_ = unstructured.SetNestedField(sched.Object, "0 2 * * *", "spec", "schedule")
+	_ = unstructured.SetNestedField(sched.Object, "default", "spec", "template", "storageLocation")
+	_ = unstructured.SetNestedField(sched.Object, false, "spec", "paused")
+
+	// etcd CronJob: spec matches sampleBackupConfig's intent exactly.
+	cj := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: etcdCronJobName(bc), Namespace: testEtcdNs},
+		Spec: batchv1.CronJobSpec{
+			Schedule: "0 3 * * *",
+			Suspend:  ptr.To(false),
+			JobTemplate: batchv1.JobTemplateSpec{
+				Spec: batchv1.JobSpec{Template: makeEtcdPodSpec("etcd-backups")},
+			},
+		},
+	}
+
+	r, c := newReconciler(t, bc, sched, cj)
+
+	_, err := r.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Name: bc.Name},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	// Fetch fresh — must see the OwnerReference the reconcile wrote.
+	liveSched := &unstructured.Unstructured{}
+	liveSched.SetGroupVersionKind(veleroScheduleGVK)
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: testVeleroNs, Name: veleroScheduleName(bc),
+	}, liveSched); err != nil {
+		t.Fatalf("get velero schedule: %v", err)
+	}
+	if !hasControllerOwnerRef(liveSched.GetOwnerReferences(), "BackupConfig", bc.Name) {
+		t.Errorf("velero Schedule missing BackupConfig OwnerReference after reconcile-with-matching-spec; refs = %+v", liveSched.GetOwnerReferences())
+	}
+
+	var liveCJ batchv1.CronJob
+	if err := c.Get(context.Background(), types.NamespacedName{
+		Namespace: testEtcdNs, Name: etcdCronJobName(bc),
+	}, &liveCJ); err != nil {
+		t.Fatalf("get etcd cronjob: %v", err)
+	}
+	if !hasControllerOwnerRef(liveCJ.OwnerReferences, "BackupConfig", bc.Name) {
+		t.Errorf("etcd CronJob missing BackupConfig OwnerReference after reconcile-with-matching-spec; refs = %+v", liveCJ.OwnerReferences)
+	}
+}
+
+// hasControllerOwnerRef reports whether refs contains an OwnerReference of
+// the given Kind + Name with Controller=true. Used by ownership-backfill
+// tests; separate from the stricter assertControllerOwnerRef closure in
+// TestReconcile_SubResourcesCarryOwnerReference (which also verifies
+// APIVersion and BlockOwnerDeletion).
+func hasControllerOwnerRef(refs []metav1.OwnerReference, kind, name string) bool {
+	for _, ref := range refs {
+		if ref.Kind == kind && ref.Name == name && ref.Controller != nil && *ref.Controller {
+			return true
+		}
+	}
+	return false
+}
+
 func TestReconcile_NoBlocksNoOp(t *testing.T) {
 	bc := &armadav1.BackupConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "empty"},
@@ -311,7 +454,7 @@ func TestReadLiveObserved_LivesResourcesPresent(t *testing.T) {
 	_ = unstructured.SetNestedField(sched.Object, false, "spec", "paused")
 
 	cj := &batchv1.CronJob{
-		ObjectMeta: metav1.ObjectMeta{Name: "colo-cluster-001-etcd-backup", Namespace: testEtcdNs},
+		ObjectMeta: metav1.ObjectMeta{Name: "colo-cluster-001-etcd", Namespace: testEtcdNs},
 		Spec: batchv1.CronJobSpec{
 			Schedule: "0 3 * * *",
 			Suspend:  ptr.To(false),
@@ -396,7 +539,7 @@ func TestReadLiveObserved_UnmanagedMechanismStayNil(t *testing.T) {
 	// still report etcd as nil — we don't observe mechanisms the CR does
 	// not ask us to manage.
 	strayCj := &batchv1.CronJob{
-		ObjectMeta: metav1.ObjectMeta{Name: "colo-cluster-001-etcd-backup", Namespace: testEtcdNs},
+		ObjectMeta: metav1.ObjectMeta{Name: "colo-cluster-001-etcd", Namespace: testEtcdNs},
 		Spec:       batchv1.CronJobSpec{Schedule: "0 3 * * *"},
 	}
 	r, _ := newReconciler(t, strayCj)

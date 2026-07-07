@@ -1,0 +1,28 @@
+# ServiceMonitor for sc-controller (`configbundle-serverconfig-controller-metrics` Service).
+# Companion to monitor.yaml — see that file for the rationale on the
+# `release: kube-prometheus-stack` label.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: configbundle-serverconfig-controller
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: serverconfig-controller
+    app.kubernetes.io/managed-by: kustomize
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - configbundle-system
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: serverconfig-controller
+  endpoints:
+    - port: https
+      path: /metrics
+      scheme: https
+      interval: 30s
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        insecureSkipVerify: true

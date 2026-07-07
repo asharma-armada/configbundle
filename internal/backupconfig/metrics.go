@@ -83,7 +83,7 @@ var (
 
 	etcdCronJobPresent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "configbundle_backup_etcd_cronjob_present",
-		Help: "1 when the live etcd-backup CronJob for this BackupConfig exists on-cluster; 0 when spec.etcd is set but the live resource is missing.",
+		Help: "1 when the live etcd CronJob for this BackupConfig exists on-cluster; 0 when spec.etcd is set but the live resource is missing.",
 	}, []string{"cluster"})
 )
 

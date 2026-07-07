@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -65,13 +66,25 @@ func (r *BackupConfigReconciler) reconcileVelero(ctx context.Context, bc *armada
 		return "", fmt.Errorf("build velero spec: %w", err)
 	}
 
+	// OwnerReference ties the Schedule's lifecycle to the BackupConfig CR:
+	// deleting the BC cascades to the Schedule via native K8s GC. Cluster-
+	// scoped parent → namespaced child is a documented K8s pattern (see
+	// cert-manager's ClusterIssuer → Certificate).
+	if err := ctrl.SetControllerReference(bc, desired, r.Scheme); err != nil {
+		return "", fmt.Errorf("set owner on velero schedule: %w", err)
+	}
+
+	// Compute what will change on this reconcile. Used ONLY to produce the
+	// summary written to status.recentPatches — NOT to gate the apply.
+	// Gating on spec-deltas is an anti-pattern: it silently skips metadata
+	// reconciliation (OwnerReferences, labels, finalizers), so any pre-
+	// existing Schedule whose spec matches intent keeps missing whatever
+	// metadata bc-controller wants to backfill. Convention (cert-manager,
+	// cluster-api, kubebuilder samples): SSA is idempotent — always apply,
+	// let the API server do the work.
 	deltas, err := veleroDeltas(ctx, r.Client, r.VeleroNamespace, name, block)
 	if err != nil {
 		return "", err
-	}
-	if len(deltas) == 0 {
-		logger.V(1).Info("velero schedule already matches intent", "name", name)
-		return "", nil
 	}
 
 	if err := r.Patch(ctx, desired, client.Apply,
@@ -81,6 +94,10 @@ func (r *BackupConfigReconciler) reconcileVelero(ctx context.Context, bc *armada
 		return "", fmt.Errorf("ssa patch velero schedule %s/%s: %w", r.VeleroNamespace, name, err)
 	}
 
+	if len(deltas) == 0 {
+		logger.V(1).Info("velero schedule already matches intent (metadata reconciled)", "name", name)
+		return "", nil
+	}
 	return formatBlockDeltas(fmt.Sprintf("velero/%s", name), deltas), nil
 }
 
