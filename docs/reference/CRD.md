@@ -10,15 +10,20 @@ configbundle defines `ConfigBundle` and `ServerConfig` CRDs in `api/v1/`. The Co
 
 ---
 
-## Key decisions
+## Settled Decisions
 
 - **apiVersion: `armada.ai/v1`** — all CRD types in this repo use this group. Do not use `configbundle.armada.ai` or any other variant.
 - **SSA everywhere** — the ConfigBundle Controller applies all resources via Server-Side Apply. No direct creates or full-object updates.
-- **Field managers are fixed** — `configbundle-controller` for all SSA writes by the controller (both ConfigBundle CR spec and child CRs). Local admin overrides use `local:<admin-id>` on the ConfigBundle CR only.
-- **ownerReferences on child CRs** — the ConfigBundle Controller sets ownerReferences so deleting a `ConfigBundle` CR cascades to domain child CRs (ServerConfig, etc.).
-- **Child CR name = `strings.ToLower(hostname)`** — following Tinkerbell/CAPI convention. Hostname is human-readable and stable for the life of a server's role. The `serviceTag` is propagated into `spec.serviceTag` for Redfish targeting.
-- **Bool fields must not use `omitempty`** — omitempty on a bool field causes `false` (Go zero value) to be omitted from the SSA patch payload, making the controller unable to enforce `false` as desired state. All desired-state bool fields in `IdracSpec` have no omitempty.
-- **Unknown fields are ignored** — the controller must not fail on fields in the ConfigBundle manifest it doesn't recognize. Forward compatibility.
+- **Field managers are fixed** — `configbundle-controller` for all SSA writes by the controller. Local admin overrides use `local:<admin-id>` on the ConfigBundle CR only, never on child CRs.
+- **ownerReferences on child CRs** — deleting a `ConfigBundle` CR cascades to domain child CRs (ServerConfig, BackupConfig).
+- **Unknown fields are ignored** — the controller must not fail on manifest fields it doesn't recognize. Forward-compatible.
+- **Server identity model** — `serviceTag` in spec, `strings.ToLower(hostname)` as the K8s resource name. `hostname` and `oobIP` are mandatory; bundler skips servers missing either. `serviceTag` is repeated in spec because the resource name isn't reliably reconstructable from it.
+- **All 8 orbital `IdracSettings` fields are desired-state spec fields** — `firmwareVersion` means "we intend this version," not a snapshot of current hardware.
+- **Overridable leaves are pointers with `omitempty`** — `IdracSpec` booleans are `*bool`, string leaves are `*string,omitempty`. A nil leaf means "no manager has set this field." Callers must dereference safely. `ServerSpec.ServiceTag` stays plain string — it's the listMapKey and always required. Do NOT drop `omitempty` here: nilifying admin-owned fields before the apply is what makes partial SSA work.
+- **Bool fields on the CRD do NOT use `omitempty` unless they are pointers** — omitempty on a plain bool omits `false` (Go zero value) from the SSA patch, making the controller unable to enforce `false` as desired state.
+- **ConfigBundle and ServerConfig are cluster-scoped; per-bundle ConfigMaps and Secrets stay namespaced.** cb-controller writes children to `CHILD_NAMESPACE` (default `configbundle-system`). Invariant: one ConfigBundle per datacenter per cluster. Not enforced by admission validation yet.
+- **Every level that orbital identifies as a ConfigItem carries its own `OrbID` field on the CRD type** (e.g. `IdracSpec.OrbID`). Bundler queries orbital and populates; controller reads directly. New nested types (BIOS, NIC, ...) follow the same pattern.
+- **No mapping OCI layer, no path→orbId translation on the wire.** Do NOT reintroduce a separate mapping layer — an earlier design shipped one as a second OCI layer and produced a persistent 409 race (mapping dispatch arrived before `Status.LastAppliedDigest` was written). Saturating orbIds on the CR closes the race by deletion.
 
 ---
 
@@ -54,7 +59,7 @@ status:
   lastOrbImportID: "abc123-def456-..."   # X-Orb-Import-ID for orb correlation
   lastAppliedAt: "2026-05-26T12:00:00Z"
 
-  # Written only by the divergence-reporter. See edge-context.md for the
+  # Written only by the divergence-reporter. See EDGE.md for the
   # dedup + steady-state-quiet semantics that read from these fields.
   divergenceReporting:
     lastPostedAt: "2026-05-26T12:00:30Z"
@@ -158,7 +163,7 @@ When a manager applies a manifest containing a field owned by another manager, t
 
 **Shared manager deadlock:** Once co-owned (Resolution #3), neither owner can change the value without the other first releasing ownership. Use with caution.
 
-These behaviors map to the cloud admin resolution actions in orbital-context.md:
+These behaviors map to the cloud admin resolution actions in ORBITAL.md:
 - Force → Resolution #1
 - Accept (incorporate local value upstream) → Resolution #3, then local-user releases ownership
 - Ignore → Resolution #2 (upstream omits the field from future bundles)
@@ -178,8 +183,7 @@ These behaviors map to the cloud admin resolution actions in orbital-context.md:
 ## External references
 
 - [kubebuilder book](https://book.kubebuilder.io/)
-- [CRD design decisions: server domain](../../docs/decisions/002-crd-design-server.md)
-- [SSA field ownership model](../../docs/claude/edge-context.md)
+- [SSA field ownership model](./EDGE.md)
 
 ---
 

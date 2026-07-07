@@ -45,9 +45,53 @@ type Omission struct {
 
 // DataCenterResult is the GraphQL response shape for a DataCenter node.
 type DataCenterResult struct {
-	Name    string         `json:"name"`
-	OrbID   string         `json:"orbId"`
-	Servers []ServerResult `json:"servers"`
+	Name               string                    `json:"name"`
+	OrbID              string                    `json:"orbId"`
+	Servers            []ServerResult            `json:"servers"`
+	KubernetesClusters []KubernetesClusterResult `json:"kubernetesClusters"`
+}
+
+// KubernetesClusterResult is the GraphQL response shape for a
+// KubernetesCluster node. Only the fields cb-controller consumes for
+// decomposition are mapped — cluster identity (orbId, name) and its backup
+// grouping. Non-backup cluster fields (kubernetesVersion, cni, etc.) are
+// omitted here; add them when a downstream child CR needs them.
+type KubernetesClusterResult struct {
+	OrbID  string               `json:"orbId"`
+	Name   string               `json:"name"`
+	Backup *ClusterBackupResult `json:"backup"`
+}
+
+// ClusterBackupResult mirrors the orbital ClusterBackup grouping node.
+// Any of etcd/velero/s3Sync may be null — cluster with only etcd configured
+// omits the other two edges from the graph.
+type ClusterBackupResult struct {
+	OrbID  string              `json:"orbId"`
+	Etcd   *EtcdBackupResult   `json:"etcd"`
+	Velero *VeleroBackupResult `json:"velero"`
+	S3Sync *S3SyncResult       `json:"s3Sync"`
+}
+
+// EtcdBackupResult / VeleroBackupResult / S3SyncResult all mirror orbital
+// nodes with identical field names on both sides — matches the schema
+// alignment established 2026-07-06 (see feedback/orbital-schema-alignment).
+type EtcdBackupResult struct {
+	OrbID    string `json:"orbId"`
+	Enabled  bool   `json:"enabled"`
+	Schedule string `json:"schedule"`
+	Location string `json:"location"`
+}
+
+type VeleroBackupResult struct {
+	OrbID    string `json:"orbId"`
+	Enabled  bool   `json:"enabled"`
+	Schedule string `json:"schedule"`
+	Location string `json:"location"`
+}
+
+type S3SyncResult struct {
+	OrbID   string `json:"orbId"`
+	Enabled bool   `json:"enabled"`
 }
 
 // ServerResult is the GraphQL response shape for a Server node.
@@ -91,6 +135,11 @@ type divergenceEntry struct {
 // configBundleQuery filters by orbId — DataCenter.orbId is
 // @search(by: [hash]) which generates StringHashFilter (supports `eq`).
 // Verified working against the live DGraph schema 2026-06-12.
+//
+// kubernetesClusters + backup subtree added 2026-07-07. Each cluster's
+// backup grouping (ClusterBackup) fans out to its per-mechanism children;
+// null edges are legal (a cluster with only etcd configured has velero and
+// s3Sync as null on the ClusterBackup).
 const configBundleQuery = `
 query ConfigBundleByOrbID($orbId: String!) {
   queryDataCenter(filter: { orbId: { eq: $orbId } }) {
@@ -113,6 +162,37 @@ query ConfigBundleByOrbID($orbId: String!) {
         usbManagementPortEnabled
         dhcpEnabled
         racadmEnabled
+      }
+    }
+    kubernetesClusters {
+      # KubernetesCluster is an INTERFACE that does NOT itself extend
+      # ConfigItem -- only concrete implementations (EksaKubernetesCluster
+      # etc.) implement both. Use an inline fragment on ConfigItem to reach
+      # orbId + name across all cluster types. The backup field lives
+      # directly on the KubernetesCluster interface so no fragment needed
+      # there.
+      ... on ConfigItem {
+        orbId
+        name
+      }
+      backup {
+        orbId
+        etcd {
+          orbId
+          enabled
+          schedule
+          location
+        }
+        velero {
+          orbId
+          enabled
+          schedule
+          location
+        }
+        s3Sync {
+          orbId
+          enabled
+        }
       }
     }
   }

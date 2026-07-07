@@ -1,8 +1,8 @@
-Review the current diff against domain context files and surface what needs to be updated before this PR merges.
+Review the current diff against topic reference docs and surface what needs to be updated before this PR merges.
 
 **Usage:** `/pr-context [domain]`
-- With domain: `/pr-context api` — checks diff against `docs/claude/api-context.md` only
-- Without domain: auto-detects relevant domain files from the diff
+- With domain: `/pr-context API` — checks diff against `docs/reference/API.md` only
+- Without domain: auto-detects relevant topic docs from the diff
 
 This is Step 3 of the Context Commit Protocol — the `terraform plan` equivalent. It shows what would change in context before you commit it.
 
@@ -14,27 +14,26 @@ Run `git diff main...HEAD` to get all changes in this branch. If that produces n
 
 ---
 
-## Step 2 — Identify relevant domain files
+## Step 2 — Identify relevant topic docs
 
 If a domain was specified: use that file only.
 
-If no domain was specified: read `docs/claude/_index.md`, then match changed file paths against the routing table to identify which domain files are relevant. A PR touching `/src/api/` and `/src/db/` is relevant to both `api-context.md` and `data-context.md`.
+If no domain was specified: read the Reference Index in `CLAUDE.md`, then match changed file paths against the routing table to identify which topic docs are relevant. A PR touching `/internal/bundler/` and `/internal/controller/` is relevant to both `API.md` and `EDGE.md`.
 
-Read every relevant domain file in full.
+Read every relevant topic doc in full.
 
 ---
 
-## Step 3 — Compare diff against domain files
+## Step 3 — Compare diff against topic docs
 
-For each relevant domain file, identify:
+For each relevant topic doc, identify:
 
-**New settled decisions** — choices made in this diff that aren't in the domain file.
+**New settled decisions** — choices made in this diff that aren't in the topic doc's `## Settled Decisions` section.
 Look for: new patterns introduced, existing patterns changed, constraints added or removed, library or dependency choices, error handling conventions, naming conventions, anything the team would want future Claude sessions to know.
 
-**Outdated entries** — content in the domain file that this diff contradicts or supersedes.
-Look for: old patterns the diff replaces, decisions this diff reverses, conventions this diff breaks intentionally.
+**Outdated entries** — content in the topic doc that this diff contradicts or supersedes. UPDATE in place — don't add a superseding record.
 
-**New gotchas** — failure modes or non-obvious behaviors introduced by this diff.
+**New gotchas** — failure modes or non-obvious behaviors introduced by this diff. Prefer "do NOT reintroduce X" landmine framing over background narrative.
 
 ---
 
@@ -47,18 +46,12 @@ If updates are needed, use this format:
 
 ```
 ─────────────────────────────────
-Context Diff — [domain-file]
+Context Diff — docs/reference/[TOPIC].md
 ─────────────────────────────────
-ADD to Key decisions:
-  • [Decision] — [one-line rationale]
+ADD to Settled Decisions:
+  • [Rule] — [one-line justification if non-obvious]
 
-ADD to Conventions:
-  • [Convention or rule]
-
-ADD to Gotchas:
-  • [Gotcha title] — [what happens and how to avoid it]
-
-UPDATE (superseded):
+UPDATE (superseded — edit in place):
   • Line: "[old content]"
     Replace with: "[new content]"
 ─────────────────────────────────
@@ -66,7 +59,7 @@ UPDATE (superseded):
 
 Only include sections that have entries. Skip empty sections.
 
-If multiple domain files need updates, output a separate block for each.
+If multiple topic docs need updates, output a separate block for each.
 
 ---
 
@@ -74,9 +67,9 @@ If multiple domain files need updates, output a separate block for each.
 
 After the diff output, say:
 
-> "Review the proposed additions above. To apply them, say `apply context` and I'll update the domain file(s) in place. These updates should be committed in this PR — not deferred."
+> "Review the proposed additions above. To apply them, say `apply context` and I'll update the topic doc(s) in place. These updates should be committed in this PR — not deferred."
 
-If the developer says `apply context`: make the edits to the domain file(s) directly. Do not ask for confirmation a second time.
+If the developer says `apply context`: make the edits to the topic doc(s) directly. Do not ask for confirmation a second time.
 
 ---
 

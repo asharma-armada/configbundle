@@ -1,8 +1,15 @@
 // serverconfig-controller — watches ServerConfig CRs and reconciles iDRAC
 // settings via Redfish on whitelisted BMCs.
+//
+// Flag surface mirrors cb-controller's kubebuilder-scaffolded shape:
+// operator-standard settings (metrics-bind-address, health-probe, leader-elect,
+// metrics-secure, enable-http2) are FLAGS; domain config (IDRAC_*) stays in
+// envconfig. This lets `manager_metrics_patch.yaml` target `kind: Deployment`
+// uniformly across all three controllers without name selectors.
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"os"
 	"strings"
@@ -17,17 +24,15 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	armadav1 "github.com/armada/configbundle/api/v1"
 	"github.com/armada/configbundle/internal/serverconfig"
 )
 
-// Config holds all controller configuration. Defaults target the prototype
-// lab setup so `make run-controller` works without env-var soup. Production
-// deploys override via ConfigMap/Deployment env. None of the defaults carry
-// secrets — credentials live exclusively in the K8s Secret named by
-// IDRAC_CREDENTIALS_SECRET.
+// Config holds domain configuration. Operator-standard settings (bind
+// addresses, leader-elect, TLS) live as flags — see main() below.
 type Config struct {
 	// OobAllowlist is the comma-separated list of OOB IPs the controller may
 	// reconcile against. Empty = controller reconciles NOTHING. Default points
@@ -53,11 +58,6 @@ type Config struct {
 	// only, no periodic poll. Production deploys opt in via the K8s manifest
 	// — typical band is 1-5min; tighter intervals add load on iDRAC firmware.
 	ObserveInterval time.Duration `envconfig:"IDRAC_OBSERVE_INTERVAL" default:"0s"`
-
-	// MetricsBindAddress is the listen address for the Prometheus /metrics
-	// endpoint. "0" disables it. Default :8093 sits next to the health probe
-	// on :8092 — neither conflicts with cb-controller's :8091/:8095.
-	MetricsBindAddress string `envconfig:"METRICS_BIND_ADDRESS" default:":8093"`
 }
 
 // parseAllowlist splits a comma-separated string into a set, trimming
@@ -83,15 +83,47 @@ func init() {
 	utilruntime.Must(armadav1.AddToScheme(scheme))
 }
 
+// nolint:gocyclo
 func main() {
+	var metricsAddr string
 	var probeAddr string
-	// Port 8092 — cb-controller uses 8091 for probe + 8095 for dispatch; pick a free one.
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8092", "Health probe bind address.")
+	var enableLeaderElection bool
+	var secureMetrics bool
+	var enableHTTP2 bool
+	var tlsOpts []func(*tls.Config)
+	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
+		"Use :8443 for HTTPS or :8093 for HTTP, or leave as 0 to disable the metrics service.")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8092", "The address the probe endpoint binds to.")
+	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
+		"Enable leader election for controller manager. "+
+			"Enabling this will ensure there is only one active controller manager.")
+	flag.BoolVar(&secureMetrics, "metrics-secure", true,
+		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
+	flag.BoolVar(&enableHTTP2, "enable-http2", false,
+		"If set, HTTP/2 will be enabled for the metrics server.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Disable HTTP/2 unless explicitly enabled — protects against the HTTP/2
+	// Stream Cancellation and Rapid Reset CVEs. Matches cb-controller.
+	if !enableHTTP2 {
+		tlsOpts = append(tlsOpts, func(c *tls.Config) { c.NextProtos = []string{"http/1.1"} })
+	}
+
+	metricsServerOptions := metricsserver.Options{
+		BindAddress:   metricsAddr,
+		SecureServing: secureMetrics,
+		TLSOpts:       tlsOpts,
+	}
+	if secureMetrics {
+		// FilterProvider protects the metrics endpoint with authn/authz — same
+		// RBAC-based setup cb-controller uses. Prom scrape needs a
+		// ServiceAccount token with the metrics-reader ClusterRole.
+		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
 
 	var cfg Config
 	if err := envconfig.Process("", &cfg); err != nil {
@@ -101,8 +133,10 @@ func main() {
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: cfg.MetricsBindAddress},
+		Metrics:                metricsServerOptions,
 		HealthProbeBindAddress: probeAddr,
+		LeaderElection:         enableLeaderElection,
+		LeaderElectionID:       "sc.configbundle.armada.ai",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -131,7 +165,7 @@ func main() {
 		setupLog.Info("iDRAC field allowlist loaded", "count", len(fieldAllowlist), "fields", fields)
 	}
 	if unknown := serverconfig.UnknownAllowlistEntries(fieldAllowlist); len(unknown) > 0 {
-		setupLog.Info("WARNING: IDRAC_FIELD_ALLOWLIST contains entries this controller does not recognize — they will be ignored. Check spelling against IdracSpec JSON tags.",
+		setupLog.Info("WARNING: IDRAC_FIELD_ALLOWLIST contains entries this controller does not recognize — they will be ignored. Check spelling against IdracSettingsSpec JSON tags.",
 			"unknown", unknown, "known", serverconfig.KnownIdracFields)
 	}
 
@@ -165,7 +199,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting manager", "probe", probeAddr, "metrics", cfg.MetricsBindAddress)
+	setupLog.Info("starting manager", "probe", probeAddr, "metrics", metricsAddr, "secureMetrics", secureMetrics, "leaderElection", enableLeaderElection)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)

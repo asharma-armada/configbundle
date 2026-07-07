@@ -26,7 +26,7 @@
 - **Enrichment is all-or-nothing.** A non-2xx response from the bundler causes Orbital to mark the publish failed and push nothing. Partial artifacts are never produced.
 - **Orbital never imports configbundle.** Dependency flows one way: configbundle calls Orbital's GraphQL API. No reverse imports.
 - **CMDB is not in the reconciliation path.** After a ConfigBundle lands on a Galleon, Orbital has no further role. ConfigBundle Controller and X Config Controllers run locally and reconcile from the CRD.
-- **Orb is the single artifact ingress at the edge.** Orb pulls from Zot, cosign-verifies, imports graph layers to DGraph, then dispatches each remaining layer to registered consumers by media type. CB Controller is a consumer — it receives the manifest layer via `POST /dispatch` (content-routed by `Content-Type`). After ADR-011 the mapping layer no longer exists; the manifest is the sole layer dispatched to CB Controller. CB Controller never holds OCI credentials.
+- **Orb is the single artifact ingress at the edge.** Orb pulls from Zot, cosign-verifies, imports graph layers to DGraph, then dispatches each remaining layer to registered consumers by media type. CB Controller is a consumer — it receives the manifest layer via `POST /dispatch` (content-routed by `Content-Type`). The manifest is the sole layer dispatched to CB Controller; there is no separate mapping layer. CB Controller never holds OCI credentials.
 - **Orb owns Dgraph import.** Configbundle never calls orb's import API. Orb is responsible for getting graph data into its own database. The ConfigBundle CR is the handoff artifact — orb reacts to it independently.
 
 ## Current State
@@ -65,36 +65,17 @@ Start a new session after each natural milestone (feature done, spike complete, 
 
 ## Reference Index
 
-### Domain files
+Read the relevant topic doc before starting work in that area. Each doc's `## Settled Decisions` section carries the current rules. **When a decision is made, add a bullet to the relevant topic doc — not to CLAUDE.md. Do NOT create separate ADR files.**
 
-Read the relevant file before starting work in that area. Each file contains settled decisions, patterns, and gotchas. **When a decision is made, document it in the domain file — not in CLAUDE.md.**
-
-| Working on | File |
+| Working on | Read |
 |---|---|
-| Bundler HTTP service, enricher API, Orbital GraphQL integration | `docs/claude/api-context.md` |
-| OCI artifact structure, layers, media types, signing, tags | `docs/claude/bundle-context.md` |
-| CRD types, ConfigBundle CR, kubebuilder annotations, SSA | `docs/claude/crd-context.md` |
-| Edge agent, Zot registry, cosign verification, divergence | `docs/claude/edge-context.md` |
-| Orbital GraphQL data model, bundler query logic, ConfigBundle manifest YAML, local overrides | `docs/claude/orbital-context.md` |
-| Planning or starting any spike | `ROADMAP.md` |
-
-See [`docs/claude/_index.md`](docs/claude/_index.md) for the full routing table.
-
-### Decision records
-
-Architecture decisions with full rationale. Read when the context would otherwise be invisible from the code.
-
-| When working on | Read |
-|---|---|
-| CRD domain routing (which domain file to read) | `docs/decisions/001-domain-routing.md` |
-| CRD design for server domain | `docs/decisions/002-crd-design-server.md` |
-| Divergence `when` field semantics | `docs/decisions/004-divergence-when-semantics.md` |
-| Divergence mapping layer (D2 decision) | `docs/decisions/005-divergence-mapping-layer.md` |
-| Takeover pipeline ordering in consume handler | `docs/decisions/006-divergence-takeover-pipeline.md` |
-| Releasing stale managedFields claims after takeover | `docs/decisions/008-managedfields-release.md` |
-| Local release auto-reverts to last-imported intent (handback) | `docs/decisions/009-edge-handback-via-release.md` |
+| Bundler HTTP service, enricher API, Orbital GraphQL integration | `docs/reference/API.md` |
+| OCI artifact structure, layers, media types, signing, tags | `docs/reference/BUNDLE.md` |
+| CRD types, ConfigBundle CR, kubebuilder annotations, SSA | `docs/reference/CRD.md` |
+| Edge dispatch, cosign verification, divergence, takeover, reclaim | `docs/reference/EDGE.md` |
+| Orbital GraphQL data model, bundler query logic, local overrides | `docs/reference/ORBITAL.md` |
 | OCI bundler pipeline, ConfigBundle integration | `~/armada/orbital/docs/configbundle-integration.md` |
-| Divergence contract (cb-controller obligations) | `docs/plans/divergence-cb-controller-contract.md` |
+| Planning or starting any spike | `ROADMAP.md` |
 
 ## Local Development
 
@@ -114,7 +95,7 @@ make test-e2e-local    # e2e against running controller (requires make install +
 
 ## Repository Structure
 
-`api/v1/` — CRD types (ConfigBundle, ServerConfig). `bundle/` — OCI media type constants. `cmd/` — entry points (`main.go` controller, `bundler/main.go`). `internal/controller/` — controller logic (ConsumeServer, Reconciler, DivergenceReporter, takeover). `internal/bundler/` — bundler HTTP service. `config/` — kubebuilder manifests. `docs/claude/` — domain reference files. `docs/decisions/` — ADRs. `docs/plans/` — implementation plans. `test/` — e2e tests.
+`api/v1/` — CRD types (ConfigBundle, ServerConfig, BackupConfig). `bundle/` — OCI media type constants. `cmd/` — entry points (controller, bundler, serverconfig, backupconfig). `internal/controller/` — cb-controller logic (ConsumeServer, Reconciler, DivergenceReporter, takeover, reclaim). `internal/bundler/` — bundler HTTP service. `internal/serverconfig/` + `internal/backupconfig/` — sibling controllers. `config/` — kubebuilder manifests. `docs/reference/` — topic docs with inline Settled Decisions. `docs/playbooks/` — task recipes. `docs/runbooks/` — operational troubleshooting. `test/` — e2e tests.
 
 ## Working Style
 

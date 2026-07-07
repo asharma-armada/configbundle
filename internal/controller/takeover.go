@@ -79,7 +79,7 @@ func (s *ConsumeServer) processTakeover(ctx context.Context, fullSpec armadav1.C
 	// reconcileLocalClaims (called from applyManifest, unconditional). Keeping
 	// it out of processTakeover means one uniform pass whether or not there's
 	// takeover in this bundle — same code path for takeover cleanup and inert-
-	// residual cleanup. See docs/decisions/008-managedfields-release.md.
+	// residual cleanup. See docs/reference/EDGE.md § Settled Decisions.
 
 	if len(errs) > 0 {
 		return fmt.Errorf("%d of %d takeover entries failed", len(errs), len(fullSpec.Takeover))

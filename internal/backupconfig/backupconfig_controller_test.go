@@ -27,23 +27,31 @@ func testLogger() logr.Logger { return logr.Discard() }
 // makeEtcdPodSpec builds a minimal PodTemplateSpec matching the shape
 // buildEtcdCronJob writes: one container named etcdBackupContainerName with
 // the location wired through BACKUP_LOCATION env. Used by observed-status
-// tests that need a live CronJob to read.
-func makeEtcdPodSpec(location string) corev1.PodTemplateSpec {
+// tests that need a live CronJob to read. The container name and env-var
+// name match what buildEtcdCronJob produces so observed / delta reads on the
+// fake client find the fields they expect.
+func makeEtcdPodSpec(container string) corev1.PodTemplateSpec {
 	return corev1.PodTemplateSpec{
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{
-				Name:  etcdBackupContainerName,
-				Image: testImage,
-				Env:   []corev1.EnvVar{{Name: etcdBackupLocationEnv, Value: location}},
+				Name:  etcdSnapshotWriterContainerName,
+				Image: testUploadImage,
+				Env: []corev1.EnvVar{
+					{Name: "STORAGE_ACCOUNT", Value: testStorageAccount},
+					{Name: "STORAGE_CONTAINER", Value: container},
+				},
 			}},
 		},
 	}
 }
 
 const (
-	testVeleroNs = "velero"
-	testEtcdNs   = "kube-system"
-	testImage    = "test/etcd-snapshot:test"
+	testVeleroNs       = "velero"
+	testEtcdNs         = "kube-system"
+	testEtcdctlImage   = "test/etcdctl:test"
+	testUploadImage    = "test/azure-cli:test"
+	testCredSecret     = "test-az-creds"
+	testStorageAccount = "teststorage"
 )
 
 func newReconciler(t *testing.T, objs ...client.Object) (*BackupConfigReconciler, client.Client) {
@@ -65,7 +73,9 @@ func newReconciler(t *testing.T, objs ...client.Object) (*BackupConfigReconciler
 		Scheme:              scheme,
 		VeleroNamespace:     testVeleroNs,
 		EtcdBackupNamespace: testEtcdNs,
-		EtcdBackupImage:     testImage,
+		EtcdctlImage:        testEtcdctlImage,
+		UploadImage:         testUploadImage,
+		CredentialSecret:    testCredSecret,
 	}
 	return r, c
 }
@@ -74,7 +84,8 @@ func sampleBackupConfig() *armadav1.BackupConfig {
 	return &armadav1.BackupConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "colo-cluster-001"},
 		Spec: armadav1.BackupConfigSpec{
-			OrbID: "colo:cluster-001",
+			OrbID:        "colo:cluster-001-backup",
+			ClusterOrbID: "colo:cluster-001",
 			Velero: &armadav1.VeleroBackupSpec{
 				OrbID:    "colo:cluster-001-velero",
 				Enabled:  ptr.To(true),
@@ -85,7 +96,7 @@ func sampleBackupConfig() *armadav1.BackupConfig {
 				OrbID:    "colo:cluster-001-etcd",
 				Enabled:  ptr.To(true),
 				Schedule: ptr.To("0 3 * * *"),
-				Location: ptr.To("s3://backups/etcd"),
+				Location: ptr.To("https://teststorage.blob.core.windows.net/etcd-backups/colo/cluster-001"),
 			},
 		},
 	}
@@ -133,12 +144,24 @@ func TestReconcile_CreatesVeleroScheduleAndEtcdCronJob(t *testing.T) {
 	if cj.Spec.Suspend != nil && *cj.Spec.Suspend {
 		t.Errorf("etcd suspend: expected false (Enabled=true)")
 	}
-	containers := cj.Spec.JobTemplate.Spec.Template.Spec.Containers
-	if len(containers) != 1 || containers[0].Image != testImage {
-		t.Errorf("etcd container image: got %+v", containers)
+	podSpec := cj.Spec.JobTemplate.Spec.Template.Spec
+	if len(podSpec.InitContainers) != 1 || podSpec.InitContainers[0].Image != testEtcdctlImage {
+		t.Errorf("etcd initContainer (snapshot-taker): expected image %q, got %+v", testEtcdctlImage, podSpec.InitContainers)
 	}
-	if envValue(containers[0].Env, etcdBackupLocationEnv) != "s3://backups/etcd" {
-		t.Errorf("etcd BACKUP_LOCATION: got %q", envValue(containers[0].Env, etcdBackupLocationEnv))
+	if len(podSpec.Containers) != 1 || podSpec.Containers[0].Image != testUploadImage {
+		t.Errorf("etcd main container (snapshot-writer): expected image %q, got %+v", testUploadImage, podSpec.Containers)
+	}
+	if envValue(podSpec.Containers[0].Env, "STORAGE_ACCOUNT") != "teststorage" {
+		t.Errorf("etcd STORAGE_ACCOUNT: got %q", envValue(podSpec.Containers[0].Env, "STORAGE_ACCOUNT"))
+	}
+	if envValue(podSpec.Containers[0].Env, "STORAGE_CONTAINER") != "etcd-backups" {
+		t.Errorf("etcd STORAGE_CONTAINER: got %q", envValue(podSpec.Containers[0].Env, "STORAGE_CONTAINER"))
+	}
+	if envValue(podSpec.Containers[0].Env, "BLOB_PREFIX") != "colo/cluster-001" {
+		t.Errorf("etcd BLOB_PREFIX: got %q", envValue(podSpec.Containers[0].Env, "BLOB_PREFIX"))
+	}
+	if !podSpec.HostNetwork {
+		t.Errorf("etcd CronJob should use hostNetwork (to reach local etcd)")
 	}
 
 	// Status reflects success.
@@ -256,14 +279,19 @@ func TestEtcdDeltas_NotFound(t *testing.T) {
 	r, c := newReconciler(t)
 	block := &armadav1.EtcdBackupSpec{
 		Schedule: ptr.To("0 3 * * *"),
-		Location: ptr.To("s3://backups/etcd"),
+		Location: ptr.To("https://teststorage.blob.core.windows.net/etcd-backups/colo/cluster-001"),
 		Enabled:  ptr.To(true),
 	}
-	d, err := etcdDeltas(context.Background(), c, r.EtcdBackupNamespace, "missing-etcd", block, testImage)
+	params := etcdCronJobParams{
+		StorageAccount:   "teststorage",
+		StorageContainer: "etcd-backups",
+		BlobPrefix:       "colo/cluster-001",
+	}
+	d, err := etcdDeltas(context.Background(), c, r.EtcdBackupNamespace, "missing-etcd", block, params)
 	if err != nil {
 		t.Fatalf("etcdDeltas: %v", err)
 	}
-	if d["schedule"] != "0 3 * * *" || d["location"] != "s3://backups/etcd" || d["suspend"] != "false" || d["image"] != testImage {
+	if d["schedule"] != "0 3 * * *" || d["storageContainer"] != "etcd-backups" || d["storageAccount"] != "teststorage" || d["blobPrefix"] != "colo/cluster-001" || d["suspend"] != "false" {
 		t.Errorf("expected all-fields delta when missing, got %+v", d)
 	}
 }

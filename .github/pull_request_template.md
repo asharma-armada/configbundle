@@ -1,26 +1,34 @@
-## What and why
+## What
 
-<!-- What changed, and why this change — not a description of what the code does -->
+<!-- What does this PR do? One or two sentences. -->
 
-## Test plan
+## Why
 
-<!-- What to verify and how -->
+<!-- Why is this change needed? Link to the ROADMAP item or issue. State
+the intended behavior explicitly — agent-assisted diffs aren't hand-typed
+line by line, so the intent isn't implicit in the effort. -->
 
----
+## How it came together
 
-## AI context checklist
+<!-- Provenance: how this change was arrived at — not who typed it (AI
+assistance is assumed across this project, so there's nothing to
+disclose). The load-bearing framing and the decisions you made steering
+it — e.g. "asked for X under constraint Y; redirected when it drifted
+to Z" — plus alternatives considered and rejected. The curated story,
+not a transcript. Skip for trivial changes. -->
 
-- [ ] **Context loaded** — domain files were read and signaled before starting this work
-- [ ] **Sync rule** — if a settled decision was made, the relevant domain file is updated in this PR
-- [ ] **No context update needed** — no new decisions, patterns, or constraints introduced
+## Verification
 
-> Run `/pr-context` to check automatically. If a domain file update is needed, it belongs in this PR — not a follow-up.
+<!-- What you checked and how you know it works: tests added/run, manual
+QA (minikube apply, e2e on colo-dev-main if applicable), edge cases.
+Call out anything you want the reviewer to scrutinize or that you're
+unsure about. -->
 
----
+## Checklist
 
-## Standard checklist
-
-- [ ] Follows project conventions in CLAUDE.md
-- [ ] Tests cover the "Done when" criteria from ROADMAP.md
-- [ ] ROADMAP.md status updated
-- [ ] No unrelated changes bundled in
+- [ ] I have read every changed line and take responsibility for this PR
+- [ ] `make test` green; behavioral changes covered by a test in the same commit
+- [ ] Settled decisions or conventions updated inline in `docs/reference/<DOMAIN>.md` (or `CLAUDE.md` if cross-cutting)
+- [ ] CRD or orbital-schema changes: `make generate manifests` run, regenerated files and updated `config/samples/*.yaml` included
+- [ ] Bundler ↔ controller contract preserved (enricher API shape, `POST /dispatch` media types, orbital GraphQL edge names)
+- [ ] ROADMAP.md status updated if this closes or advances a WRK item

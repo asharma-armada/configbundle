@@ -13,7 +13,7 @@ spec:
     control-plane: controller-manager
     app.kubernetes.io/name: serverconfig-controller
   ports:
-  - name: metrics
-    port: 8093
+  - name: https
+    port: 8443
     targetPort: metrics
     protocol: TCP

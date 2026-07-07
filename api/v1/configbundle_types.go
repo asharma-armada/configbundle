@@ -274,8 +274,8 @@ type ConfigBundleStatus struct {
 	//
 	// A nil value means "no POST has ever landed for this CB" — the reporter
 	// treats this as unknown and posts once on the next reconcile (biased
-	// toward orb-sync-correctness over one avoidable POST). See ADR notes and
-	// docs/claude/edge-context.md for the cold-start semantics.
+	// toward orb-sync-correctness over one avoidable POST). See
+	// docs/reference/EDGE.md for the cold-start semantics.
 	// +optional
 	DivergenceReporting *DivergenceReportingStatus `json:"divergenceReporting,omitempty"`
 }

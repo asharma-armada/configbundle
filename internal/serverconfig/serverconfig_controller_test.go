@@ -287,7 +287,7 @@ func TestBuildObservedIdrac(t *testing.T) {
 	}
 }
 
-func boolPtrForTest(b bool) *bool                { return &b }
+func boolPtrForTest(b bool) *bool { return &b }
 func boolPtrEqualForTest(a, b *bool) bool {
 	if a == nil && b == nil {
 		return true

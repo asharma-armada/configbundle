@@ -210,22 +210,29 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 		return reconcile.Result{}, err
 	}
 
-	// No oobIP means nothing actionable — log and skip without status write.
+	// No oobIP means nothing actionable — surface the skip on status so
+	// `kubectl describe sc <name>` explains the blank live state.
 	if sc.Spec.OobIP == nil || *sc.Spec.OobIP == "" {
 		logger.Info("no oobIP on serverconfig; skipping",
 			"name", sc.Name, "serviceTag", sc.Spec.ServiceTag)
+		r.setStatusSkipped(ctx, &sc, "NoOobIP",
+			"spec.oobIP is empty — no target to reconcile against. Populate spec.oobIP to enable reconciliation.")
 		return reconcile.Result{}, nil
 	}
 	oobIP := *sc.Spec.OobIP
 
 	// Allowlist enforcement — short-circuit before fetching credentials or
-	// touching the network. No status update for un-allowlisted CRs.
+	// touching the network. Status is written so operators can distinguish
+	// "controller broken" from "this CR is deliberately not managed by this
+	// controller instance" without reading logs.
 	if !r.AllowedOobIPs[oobIP] {
 		logger.Info("change detected but oobIP not on allowlist, ignoring",
 			"name", sc.Name, "oobIP", oobIP,
 			"intent.sshEnabled", boolPtr(sc.Spec.IdracSettings.SSHEnabled),
 			"intent.racadmEnabled", boolPtr(sc.Spec.IdracSettings.RacadmEnabled),
 			"intent.ipmiEnabled", boolPtr(sc.Spec.IdracSettings.IPMIEnabled))
+		r.setStatusSkipped(ctx, &sc, "NotInOobAllowlist",
+			fmt.Sprintf("oobIP %s is not in IDRAC_OOB_ALLOWLIST — this ServerConfig is not managed by this controller instance.", oobIP))
 		return reconcile.Result{}, nil
 	}
 
@@ -407,6 +414,16 @@ func (r *ServerConfigReconciler) setStatusApplied(ctx context.Context, sc *armad
 // names which step failed (MissingCredentials, RedfishReadFailed, RedfishPatchFailed).
 func (r *ServerConfigReconciler) setStatusFailed(ctx context.Context, sc *armadav1.ServerConfig, reason, msg string) {
 	r.writeStatus(ctx, sc, armadav1.ServerConfigPhaseDiverged, metav1.ConditionFalse, reason, msg)
+}
+
+// setStatusSkipped writes Phase=Skipped + Reconciled=False with a Reason
+// describing why the controller deliberately did not reconcile this CR
+// (NoOobIP, NotInOobAllowlist). Distinct from setStatusFailed — a Skipped
+// CR was never attempted, not tried-and-failed. Surfaces the gate that
+// blocked reconciliation so `kubectl describe sc <name>` explains blank
+// live state without an operator having to check the controller logs.
+func (r *ServerConfigReconciler) setStatusSkipped(ctx context.Context, sc *armadav1.ServerConfig, reason, msg string) {
+	r.writeStatus(ctx, sc, armadav1.ServerConfigPhaseSkipped, metav1.ConditionFalse, reason, msg)
 }
 
 // writeStatus updates the ServerConfig's Phase + Reconciled condition.

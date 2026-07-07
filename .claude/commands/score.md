@@ -15,20 +15,20 @@ Use `git log --follow -1 --format="%cr" <file>` to determine freshness of each f
 - When was it last updated?
 - Is `## Current State` current (not blank or placeholder)?
 
-**`docs/claude/_index.md`**
-- Does it exist?
-- Are the domain files it references actually present on disk?
+**`CLAUDE.md` Reference Index**
+- Does the Reference Index table exist?
+- Are the topic docs it references actually present under `docs/reference/`?
 
-**Each domain file listed in `_index.md`**
+**Each topic doc listed in the Reference Index**
 - Does it exist?
 - When was it last updated?
-- Is it substantively populated, or mostly template placeholders?
+- Is the `## Settled Decisions` section substantively populated, or mostly placeholders?
 
 **Coverage gaps**
-- Read the top-level source directory structure. Identify any major areas (e.g. `/src/auth`, `/src/billing`) that have no corresponding domain file in `docs/claude/`.
+- Read the top-level source directory structure. Identify any major areas (e.g. `/internal/auth`, `/internal/billing`) that have no corresponding topic doc in `docs/reference/`.
 
-**AI commit trailers**
-- Run `git log --grep="AI-model" -5` — are recent AI-assisted commits including `AI-model` trailers?
+**PR provenance section**
+- If a PR is open for this branch (`gh pr view --json body`), does the "How it came together" section explain how the change was arrived at, or is it empty/placeholder? Empty is a ⚠ warning — that section is what carries provenance under the "AI is assumed" model.
 
 ---
 
@@ -63,7 +63,7 @@ Context Health       [grade]
   [✓/⚠/✗] CLAUDE.md — [status]
   [✓/⚠/✗] [domain file] — [status]
   [✓/⚠/✗] Coverage — [gaps found, or "no gaps"]
-  [✓/⚠/✗] AI commit trailers — [recent commits include AI-model trailer / missing]
+  [✓/⚠/✗] PR provenance — [How-it-came-together section written / empty / no open PR]
 
 Session Efficiency   [grade]
   [✓/⚠/✗] Context loaded and signaled: [files listed, or "not signaled"]

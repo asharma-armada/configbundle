@@ -151,7 +151,7 @@ Orbital retries failed enricher calls. These are Orbital-side settings, not conf
 The bundler emits a `ConfigBundleSpec` YAML carrying Orbital's `orbId` as a
 first-class field at every K8s-addressable level. `orbId` is the immutable
 Orbital identifier — stable across `serviceTag` rebadges and hostname renames.
-See `docs/plans/server-identity-orbid.md`.
+See [ADR-011](../decisions/011-saturate-orbids-eliminate-mapping-layer.md).
 
 ```yaml
 orbId: colo:colo-galleon         # datacenter orbId (required)

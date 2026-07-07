@@ -1,141 +1,273 @@
-# configbundle
+# 📦 configbundle
 
-`ConfigBundle` is a Kubernetes CRD for cloud-authored, edge-enforced configuration. This repo defines the CRD family (`ConfigBundle`, `ServerConfig`, `BackupConfig`) and the two services that produce and consume it: **cb-bundler**, which reads Orbital's CMDB graph and materializes it as a ConfigBundle manifest, and **cb-controller**, which runs at the edge — inside a modular data center's management cluster — and reconciles the manifest into per-domain child CRs.
+`ConfigBundle` is a Kubernetes CRD for cloud-authored, edge-enforced
+configuration. This repo defines the CRD family (`ConfigBundle`,
+`ServerConfig`, `BackupConfig`) plus four services that move intent from
+Orbital's CMDB graph in the cloud to actuation on edge management clusters:
+**cb-bundler**, **cb-controller**, **sc-controller** (iDRAC), **bc-controller**
+(backups).
 
-For project status, see [`ROADMAP.md`](ROADMAP.md).
+For project status, see [ROADMAP.md](./ROADMAP.md).
 
-## What is this
+## Motivation
 
-- **`ConfigBundle`** is the CRD that carries one data center's intent — servers, iDRAC settings, backup schedules, and local override / divergence state — as a single Kubernetes resource.
-- **Orbital** is the cloud CMDB (GraphQL over DGraph) that authors the intent. See the [orbital repo](../orbital/README.md) for its design.
-- **`cb-bundler`** and **`cb-controller`** are the two ends of the delivery pipeline — bundler cloud-side, controller edge-side. Both live in this repo; both operate on the same CRD schema this repo defines.
+Modular data centers ship with intermittent or air-gapped network connectivity
+and management clusters that cannot receive pushed configuration. Existing
+tools assume persistent connectivity + a central controller that reconciles
+downstream. That assumption breaks at the edge:
 
-## Why
+- **GitOps and pull-webhook patterns don't work** — the edge can't reach
+  arbitrary git hosts and can't accept unsigned bytes from the network
+- **Direct actuation from the cloud is unavailable** — no reliable push path
+  exists into an air-gapped facility
+- **Manual per-cluster reconciliation doesn't scale** — dozens of galleons,
+  each with their own drift, quickly outgrows tribal knowledge
 
-Modular data centers are often air-gapped or intermittently connected. Their management clusters can't receive pushed config, and they can't trust unsigned bytes from the network. Together those constraints rule out most GitOps and pull-webhook patterns.
+`configbundle` closes that gap by turning Orbital's intent graph into signed
+OCI artifacts that edge clusters pull, verify, and reconcile locally.
+Divergence flows back through the same pipe as a separate report — it's data,
+not an error.
 
-`configbundle` solves this with a two-part contract:
+## Goals
 
-1. **Cloud side.** `cb-bundler` runs as an Orbital enricher: Orbital's export pipeline POSTs to `bundler:/bundle`, receives back the ConfigBundle manifest, signs the full artifact once, and pushes it to a registry. Orbital owns signing and push; the bundler contributes one layer.
-2. **Edge side.** `cb-controller` runs on the edge management cluster as a passive consumer. It never polls a registry and never talks to the cloud. `orb` (the edge service) pulls from the local Zot mirror, cosign-verifies, imports graph data to DGraph, then dispatches the manifest layer over HTTP to `cb-controller` via `POST /dispatch`. `cb-controller` applies the ConfigBundle CR, decomposes it into per-domain child CRs, and reports divergence back to `orb`.
+- **Edge always pulls, cloud never pushes** — no cloud component initiates a
+  connection to a Galleon
+- **Signed intent, verified at the edge** — Orbital signs the ConfigBundle OCI
+  artifact once; orb cosign-verifies before applying
+- **CRD-native at the edge** — the ConfigBundle CR IS the handoff artifact;
+  edge controllers reconcile from the CR
+- **Divergence is data, not error** — local admin overrides surface upstream
+  via a divergence report; orbital resolves each as accept / reject / ignore
+- **Monorepo, one release cycle** — four services share types, share a
+  Dockerfile, share a release cadence (cert-manager / cluster-api pattern)
 
-See [`docs/claude/edge-context.md`](docs/claude/edge-context.md) for the end-to-end sequence diagram.
+## Reference architecture
 
-## What this repo owns
-
-For the full delivery pipeline (Orbital → OCI signing → ACR → Zot mirror → orb → edge), see the reference architecture in the [orbital README](../orbital/README.md#reference-architecture).
-
-Within that pipeline, `configbundle` owns two services and one CRD family:
+<p align="center"><em>Blue components live in this repo. Everything else is
+external — Orbital and orb (in the orbital repo) drive input, sibling
+resources are downstream actuation targets.</em></p>
 
 ```mermaid
 flowchart LR
-    O([Orbital<br/>upstream]) -->|POST /bundle| B[cb-bundler]
-    B -->|manifest YAML bytes| O
-    ORB([orb<br/>upstream]) -->|POST /dispatch| CB[cb-controller]
+    O([Orbital<br/>cloud CMDB]) -->|POST /bundle| B[cb-bundler]
+    B -->|manifest YAML| O
+    O -->|OCI artifact<br/>signed, pushed to ACR| Z([Zot<br/>edge mirror])
+    Z -->|poll| ORB([orb<br/>edge service])
+    ORB -->|POST /dispatch| CB[cb-controller]
     CB -->|SSA| CR[[ConfigBundle CR]]
     CR -.decompose.-> SCR[[ServerConfig CR]] & BCR[[BackupConfig CR]]
-    SCR --> SC([sc-controller<br/>sibling repo])
-    BCR --> BC([bc-controller<br/>sibling repo])
+    SCR --> SC[sc-controller]
+    BCR --> BC[bc-controller]
+    SC -.PATCH.-> R([Dell iDRAC via Redfish])
+    BC -.SSA.-> V([Velero Schedule + etcd CronJob])
 
     style B fill:#e8f0ff,stroke:#4a90e2
     style CB fill:#e8f0ff,stroke:#4a90e2
+    style SC fill:#e8f0ff,stroke:#4a90e2
+    style BC fill:#e8f0ff,stroke:#4a90e2
     style CR fill:#e8f0ff,stroke:#4a90e2
     style SCR fill:#e8f0ff,stroke:#4a90e2
     style BCR fill:#e8f0ff,stroke:#4a90e2
 ```
 
-Blue = owned by this repo. Everything else is an external boundary — Orbital calls the bundler, orb calls the controller, sibling controllers watch the child CRs.
+## Concepts
 
-**The cardinal invariant:** the edge always pulls; the cloud never initiates a connection to the edge.
+- **`ConfigBundle`** — top-level CRD. One CR per Galleon. Carries desired
+  state for servers, iDRAC settings, Kubernetes cluster backup config, plus
+  divergence directives from Orbital.
+- **`ServerConfig`** — per-server child CR decomposed from `ConfigBundle`.
+  Owned by `sc-controller`, which PATCHes iDRAC via Redfish.
+- **`BackupConfig`** — per-cluster child CR. Owned by `bc-controller`, which
+  reconciles a Velero Schedule + etcd snapshot CronJob to Azure Blob storage.
+- **`cb-bundler`** — cloud-side HTTP service. Runs as an Orbital enricher.
+  Reads Orbital's DGraph via GraphQL, produces the ConfigBundle manifest.
+  Never pushes to a registry — Orbital owns signing and push.
+- **`cb-controller`** — edge-side controller. Registered as a consumer with
+  `orb` on `POST /dispatch`; applies the manifest as a ConfigBundle CR;
+  decomposes into child CRs; reports divergence back to orb.
+- **`orb`** — edge service (lives in the [orbital repo](../orbital)). Polls
+  Zot for new bundle tags, cosign-verifies, imports graph data to local
+  DGraph, dispatches remaining layers to registered consumers by media type.
+- **`divergence`** — delta between orbital intent and observed edge state.
+  Produced by cb-controller, forwarded to orb → orbital. Data, not error.
+- **`local:admin` override** — SSA field manager string used when an operator
+  applies a manual field-level change against the edge CR. Preserved and
+  surfaced upstream as divergence.
 
-## Repos in this system
+---
 
-| Repo | Role |
-|---|---|
-| `~/armada/configbundle` (this repo) | ConfigBundle CRD family + cb-bundler + cb-controller + sc-controller + bc-controller (one Go module) |
-| `~/armada/orbital` | Cloud CMDB (GraphQL, DGraph, OCI signing/push) + orb edge service |
+## Quick Start
 
-All four services (cb-controller, cb-bundler, sc-controller, bc-controller) live in this single module and ship as four distinct images built from one Dockerfile with four targets. This follows the cert-manager / cluster-api monorepo pattern — related controllers, shared types, coupled release cadence. See `cmd/{controller,bundler,serverconfig,backupconfig}/` and `internal/{controller,bundler,serverconfig,backupconfig}/`.
+Get from clone to end-to-end reconcile in ~5 minutes.
 
-## Running locally
-
-Full local dev needs three terminals: minikube + this repo's controller and bundler. Orbital can be mocked or run in the sibling repo depending on what you're testing.
+### Prerequisites
 
 ```bash
-# Terminal 0 — start minikube and install CRDs
+brew install go@1.26 kubectl kustomize kubebuilder minikube docker
+brew install --cask docker    # if you don't already have a Docker runtime
+```
+
+Verify:
+
+```bash
+go version              # go 1.26.4 or later
+docker --version
+minikube version
+kubectl version --client
+```
+
+### 1. Start local Kubernetes + install CRDs
+
+```bash
 make up
+```
 
-# Terminal 1 — cb-controller (:8091 health, :8095 dispatch)
+Starts minikube if it isn't already running, installs the three CRDs
+(`configbundles.armada.ai`, `serverconfigs.armada.ai`, `backupconfigs.armada.ai`).
+
+Verify:
+
+```bash
+kubectl get crd | grep armada.ai
+```
+
+### 2. Run cb-controller
+
+In one terminal:
+
+```bash
 make run-controller
+```
 
-# Terminal 2 — cb-bundler (:8020) — only needed if testing the enricher path
+- Health: `http://localhost:8091/healthz`
+- Dispatch (from orb): `http://localhost:8095/dispatch`
+
+### 3. Apply the sample and watch decomposition
+
+In another terminal:
+
+```bash
+kubectl apply -f config/samples/v1_configbundle.yaml
+```
+
+Verify all three CR layers exist:
+
+```bash
+kubectl get configbundles
+kubectl get serverconfigs.armada.ai
+kubectl get backupconfigs
+```
+
+Each should show one CR. cb-controller decomposed the parent into a
+`ServerConfig` (name derived from hostname) and a `BackupConfig` (name derived
+from ClusterBackup orbId).
+
+### 4. Run tests
+
+```bash
+make test
+```
+
+Unit + envtest, no cluster required. ~30 seconds. All packages should be green.
+
+### 5. Clean up
+
+```bash
+kubectl delete configbundle colo-galleon
+make down   # stop minikube
+```
+
+Cascade delete removes child CRs; `make down` stops minikube.
+
+### Troubleshooting
+
+**`make up` fails on minikube start.**
+`minikube delete && minikube start --driver=docker` and retry.
+
+**`make test` fails with "envtest binaries not found".**
+`make setup-envtest`. Usually only needed after a Go toolchain upgrade.
+
+**`kubectl` context is wrong.**
+`kubectl config current-context` should say `minikube` for local dev. Edge
+work uses a different KUBECONFIG — see
+[`docs/playbooks/deploy-to-edge.md`](docs/playbooks/deploy-to-edge.md).
+
+**Pods stuck `ImagePullBackOff` on colo-dev-main.**
+`az acr login --name armadaeksatest` before `make push-*`.
+
+---
+
+## Optional: sibling controllers (sc, bc)
+
+Only needed if you're exercising iDRAC or backup paths.
+
+```bash
+# sc-controller — iDRAC reconciler. Empty allowlists = starts safely.
+IDRAC_OOB_ALLOWLIST="" IDRAC_FIELD_ALLOWLIST="" make run-serverconfig
+
+# bc-controller — Velero Schedule + etcd CronJob reconciler
+make run-backupconfig
+
+# cb-bundler — only if testing the orbital → bundler path
 make run-bundler
 ```
 
-`make up` starts minikube if it isn't running, installs the CRDs, and prints the follow-up commands. `make down` stops minikube.
+---
 
-For full pipeline testing (orbital → OCI → orb → cb-controller), you need the orbital repo running too. See [`docs/edge-deploy.md`](docs/edge-deploy.md) for edge deployment and the [orbital repo](../orbital) for its own dev commands.
+## Where to go next
 
-## Testing
+**Building a feature or fixing a bug** → [CONTRIBUTING.md](./CONTRIBUTING.md) —
+PR workflow, tests, code style, release process, AI-assistant conventions.
 
-```bash
-make test              # unit + envtest (in-process API server; no cluster required)
-make test-e2e-local    # e2e against `make run-controller` on minikube
-make test-e2e          # full CI path: build image, Kind cluster, kustomize deploy
-```
-
-`make test` covers:
-
-- **CRD decomposition** — ConfigBundle → ServerConfig, ConfigBundle → BackupConfig, all leaf fields propagated, cross-CR ownerReferences
-- **Desired state enforcement** — out-of-band mutations on child CRs are restored via `Owns()` watch
-- **Spec updates** propagate parent → child
-- **ConsumeServer apply pipeline** — idempotency, admin-override bow-out (`omitAdminOwnedFields`), takeover, ignored, stale-filter
-- **Divergence reporter** — debounce, heartbeat, bootstrap rehydration from persistent ConfigMap, cold-start guard
-- **Reclaim controller** — event-driven replay after local:* release, in-flight guard
-- **Bundler** — GraphQL mapping, takeover/ignored resolution lookup, cluster backup mapping
-
-`make test-e2e-local` adds cascade-delete verification and full-controller behavior tests.
-
-## Documentation map
-
-The README is intentionally thin. Detailed context lives in structured domain files.
-
-- [`CLAUDE.md`](CLAUDE.md) — top-level navigation, settled cross-cutting decisions, working conventions
-- [`ROADMAP.md`](ROADMAP.md) — spike register, recent accomplishments, upcoming priorities
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — commit conventions, PR process, review expectations
-- [`AGENTS.md`](AGENTS.md) — AI agent guide (kubebuilder layout, code-gen rules)
-
-**Domain reference files** (read the one that matches what you're touching):
+**Understanding a specific domain** — each topic doc includes a
+`## Settled Decisions` section with the rules and rationale for that area:
 
 | Working on | Read |
 |---|---|
-| Bundler HTTP service, enricher API, Orbital GraphQL integration | [`docs/claude/api-context.md`](docs/claude/api-context.md) |
-| OCI artifact structure, layers, media types, signing, tags | [`docs/claude/bundle-context.md`](docs/claude/bundle-context.md) |
-| CRD types, kubebuilder annotations, SSA semantics | [`docs/claude/crd-context.md`](docs/claude/crd-context.md) |
-| Edge dispatch pipeline, cosign, divergence, reclaim, handback | [`docs/claude/edge-context.md`](docs/claude/edge-context.md) |
-| Orbital GraphQL data model, override semantics, ConfigBundle YAML | [`docs/claude/orbital-context.md`](docs/claude/orbital-context.md) |
+| Bundler HTTP service, enricher API, Orbital GraphQL integration | [`docs/reference/API.md`](docs/reference/API.md) |
+| OCI artifact structure, layers, media types, signing, tags | [`docs/reference/BUNDLE.md`](docs/reference/BUNDLE.md) |
+| CRD types, kubebuilder annotations, SSA semantics | [`docs/reference/CRD.md`](docs/reference/CRD.md) |
+| Edge dispatch, cosign, divergence, reclaim, handback | [`docs/reference/EDGE.md`](docs/reference/EDGE.md) |
+| Orbital GraphQL data model, override semantics | [`docs/reference/ORBITAL.md`](docs/reference/ORBITAL.md) |
 
-**Decision records** — architecture decisions with full rationale. See [`docs/decisions/`](docs/decisions/). Load when the context isn't visible from the code.
+**Doing a specific task** — playbook:
 
-**Deployment** — see [`docs/edge-deploy.md`](docs/edge-deploy.md) for kustomize-based deploy to the edge management cluster.
+| Task | Playbook |
+|---|---|
+| Add a new field to a CRD | [`docs/playbooks/add-crd-field.md`](docs/playbooks/add-crd-field.md) |
+| Cut and push a new version | [`docs/playbooks/tag-and-release.md`](docs/playbooks/tag-and-release.md) |
+| Deploy to the colo-dev-main edge cluster | [`docs/playbooks/deploy-to-edge.md`](docs/playbooks/deploy-to-edge.md) |
+
+**Troubleshooting** — runbook:
+
+| Symptom | Runbook |
+|---|---|
+| BackupConfig CR exists but no CronJob was created | [`docs/runbooks/backupconfig-not-reconciling.md`](docs/runbooks/backupconfig-not-reconciling.md) |
+
+---
 
 ## Repository layout
 
 ```
-api/v1/                     CRD type definitions (ConfigBundle, ServerConfig, BackupConfig)
+api/v1/                     CRD types
 bundle/                     OCI media type constants
 cmd/
-  controller/               cb-controller entry point
-  bundler/                  cb-bundler entry point
-  serverconfig/             sc-controller entry point
-  backupconfig/             bc-controller entry point
+  controller/main.go        cb-controller entry
+  bundler/main.go           cb-bundler entry
+  serverconfig/main.go      sc-controller entry
+  backupconfig/main.go      bc-controller entry
 internal/
-  controller/               cb-controller logic — consume, decompose, divergence, reclaim, takeover
-  bundler/                  cb-bundler HTTP service (POST /bundle)
-  serverconfig/             sc-controller logic — Redfish PATCH, drift metrics
-  backupconfig/             bc-controller logic — Velero Schedule + etcd CronJob reconcile
-config/                     Kubebuilder / kustomize manifests (per-controller overlays under config/serverconfig, config/backupconfig)
-docs/                       Domain reference files, ADRs, deploy guides
+  controller/               cb-controller logic
+  bundler/                  cb-bundler logic
+  serverconfig/             sc-controller logic
+  backupconfig/             bc-controller logic
+config/                     Kubebuilder / kustomize manifests
+docs/
+  reference/*.md            topic docs with inline "## Settled Decisions"
+  examples/                 sample manifests
+  playbooks/                task-focused how-tos
+  runbooks/                 operational troubleshooting
+  research/                 investigation notes
 test/                       e2e tests
 ```
 
@@ -144,5 +276,10 @@ test/                       e2e tests
 - **Language:** Go 1.26.4, module `github.com/armada/configbundle`
 - **Framework:** kubebuilder / controller-runtime
 - **Kubernetes:** client-go, envtest, Ginkgo v2
-- **Registries:** ACR (cloud, Orbital pushes), Zot (edge mirror, orb pulls). This repo holds **no** OCI write credentials — Orbital is the sole producer.
+- **Registries:** ACR (cloud, Orbital pushes), Zot (edge mirror, orb pulls).
+  This repo holds **no** OCI write credentials — Orbital is the sole producer.
 
+## Related projects
+
+- **[orbital](../orbital)** — Cloud CMDB (GraphQL, DGraph, OCI signing/push) +
+  `orb` edge service. Configbundle sits between the two as data + delivery.

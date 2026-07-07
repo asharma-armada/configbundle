@@ -33,6 +33,13 @@ spec:
       control-plane: controller-manager
       app.kubernetes.io/name: serverconfig-controller
   replicas: 1
+  # Recreate (not RollingUpdate) because the pod uses hostNetwork: true. Rolling
+  # update tries to spin the new pod BEFORE terminating the old, but both want
+  # the same host ports (:8092 health, :8443 metrics) on the same node → new
+  # pod stuck Pending until we manually delete the old one. Recreate = brief
+  # metrics-scrape gap during rollout, no host-port deadlock.
+  strategy:
+    type: Recreate
   template:
     metadata:
       labels:
@@ -43,7 +50,7 @@ spec:
       # reach the OOB management VLAN (e.g. 10.20.21.0/24) where iDRACs live.
       # The CNI pod network typically can't see that subnet. Trade-off: the
       # pod can no longer reach in-cluster ClusterIP Services for itself, and
-      # the metrics port (8093) binds on the host network namespace (so a
+      # the metrics port (8443) binds on the host network namespace (so a
       # cluster-internal Prometheus scrape goes via the node IP). DNS still
       # works thanks to dnsPolicy: ClusterFirstWithHostNet.
       hostNetwork: true
@@ -94,7 +101,7 @@ spec:
         - containerPort: 8092
           name: health
           protocol: TCP
-        - containerPort: 8093
+        - containerPort: 8443
           name: metrics
           protocol: TCP
         securityContext:

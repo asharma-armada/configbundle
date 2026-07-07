@@ -46,7 +46,7 @@ tools: [comma-separated list of allowed tools]
 ## Context
 
 Load before starting:
-- @docs/claude/[DOMAIN].md
+- @docs/reference/[DOMAIN].md
 - [other files this agent needs]
 
 ## Constraints

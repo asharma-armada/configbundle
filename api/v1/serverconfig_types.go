@@ -54,13 +54,18 @@ type ServerConfigSpec struct {
 }
 
 // ServerConfigPhase represents the current lifecycle phase.
-// +kubebuilder:validation:Enum=Pending;Applied;Diverged
+// +kubebuilder:validation:Enum=Pending;Applied;Diverged;Skipped
 type ServerConfigPhase string
 
 const (
 	ServerConfigPhasePending  ServerConfigPhase = "Pending"
 	ServerConfigPhaseApplied  ServerConfigPhase = "Applied"
 	ServerConfigPhaseDiverged ServerConfigPhase = "Diverged"
+	// ServerConfigPhaseSkipped means the controller deliberately did not
+	// reconcile this CR. The Reconciled condition carries the reason
+	// (NoOobIP, NotInOobAllowlist). Distinct from Diverged (which implies
+	// we tried and failed) — Skipped is "we consciously chose not to try."
+	ServerConfigPhaseSkipped ServerConfigPhase = "Skipped"
 )
 
 // ServerConfigStatus records the controller's observed state.

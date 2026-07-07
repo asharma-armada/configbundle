@@ -29,13 +29,14 @@ Do not invent content. If something is ambiguous in the source docs, note it as 
 
 ---
 
-## Generate the domain context file
+## Generate the topic reference doc
 
-Create `docs/claude/[domain-name]-context.md` using `docs/claude/_TEMPLATE.md` as the structure.
+Create `docs/reference/[DOMAIN].md` (uppercase filename) using `docs/reference/_TEMPLATE.md` as the structure.
 
 **Rules:**
 - Replace every `[placeholder]` with real content derived from the source documents
-- **Key decisions:** settled choices only; frame each as something Claude should not re-open
+- **Settled Decisions:** current rules only — one bullet per rule. No dated bullets, no "rejected alternatives" paragraphs, no ADR-style history. `git blame` is the audit trail.
+- **Landmine warnings** — the one exception. One-liners of the form *"do NOT reintroduce X — we tried it, it broke Y"* are worth preserving inline.
 - **Conventions:** project-specific patterns only; omit standard language or framework idioms
 - **Gotchas:** only include what is explicitly mentioned or clearly implied in the source docs
 - **External references:** only URLs or file paths that appear in the source docs
@@ -44,13 +45,13 @@ Create `docs/claude/[domain-name]-context.md` using `docs/claude/_TEMPLATE.md` a
 
 ## Update the routing table
 
-Add a row to `docs/claude/_index.md`:
+Add a row to the Reference Index in `CLAUDE.md`:
 
 ```
-| Working on [one-line domain description] | [`[domain-name]-context.md`]([domain-name]-context.md) |
+| Working on [one-line domain description] | `docs/reference/[DOMAIN].md` |
 ```
 
-Add the same row to the Domain Reference Files table in `CLAUDE.md`.
+Add the same row to the "Understanding a specific domain" table in `README.md`.
 
 ---
 
@@ -58,9 +59,9 @@ Add the same row to the Domain Reference Files table in `CLAUDE.md`.
 
 Output:
 - Files created and updated
-- 3–5 bullet summary of the key decisions captured
+- 3–5 bullet summary of the settled decisions captured
 - Any gaps — information that seemed important but was too ambiguous to commit as a settled decision
 
 Then say:
 
-> "Review `docs/claude/[domain-name]-context.md` before committing — edit freely. The source documents are now the historical record; this file is the living truth. Maintain it through the sync rule: any future decision in this domain belongs in this file, in the same PR as the code that motivated it."
+> "Review `docs/reference/[DOMAIN].md` before committing — edit freely. The source documents are now the historical record; this file is the living truth. Maintain it through the sync rule: any future decision in this domain belongs in this file, in the same PR as the code that motivated it."

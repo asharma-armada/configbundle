@@ -11,7 +11,7 @@ Identify which `WRK-xxx` item(s) these changes correspond to. If you cannot dete
 Read:
 - `CLAUDE.md` — architecture invariants, working style, settled decisions
 - `ROADMAP.md` — the "Done when" criteria for the relevant WRK item(s)
-- Any domain files in `docs/claude/` that are relevant to the changed files
+- Any topic docs in `docs/reference/` that are relevant to the changed files
 
 ## 3. Review against four standards
 

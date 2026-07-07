@@ -32,7 +32,7 @@ const reclaimInFlightRequeue = 2 * time.Second
 // through ConsumeServer.applyManifest. The replay's SSA+ForceOwnership pass
 // claims the released field with intent value.
 //
-// See ADR-009 (docs/decisions/009-edge-handback-via-release.md).
+// See docs/reference/EDGE.md § Settled Decisions (local release reverts to intent).
 type ReclaimController struct {
 	Client    client.Client
 	consume   *ConsumeServer

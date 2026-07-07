@@ -76,7 +76,7 @@ spec:
         - containerPort: 8094
           name: health
           protocol: TCP
-        - containerPort: 8096
+        - containerPort: 8443
           name: metrics
           protocol: TCP
         securityContext:

@@ -55,19 +55,23 @@ sequenceDiagram
 
 ---
 
-## Key decisions
+## Settled Decisions
 
-- **No separate edge agent** — The ConfigBundle Controller, ConsumeServer, and Divergence Reporter are all part of the same binary on the Mgmt Cluster. Do not create an `edge-agent` binary.
+- **No separate edge agent** — the ConfigBundle Controller, ConsumeServer, and Divergence Reporter are all part of the same binary on the Mgmt Cluster. Do not create an `edge-agent` binary.
 - **Single dispatch endpoint, content-routed** — `POST /dispatch` is the only inbound HTTP endpoint. Only `manifest.v1+yaml` is accepted; any other Content-Type returns 415. Do NOT add `/consume` or `/mapping` back.
-- **No mapping layer** — Post-ADR-011, orbIds are saturated directly on the ConfigBundle CR (every ConfigItem carries its own `orbId`). The bundler returns a single OCI layer (manifest only); orb dispatches that one layer to CB Controller. The `<cb-name>-mapping` ConfigMap is retained by name for backward compatibility but only holds `last-applied-spec.yaml` — no more `mapping.json`.
-- **CB Controller is a passive consumer** — it never polls Zot, never pulls OCI artifacts, and never calls cosign. Orb owns the full OCI pipeline including cosign verification.
-- **CB Controller never needs OCI credentials** — orb handles all OCI mechanics including cosign verification. The ConfigBundle Controller receives plain manifest bytes over HTTP.
-- **omitAdminOwnedFields is mandatory in the consume path** — the ConsumeServer handler must inspect `managedFields` and strip `local:*`-owned "bow-out" fields (intent differs from live) before applying the SSA patch.
-- **If orb is down, CB Controller receives no updates until orb recovers and re-dispatches** — there is no fallback polling mechanism.
-- **Single field manager** — `configbundle-controller` owns all fields it writes on both the ConfigBundle CR and child CRs. Local admin overrides use `local:admin` — but ONLY on the ConfigBundle CR, never on child CRs.
-- **Local overrides are at ConfigBundle CR level only** — child CRs are derived state, not an override surface. The ConsumeServer applies the ConfigBundle CR spec with `ForceOwnership` on stripped-and-then-included fields (see ADR-008); locally-overridden fields with divergent values are omitted from the apply, preserving admin ownership. The Decomposition Reconciler applies child CR specs WITH `ForceOwnership` because child CRs always faithfully reflect the ConfigBundle CR (including any local overrides already merged into it).
-- **Divergence is data, not an error** — a disconnected Galleon that hasn't received a dispatch is in a valid (diverged) state. Do not block or error on lack of convergence.
+- **No mapping layer** — orbIds are saturated on the CR (see CRD.md). The bundler returns a single OCI layer (manifest only). The `<cb-name>-mapping` ConfigMap is kept by name for backward compatibility but only holds `last-applied-spec.yaml`.
+- **CB Controller is a passive consumer** — never polls Zot, never pulls OCI artifacts, never calls cosign. Orb owns the full OCI pipeline. CB Controller never needs OCI credentials.
+- **If orb is down, CB Controller receives no updates until orb recovers and re-dispatches** — no fallback polling.
+- **`configbundle-controller` field manager owns everything the controller writes.** Local admin overrides use `local:admin`, ONLY on the ConfigBundle CR — never on child CRs. Child CRs are derived state; Decomposition Reconciler applies them WITH `ForceOwnership`.
+- **Divergence is data, not an error** — a disconnected Galleon that hasn't received a dispatch is in a valid (diverged) state. Never block or error on lack of convergence.
 - **Divergence Reporter fires on `local:*` managedFields change only** — the predicate ignores spec-only changes. Quiet-state: zero reconciles, zero POSTs to orb.
+- **`omitAdminOwnedFields` is mandatory in the consume path.** ConsumeServer inspects `managedFields` and, for each `local:*`-owned leaf, KEEPs it in the apply body when the value matches intent or the field is in `spec.takeover[]` (force-claim evicts local:*), OMITs it when values differ and there's no takeover (bow out; local:* retains). Skipping this steals ownership via `ForceOwnership` and breaks the divergence loop. No steady-state co-ownership on value fields.
+- **Divergence `when` uses `managedFields[].time` directly** — no annotation tracking. Orbital's `DivergenceEntry.first_seen_at` is the stable first-seen surfaced in the UI.
+- **Takeover is a second pass in the consume handler, and runs regardless of normal-apply success.** Cloud admin's force decision must not be blocked by an unrelated 409 on another field. The consume handler does NOT mutate `spec.takeover[]` — entries persist until the next bundle naturally replaces them (cb-bundler flips `DivergenceResolution.cb_consumed = true` after push).
+- **Every takeover ends with a release-of-other-claims pass via SSA-as-manager.** cb-controller submits an SSA apply as the other manager, omitting the takeover-target fields — SSA's release-on-omit strips just those claims. When every claim a manager held was a takeover target on one entry, the whole entry is omitted from the release body (else the residual `{orbId: X}` leaves a false-positive audit signal). When `newSpec` is empty, `spec` is omitted from the Apply body entirely. Do NOT edit `managedFields` directly — K8s docs warn against it; SSA-as-manager is the intended protocol.
+- **Ignore lives in `spec.ignored[]`, not as bundler value-omission.** Intent values stay in spec so divergence-reporter can compare, and overrides remain visible to the operator instead of silently muted.
+- **Local release of a local:* claim auto-reverts to last-imported intent.** ReclaimController watches managedFields; when a field had a local:* claim and now has none (release, not rotation), it replays the last-imported manifest from the `<cb>-mapping` ConfigMap. Applies regardless of `spec.ignored[]` membership.
+- **`spec.ignored[]` only carries entries with an active local:* claim.** `applyManifest` scrubs stale entries via `collectLocalClaimedKeys` + `filterActiveIgnored`. Do NOT reinstate the earlier defensive Ignored sweep on non-claimed fields — it produced orphan state (no claim, value ≠ intent) and was replaced by the reclaim path.
 
 ---
 
@@ -97,7 +101,7 @@ Listens on `CB_CONTROLLER_PORT` (default `:8095`).
 4. **Fetch current CR** and inspect `managedFields` — identify fields owned by `local:*` managers
 5. **`filterActiveIgnored`** — drop `spec.ignored[]` entries whose target field has no active `local:*` claim (ADR-009 invariant)
 6. **`omitAdminOwnedFields`** — strip "bow-out" leaves: `local:*`-owned fields where intent value differs from live value AND the field isn't in `spec.takeover[]`. Values-match fields stay in the apply and get force-claimed below (no steady-state co-ownership)
-7. **SSA patch** with `ForceOwnership`, field manager `configbundle-controller`. See crd-context.md § SSA conflict resolution
+7. **SSA patch** with `ForceOwnership`, field manager `configbundle-controller`. See `CRD.md` § SSA conflict resolution
 8. **`processTakeover`** — for each `spec.takeover[]` entry, submit a narrow SSA apply with `ForceOwnership` reclaiming that field from `local:admin` (ADR-006). Runs regardless of step 7 success
 9. **Write `<cb-name>-mapping` ConfigMap** — persist `last-applied-spec.yaml` under this CM (OwnerReference to the CR, `controller: true`). Same CM name as pre-ADR-011 for backward compatibility; the old `mapping.json` key is scrubbed if present
 10. **Update ConfigBundle CR status** (status subresource): `lastAppliedDigest` (`X-Orb-Digest`), `lastOrbImportID` (`X-Orb-Import-ID`), `lastAppliedAt`, `Reconciled=True` condition
@@ -197,9 +201,9 @@ Using a plain `int` would collapse `nil` and `*0` into the same value (`0`), whi
 
 ## External references
 
-- [OCI artifact layer reference](bundle-context.md)
-- [ConfigBundle CR structure](crd-context.md)
-- [Local override / divergence model](orbital-context.md)
+- [OCI artifact layer reference](./BUNDLE.md)
+- [ConfigBundle CR structure](./CRD.md)
+- [Local override / divergence model](./ORBITAL.md)
 
 ---
 

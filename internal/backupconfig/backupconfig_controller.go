@@ -59,9 +59,23 @@ type BackupConfigReconciler struct {
 	// (conventionally "kube-system").
 	EtcdBackupNamespace string
 
-	// EtcdBackupImage is the container image the etcd-backup CronJob runs.
-	// Placeholder until a dedicated snapshot image ships.
-	EtcdBackupImage string
+	// EtcdctlImage is the container image that runs `etcdctl snapshot save`
+	// in the CronJob's initContainer. Convention: pin a specific etcdctl
+	// version so bc-controller-managed backups don't drift when the etcdctl
+	// upstream tags move.
+	EtcdctlImage string
+
+	// UploadImage is the container image that uploads the snapshot to blob
+	// storage. Convention: azure-cli today (matches existing etcd-backup on
+	// colo-dev-main). Future clouds will need different tooling — swap the
+	// image via env when we get there.
+	UploadImage string
+
+	// CredentialSecret is the K8s Secret name (in EtcdBackupNamespace)
+	// holding Azure service-principal credentials. Data keys required:
+	// client-id, client-secret, tenant-id. Provisioned out-of-band; bc-
+	// controller only references it.
+	CredentialSecret string
 
 	// ObserveInterval is the cadence at which the reconciler re-polls Velero +
 	// CronJob state even when nothing on the CR has changed. Drives drift

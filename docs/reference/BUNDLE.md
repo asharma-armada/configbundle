@@ -6,16 +6,17 @@
 
 ## Overview
 
-A configbundle OCI artifact is produced by Orbital's publish pipeline (with configbundle as an enricher). It contains three layers identified by media type. The artifact is signed once by Orbital using cosign and pushed once to ACR. Downstream consumers (orb, cb-controller, edge agent) pull from ACR or the local Zot mirror and identify their layer by media type — unknown layers are ignored.
+A configbundle OCI artifact is produced by Orbital's publish pipeline (with configbundle as an enricher). It contains three layers identified by media type. The artifact is signed once by Orbital using cosign and pushed once to ACR. Downstream consumers (orb, cb-controller) pull from ACR or the local Zot mirror and identify their layer by media type — unknown layers are ignored.
 
 ---
 
-## Key decisions
+## Settled Decisions
 
-- **Orbital produces the artifact** — configbundle's bundler returns bytes to Orbital; it never pushes to ACR. No downstream system needs OCI registry write credentials.
-- **Monotonic int tags** — OCI tags are `v1`, `v2`, `v42`. After push, all references use the digest for immutability. Do not use datacenter/schema/sequence compound tags.
-- **cosign signing** — signature stored as an OCI referrer artifact on the bundle digest. Galleons hold only the public key. Verification is fully air-gapped (no ACR reachability required).
-- **Enrichment is all-or-nothing** — if the bundler fails, Orbital pushes nothing. Partial artifacts with some layers missing are never produced.
+- **Orbital produces the artifact.** configbundle's bundler returns bytes to Orbital; it never pushes to ACR. No downstream system needs OCI registry write credentials.
+- **Monotonic int tags** — `v1`, `v2`, `v42`. After push, all references use the digest for immutability. Do not use datacenter/schema/sequence compound tags.
+- **cosign signing.** Signature stored as an OCI referrer artifact on the bundle digest. Galleons hold only the public key. Verification is fully air-gapped — no ACR reachability required.
+- **Enrichment is all-or-nothing.** If the bundler fails, Orbital pushes nothing. Partial artifacts with some layers missing are never produced.
+- **cb-bundler ships a single layer (manifest only) to cb-controller.** Do NOT reintroduce a separate mapping layer — an earlier design shipped `mapping.json` as a second OCI layer and produced a persistent 409 race (mapping dispatch arrived before `Status.LastAppliedDigest` was written). Saturating orbIds directly on the CR (see CRD.md) closed the race by deletion.
 
 ---
 
@@ -27,7 +28,7 @@ A configbundle OCI artifact is produced by Orbital's publish pipeline (with conf
 | DGraph export subgraph | `application/vnd.orbital.subgraph.data.v1+gzip` | Orbital | orb (`dgraph live` import) |
 | DGraph schema | `application/vnd.orbital.subgraph.schema.v1+gzip` | Orbital | orb (schema version check) |
 
-The first layer is produced only when the publish request includes the bundler enricher URL. The orbital layers are always present.
+The first layer is produced only when the publish request includes the bundler enricher URL. The orbital layers are always present. A mapping layer (`vnd.armada.configbundle.mapping.v1+json`) was shipped historically alongside the manifest but has been removed — see Settled Decisions above.
 
 ---
 

@@ -53,8 +53,11 @@ resources:
 
 # Uncomment the patches line if you enable Metrics
 patches:
-# [METRICS] The following patch will enable the metrics endpoint using HTTPS and the port :8443.
-# More info: https://book.kubebuilder.io/reference/metrics
+# [METRICS] Enables the kubebuilder-standard HTTPS metrics endpoint on :8443
+# for every controller Deployment (cb/sc/bc). All three accept the
+# --metrics-bind-address + --metrics-secure flag surface — kubebuilder-first
+# pattern locked in 2026-07-06 (see CLAUDE.md Settled Decisions). Prom scrape
+# needs a ServiceAccount token bound to the metrics-reader ClusterRole.
 - path: manager_metrics_patch.yaml
   target:
     kind: Deployment

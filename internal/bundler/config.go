@@ -18,7 +18,7 @@ type Config struct {
 
 	// OAuth2 client credentials (Azure AD). Reuses orbital's own OIDC app registration.
 	// Token URL is derived from OIDCIssuerURL; scope is derived from OIDCClientID.
-	// Used when OrbitalBearerToken is empty. See docs/decisions/010-bundler-service-auth.md.
+	// Used when OrbitalBearerToken is empty. See docs/reference/API.md § bundler auth.
 	OIDCIssuerURL    string `envconfig:"ORBITAL_OIDC_ISSUER_URL"    default:"https://login.microsoftonline.com/8f231c2a-9551-4b40-be17-5b24afe5e890/v2.0"`
 	OIDCClientID     string `envconfig:"ORBITAL_OIDC_CLIENT_ID"     default:"5fc832f6-843e-4207-93dd-b3c3a77c06f2"`
 	OIDCClientSecret string `envconfig:"ORBITAL_OIDC_CLIENT_SECRET" default:""`

@@ -231,6 +231,7 @@ spec:
                 - Pending
                 - Applied
                 - Diverged
+                - Skipped
                 type: string
               recentPatches:
                 description: |-

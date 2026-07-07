@@ -6,7 +6,7 @@ Do the following in order:
 
 2. **Update CLAUDE.md `## Current State`** — update the active work and next priority to reflect where things stand right now.
 
-3. **Update domain files** — if any settled decisions, gotchas, or conventions were discovered during this session, add them to the relevant `docs/claude/*.md` file. If no domain file exists for the area, note the decision in `CLAUDE.md` Settled Decisions instead.
+3. **Update topic docs** — if any settled decisions, gotchas, or conventions were discovered during this session, add a bullet to the relevant `docs/reference/<DOMAIN>.md` `## Settled Decisions` section. Current rules only — no dated bullets, no rejected-alternatives, no separate ADR files. If no topic doc exists for the area, note the decision in `CLAUDE.md` Settled Decisions instead.
 
 4. **Summarize for the developer** — output a short summary:
    - What was completed
@@ -14,13 +14,12 @@ Do the following in order:
    - What to pick up next session
    - Any open questions or decisions that need a human answer before continuing
 
-5. **Remind the developer to commit with trailers** — end with:
+5. **Hand back to the developer.** Do not commit. Do not push. Leave
+   committing to the developer.
 
-> "When you commit, include AI trailers in the commit body:
-> ```
-> AI-model: [sonnet/opus/haiku]
-> AI-settled: [brief description of any settled decision, if applicable]
-> ```
-> Git is the audit trail."
-
-Do not commit. Do not push. Leave committing to the developer.
+Do NOT ask the developer to add `AI-model:` / `AI-settled:` commit trailers.
+AI assistance is assumed across every commit in this project — a
+constant-valued disclosure is information-free. Provenance (intent,
+steering, verification, human ownership) lives in the PR description
+under the "How it came together" section of the PR template, where it
+varies per change and is what a reviewer actually needs.

@@ -1,9 +1,14 @@
 // backupconfig-controller — watches BackupConfig CRs and reconciles Velero
 // Schedule CRDs + an etcd-backup CronJob in the same cluster. Mirror of
 // serverconfig-controller for the backup domain.
+//
+// Flag surface mirrors cb-controller's kubebuilder-scaffolded shape:
+// operator-standard settings are FLAGS; domain config (VELERO_*, ETCD_*,
+// BACKUP_OBSERVE_INTERVAL) stays in envconfig.
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"os"
 	"time"
@@ -17,16 +22,15 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	armadav1 "github.com/armada/configbundle/api/v1"
 	"github.com/armada/configbundle/internal/backupconfig"
 )
 
-// Config holds all controller configuration. Defaults target a local minikube
-// setup so `make run-controller` works without env-var soup. Production
-// deploys override via ConfigMap/Deployment env. None of the defaults carry
-// secrets — this controller talks only to the local K8s API.
+// Config holds domain configuration. Operator-standard settings (bind
+// addresses, leader-elect, TLS) live as flags — see main() below.
 type Config struct {
 	// VeleroNamespace is where the controller writes Velero Schedule CRDs. The
 	// Velero install conventionally lives in `velero` on the management cluster.
@@ -36,10 +40,20 @@ type Config struct {
 	// `kube-system` is the conventional home for control-plane infrastructure.
 	EtcdBackupNamespace string `envconfig:"ETCD_BACKUP_NAMESPACE" default:"kube-system"`
 
-	// EtcdBackupImage is the container image the etcd-backup CronJob runs.
-	// Placeholder until the dedicated snapshot image ships; swapped via the
-	// kustomize images: block (or this env var) once the real image is built.
-	EtcdBackupImage string `envconfig:"ETCD_BACKUP_IMAGE" default:"armadaeksatest.azurecr.io/etcd-snapshot:TBD"`
+	// EtcdctlImage is the container image that runs `etcdctl snapshot save`
+	// in the CronJob's initContainer. Default pins the same version the
+	// existing hand-crafted etcd-backup on colo-dev-main uses.
+	EtcdctlImage string `envconfig:"ETCD_BACKUP_ETCDCTL_IMAGE" default:"armadaeksatest.azurecr.io/etcdctl:3.5.15"`
+
+	// UploadImage is the container image that uploads the snapshot to Azure
+	// Blob storage. Default pins the same azure-cli version the existing
+	// etcd-backup uses.
+	UploadImage string `envconfig:"ETCD_BACKUP_UPLOAD_IMAGE" default:"armadaeksatest.azurecr.io/azure-cli:2.67.0"`
+
+	// CredentialSecret is the K8s Secret name (in EtcdBackupNamespace)
+	// holding Azure service-principal credentials. Data keys required:
+	// client-id, client-secret, tenant-id.
+	CredentialSecret string `envconfig:"ETCD_BACKUP_CRED_SECRET" default:"az-storage-creds"`
 
 	// ObserveInterval is how often the controller re-polls Velero Schedule and
 	// the etcd CronJob for each CR independent of CR spec changes. Drives
@@ -47,11 +61,6 @@ type Config struct {
 	// for local dev) = event-driven only, no periodic poll. Production deploys
 	// opt in via the K8s manifest — typical band is 1-5min.
 	ObserveInterval time.Duration `envconfig:"BACKUP_OBSERVE_INTERVAL" default:"0s"`
-
-	// MetricsBindAddress is the listen address for the Prometheus /metrics
-	// endpoint. "0" disables it. Default :8096 avoids cb-controller (:8095) and
-	// sc-controller (:8093) collisions.
-	MetricsBindAddress string `envconfig:"METRICS_BIND_ADDRESS" default:":8096"`
 }
 
 var (
@@ -64,15 +73,44 @@ func init() {
 	utilruntime.Must(armadav1.AddToScheme(scheme))
 }
 
+// nolint:gocyclo
 func main() {
+	var metricsAddr string
 	var probeAddr string
-	// Port 8094 — cb-controller uses 8091, sc-controller uses 8092; pick a free one.
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8094", "Health probe bind address.")
+	var enableLeaderElection bool
+	var secureMetrics bool
+	var enableHTTP2 bool
+	var tlsOpts []func(*tls.Config)
+	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
+		"Use :8443 for HTTPS or :8096 for HTTP, or leave as 0 to disable the metrics service.")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8094", "The address the probe endpoint binds to.")
+	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
+		"Enable leader election for controller manager. "+
+			"Enabling this will ensure there is only one active controller manager.")
+	flag.BoolVar(&secureMetrics, "metrics-secure", true,
+		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
+	flag.BoolVar(&enableHTTP2, "enable-http2", false,
+		"If set, HTTP/2 will be enabled for the metrics server.")
 	opts := zap.Options{Development: true}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Disable HTTP/2 unless explicitly enabled — protects against the HTTP/2
+	// Stream Cancellation and Rapid Reset CVEs. Matches cb-controller.
+	if !enableHTTP2 {
+		tlsOpts = append(tlsOpts, func(c *tls.Config) { c.NextProtos = []string{"http/1.1"} })
+	}
+
+	metricsServerOptions := metricsserver.Options{
+		BindAddress:   metricsAddr,
+		SecureServing: secureMetrics,
+		TLSOpts:       tlsOpts,
+	}
+	if secureMetrics {
+		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
 
 	var cfg Config
 	if err := envconfig.Process("", &cfg); err != nil {
@@ -82,8 +120,10 @@ func main() {
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
-		Metrics:                metricsserver.Options{BindAddress: cfg.MetricsBindAddress},
+		Metrics:                metricsServerOptions,
 		HealthProbeBindAddress: probeAddr,
+		LeaderElection:         enableLeaderElection,
+		LeaderElectionID:       "bc.configbundle.armada.ai",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -93,7 +133,9 @@ func main() {
 	setupLog.Info("backup target namespaces",
 		"velero", cfg.VeleroNamespace,
 		"etcd", cfg.EtcdBackupNamespace,
-		"etcdImage", cfg.EtcdBackupImage)
+		"etcdctlImage", cfg.EtcdctlImage,
+		"uploadImage", cfg.UploadImage,
+		"credentialSecret", cfg.CredentialSecret)
 
 	if cfg.ObserveInterval > 0 {
 		setupLog.Info("drift-detection polling enabled", "interval", cfg.ObserveInterval)
@@ -106,7 +148,9 @@ func main() {
 		Scheme:              mgr.GetScheme(),
 		VeleroNamespace:     cfg.VeleroNamespace,
 		EtcdBackupNamespace: cfg.EtcdBackupNamespace,
-		EtcdBackupImage:     cfg.EtcdBackupImage,
+		EtcdctlImage:        cfg.EtcdctlImage,
+		UploadImage:         cfg.UploadImage,
+		CredentialSecret:    cfg.CredentialSecret,
 		ObserveInterval:     cfg.ObserveInterval,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "backupconfig")
@@ -122,7 +166,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting manager", "probe", probeAddr, "metrics", cfg.MetricsBindAddress)
+	setupLog.Info("starting manager", "probe", probeAddr, "metrics", metricsAddr, "secureMetrics", secureMetrics, "leaderElection", enableLeaderElection)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
