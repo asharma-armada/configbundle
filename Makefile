@@ -203,6 +203,9 @@ push-backupconfig: ## Build and push bc-controller image to ACR (e.g. make push-
 	@echo "Building $(BACKUPCONFIG_IMG)"
 	docker buildx build --platform linux/amd64 --target backupconfig -t $(BACKUPCONFIG_IMG) --push .
 
+.PHONY: push-all
+push-all: push-controller push-bundler push-serverconfig push-backupconfig ## Build and push all 4 images to ACR (versions resolved from per-component git tags). Requires: az acr login --name armadaeksatest
+
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
 # - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
