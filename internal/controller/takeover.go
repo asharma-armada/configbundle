@@ -380,7 +380,7 @@ func reconstructServerEntry(
 			continue
 		}
 
-		if field == "idrac" {
+		if field == "idracSettings" {
 			// Nested struct — recurse, scoping the exclusion to idrac fields.
 			srcIdrac, ok := srcVal.(map[string]any)
 			if !ok {
@@ -391,7 +391,7 @@ func reconstructServerEntry(
 				touched = true
 			}
 			if len(newIdrac) > 0 {
-				newEntry["idrac"] = newIdrac
+				newEntry["idracSettings"] = newIdrac
 			}
 			continue
 		}
@@ -505,7 +505,7 @@ func setFieldOnServer(dst, src *armadav1.ServerSpec, field string) error {
 	if copyStructFieldByJSONTag(reflect.ValueOf(dst).Elem(), reflect.ValueOf(src).Elem(), field) {
 		return nil
 	}
-	if copyStructFieldByJSONTag(reflect.ValueOf(&dst.Idrac).Elem(), reflect.ValueOf(&src.Idrac).Elem(), field) {
+	if copyStructFieldByJSONTag(reflect.ValueOf(&dst.IdracSettings).Elem(), reflect.ValueOf(&src.IdracSettings).Elem(), field) {
 		return nil
 	}
 	return fmt.Errorf("unknown takeover field %q", field)

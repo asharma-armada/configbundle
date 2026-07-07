@@ -28,16 +28,16 @@ import (
 //
 // Drift in PromQL:
 //
-//	armada_backup_field_intent != on(cluster, kind, field) armada_backup_field_observed
-//	  unless armada_backup_field_ignored == 1
+//	configbundle_backup_field_intent != on(cluster, kind, field) configbundle_backup_field_observed
+//	  unless configbundle_backup_field_ignored == 1
 var (
 	backupFieldIntent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "armada_backup_field_intent",
+		Name: "configbundle_backup_field_intent",
 		Help: "Intended value of a BackupConfig field. Boolean fields: 0=disabled, 1=enabled. String fields: 1 when set, absent when unset.",
 	}, []string{"cluster", "kind", "field"})
 
 	backupFieldObserved = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "armada_backup_field_observed",
+		Name: "configbundle_backup_field_observed",
 		Help: "Confirmed value of a BackupConfig field from the controller's recordObserved ledger. Same encoding as intent.",
 	}, []string{"cluster", "kind", "field"})
 
@@ -47,13 +47,91 @@ var (
 	// in spec.ignored[] — when divergence reporting for backup fields ships,
 	// this gauge will be populated by ignoredFieldsForCluster below.
 	backupFieldIgnored = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "armada_backup_field_ignored",
+		Name: "configbundle_backup_field_ignored",
 		Help: "1 when the parent ConfigBundle's spec.ignored[] lists this {cluster, kind, field}; absent otherwise. Used by alert rules to suppress drift alerts on admin-overridden fields.",
 	}, []string{"cluster", "kind", "field"})
+
+	// backupConfigReconcileTimestamp is set to time.Now().Unix() after every
+	// successful reconcile. Alerts on "bc-controller has stopped reconciling
+	// this CR" fire when (time() - <this>) exceeds an expected reconcile
+	// cadence. Populated only on success paths — failures leave the last
+	// success timestamp alone so operators see how stale the current state is.
+	backupConfigReconcileTimestamp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "configbundle_backupconfig_reconcile_timestamp_seconds",
+		Help: "Unix timestamp of the last successful reconcile of this BackupConfig CR. Absent series = never reconciled.",
+	}, []string{"cluster"})
+
+	// backupConfigReconcileErrors counts reconcile failures by cause. Labels
+	// stay bounded (fixed set of reason strings: VeleroPatchFailed,
+	// EtcdPatchFailed). Rate() over this counter tells cloud dashboards
+	// which failure mode is dominant.
+	backupConfigReconcileErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "configbundle_backupconfig_reconciliation_errors_total",
+		Help: "Cumulative reconcile failures per BackupConfig CR, labelled by failure reason (VeleroPatchFailed | EtcdPatchFailed).",
+	}, []string{"cluster", "reason"})
+
+	// veleroSchedulePresent = 1 when the underlying Velero Schedule CR that
+	// bc-controller manages for this cluster exists on-cluster, 0 when spec
+	// asked for it but live is missing (deleted OOB, CRD absent, or apply
+	// pending). Series is deleted entirely when spec.velero is nil, so
+	// "no series" means "not managed" — distinct from "should exist but is
+	// gone (0)". Same semantic for etcd below.
+	veleroSchedulePresent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "configbundle_backup_velero_schedule_present",
+		Help: "1 when the live Velero Schedule for this BackupConfig exists on-cluster; 0 when spec.velero is set but the live resource is missing.",
+	}, []string{"cluster"})
+
+	etcdCronJobPresent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "configbundle_backup_etcd_cronjob_present",
+		Help: "1 when the live etcd-backup CronJob for this BackupConfig exists on-cluster; 0 when spec.etcd is set but the live resource is missing.",
+	}, []string{"cluster"})
 )
 
 func init() {
-	metrics.Registry.MustRegister(backupFieldIntent, backupFieldObserved, backupFieldIgnored)
+	metrics.Registry.MustRegister(
+		backupFieldIntent, backupFieldObserved, backupFieldIgnored,
+		backupConfigReconcileTimestamp, backupConfigReconcileErrors,
+		veleroSchedulePresent, etcdCronJobPresent,
+	)
+}
+
+// recordPresence updates the resource-present gauges from a live snapshot.
+// Nil block for a mechanism spec-asks-for = live-missing (0). Nil block for a
+// mechanism spec-does-not-ask-for = delete the series entirely (mechanism
+// not managed, absence is not "missing"). Called from the same live-read
+// snapshot as the other observed metrics so all four surfaces stay coherent.
+func recordPresence(cluster string, bc *armadav1.BackupConfig, live armadav1.ObservedBackup) {
+	labels := prometheus.Labels{"cluster": cluster}
+	if bc.Spec.Velero != nil {
+		if live.Velero != nil {
+			veleroSchedulePresent.With(labels).Set(1)
+		} else {
+			veleroSchedulePresent.With(labels).Set(0)
+		}
+	} else {
+		veleroSchedulePresent.Delete(labels)
+	}
+	if bc.Spec.Etcd != nil {
+		if live.Etcd != nil {
+			etcdCronJobPresent.With(labels).Set(1)
+		} else {
+			etcdCronJobPresent.With(labels).Set(0)
+		}
+	} else {
+		etcdCronJobPresent.Delete(labels)
+	}
+}
+
+// recordReconcileSuccess marks a successful reconcile timestamp.
+func recordReconcileSuccess(cluster string, now int64) {
+	backupConfigReconcileTimestamp.With(prometheus.Labels{"cluster": cluster}).Set(float64(now))
+}
+
+// recordReconcileError increments the failure counter for the given reason.
+// Reason strings should stay bounded — pick from a fixed enum, do not
+// interpolate error messages.
+func recordReconcileError(cluster, reason string) {
+	backupConfigReconcileErrors.With(prometheus.Labels{"cluster": cluster, "reason": reason}).Inc()
 }
 
 func boolGauge(b bool) float64 {
@@ -67,59 +145,80 @@ func boolGauge(b bool) float64 {
 // spec. Fields with no intent (nil pointer) have their series deleted so
 // PromQL queries don't see stale values.
 func recordIntent(bc *armadav1.BackupConfig) {
-	recordBlockIntent(bc.Name, "velero", bc.Spec.Velero)
-	recordBlockIntent(bc.Name, "etcd", bc.Spec.Etcd)
+	if v := bc.Spec.Velero; v != nil {
+		recordBlockIntent(bc.Name, "velero", v.Enabled, v.Schedule, v.Location)
+	} else {
+		recordBlockIntent(bc.Name, "velero", nil, nil, nil)
+	}
+	if e := bc.Spec.Etcd; e != nil {
+		recordBlockIntent(bc.Name, "etcd", e.Enabled, e.Schedule, e.Location)
+	} else {
+		recordBlockIntent(bc.Name, "etcd", nil, nil, nil)
+	}
 }
 
-func recordBlockIntent(cluster, kind string, block *armadav1.BackupBlock) {
+// recordBlockIntent takes plain fields (not a typed *BackupBlock) so callers
+// carrying either VeleroBackupSpec or EtcdBackupSpec can share this helper
+// without wrapping in an interface.
+func recordBlockIntent(cluster, kind string, enabled *bool, schedule, location *string) {
 	enabledLabels := prometheus.Labels{"cluster": cluster, "kind": kind, "field": "enabled"}
 	scheduleLabels := prometheus.Labels{"cluster": cluster, "kind": kind, "field": "schedule"}
 	locationLabels := prometheus.Labels{"cluster": cluster, "kind": kind, "field": "location"}
-	if block == nil {
-		backupFieldIntent.Delete(enabledLabels)
-		backupFieldIntent.Delete(scheduleLabels)
-		backupFieldIntent.Delete(locationLabels)
-		return
-	}
-	if block.Enabled != nil {
-		backupFieldIntent.With(enabledLabels).Set(boolGauge(*block.Enabled))
+	if enabled != nil {
+		backupFieldIntent.With(enabledLabels).Set(boolGauge(*enabled))
 	} else {
 		backupFieldIntent.Delete(enabledLabels)
 	}
-	if block.Schedule != nil {
+	if schedule != nil {
 		backupFieldIntent.With(scheduleLabels).Set(1)
 	} else {
 		backupFieldIntent.Delete(scheduleLabels)
 	}
-	if block.Location != nil {
+	if location != nil {
 		backupFieldIntent.With(locationLabels).Set(1)
 	} else {
 		backupFieldIntent.Delete(locationLabels)
 	}
 }
 
-// recordObservedMetric updates the observed gauge from the status ledger.
-// Mirror of recordIntent but reading from status.observed.{velero,etcd}.
-func recordObservedMetric(bc *armadav1.BackupConfig) {
-	recordBlockObserved(bc.Name, "velero", bc.Status.Observed.Velero)
-	recordBlockObserved(bc.Name, "etcd", bc.Status.Observed.Etcd)
+// recordObservedMetric updates the observed gauges directly from a live-read
+// snapshot. Deliberately takes the snapshot value (not `bc.Status`) so metrics
+// are decoupled from status write success: if RetryOnConflict exhausts on the
+// status Update, the Prom scrape still sees the honest values from THIS
+// reconcile. Metrics feed Prom federation → cloud Grafana/Alertmanager —
+// that pipeline is the primary observability surface and must not block on
+// a K8s API race.
+//
+// A nil block (unmanaged mechanism or live resource missing) deletes the
+// series so PromQL doesn't see stale values.
+func recordObservedMetric(cluster string, observed armadav1.ObservedBackup) {
+	if v := observed.Velero; v != nil {
+		recordBlockObserved(cluster, "velero", v.Enabled, v.Schedule, v.Location)
+	} else {
+		recordBlockObserved(cluster, "velero", nil, nil, nil)
+	}
+	if e := observed.Etcd; e != nil {
+		recordBlockObserved(cluster, "etcd", e.Enabled, e.Schedule, e.Location)
+	} else {
+		recordBlockObserved(cluster, "etcd", nil, nil, nil)
+	}
 }
 
-func recordBlockObserved(cluster, kind string, block armadav1.ObservedBackupBlock) {
+func recordBlockObserved(cluster, kind string, enabled *bool, schedule, location *string) {
 	enabledLabels := prometheus.Labels{"cluster": cluster, "kind": kind, "field": "enabled"}
 	scheduleLabels := prometheus.Labels{"cluster": cluster, "kind": kind, "field": "schedule"}
 	locationLabels := prometheus.Labels{"cluster": cluster, "kind": kind, "field": "location"}
-	if block.Enabled != nil {
-		backupFieldObserved.With(enabledLabels).Set(boolGauge(*block.Enabled))
+	if enabled != nil {
+		backupFieldObserved.With(enabledLabels).Set(boolGauge(*enabled))
 	} else {
 		backupFieldObserved.Delete(enabledLabels)
 	}
-	if block.Schedule != nil {
+	if schedule != nil {
 		backupFieldObserved.With(scheduleLabels).Set(1)
 	} else {
 		backupFieldObserved.Delete(scheduleLabels)
 	}
-	if block.Location != nil {
+	if location != nil {
 		backupFieldObserved.With(locationLabels).Set(1)
 	} else {
 		backupFieldObserved.Delete(locationLabels)

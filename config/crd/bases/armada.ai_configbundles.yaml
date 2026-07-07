@@ -56,86 +56,6 @@ spec:
               ConfigBundleSpec holds the full intended configuration for a datacenter.
               The ConfigBundle controller decomposes this into domain child CRs via SSA.
             properties:
-              clusters:
-                description: |-
-                  Clusters is the list of Kubernetes cluster backup configurations for this
-                  datacenter. The decomposer projects each entry into a BackupConfig child CR.
-                items:
-                  description: |-
-                    ClusterSpec describes one Kubernetes cluster's desired backup configuration
-                    within a ConfigBundle. The bundler populates this from the orbital
-                    KubernetesCluster → ClusterBackup → {EtcdBackup, VeleroBackup} subgraph.
-                    The decomposer projects each entry into a BackupConfig child CR.
-                    BackupBlock and its type-name constants live in backupconfig_types.go so the
-                    child-shape declaration stays adjacent to its consumer.
-                  properties:
-                    etcd:
-                      description: Etcd holds desired etcd backup configuration.
-                      properties:
-                        enabled:
-                          description: Enabled toggles the backup mechanism on or
-                            off.
-                          type: boolean
-                        location:
-                          description: |-
-                            Location is the storage location the backup writes to (e.g. an S3 URL or a
-                            Velero BackupStorageLocation name). Free-form; mechanism-specific.
-                          type: string
-                        orbId:
-                          description: |-
-                            OrbID is the immutable Orbital identifier for the backup-node this block
-                            represents (e.g. "colo:cluster-001-velero"). Set by the bundler.
-                            Identity-only; admin overrides never touch it.
-                          type: string
-                        schedule:
-                          description: Schedule is a cron expression for when the
-                            backup runs (e.g. "0 2 * * *").
-                          type: string
-                      required:
-                      - orbId
-                      type: object
-                    name:
-                      description: |-
-                        Name is the cluster's display name. Informational — not used for routing
-                        or identity.
-                      type: string
-                    orbId:
-                      description: |-
-                        OrbID is the immutable Orbital identifier for this cluster (e.g.
-                        "colo:cluster-001"). Used as the SSA listMapKey for spec.clusters[].
-                      type: string
-                    velero:
-                      description: Velero holds desired Velero backup configuration.
-                      properties:
-                        enabled:
-                          description: Enabled toggles the backup mechanism on or
-                            off.
-                          type: boolean
-                        location:
-                          description: |-
-                            Location is the storage location the backup writes to (e.g. an S3 URL or a
-                            Velero BackupStorageLocation name). Free-form; mechanism-specific.
-                          type: string
-                        orbId:
-                          description: |-
-                            OrbID is the immutable Orbital identifier for the backup-node this block
-                            represents (e.g. "colo:cluster-001-velero"). Set by the bundler.
-                            Identity-only; admin overrides never touch it.
-                          type: string
-                        schedule:
-                          description: Schedule is a cron expression for when the
-                            backup runs (e.g. "0 2 * * *").
-                          type: string
-                      required:
-                      - orbId
-                      type: object
-                  required:
-                  - orbId
-                  type: object
-                type: array
-                x-kubernetes-list-map-keys:
-                - orbId
-                x-kubernetes-list-type: map
               datacenter:
                 description: Datacenter is the identifier of the target datacenter
                   (matches Orbital namespace name).
@@ -162,13 +82,14 @@ spec:
                     field:
                       description: |-
                         Field is the leaf field name to leave to the local manager (e.g. "racadmEnabled").
-                        Must match the JSON tag name on IdracSpec (or ServerSpec for top-level fields).
+                        Must match the JSON tag name on IdracSettingsSpec (or ServerSpec for
+                        top-level fields).
                       type: string
                     orbId:
                       description: |-
                         OrbID is the Orbital ConfigItem identifier of the node that owns the field
-                        (e.g. "colo:srv-001-idrac" for an iDRAC field). Informational — used for
-                        audit and divergence-resolution correlation.
+                        (e.g. "colo:srv-001-idrac" for an idracSettings field). Informational —
+                        used for audit and divergence-resolution correlation.
                       type: string
                     serverOrbId:
                       description: |-
@@ -182,6 +103,112 @@ spec:
                   type: object
                 type: array
                 x-kubernetes-list-type: atomic
+              kubernetesClusters:
+                description: |-
+                  KubernetesClusters is the list of Kubernetes cluster configurations for
+                  this datacenter, mirroring the orbital DataCenter.kubernetesClusters
+                  collection. The decomposer projects each entry's Backup into a
+                  BackupConfig child CR.
+                items:
+                  description: |-
+                    KubernetesClusterSpec describes one Kubernetes cluster within a ConfigBundle,
+                    mirroring orbital KubernetesCluster (interface). The bundler populates this
+                    from the orbital KubernetesCluster subgraph; the decomposer projects the
+                    Backup field into a BackupConfig child CR (one per ClusterBackup node).
+                  properties:
+                    backup:
+                      description: |-
+                        Backup holds this cluster's backup configuration, mirroring the orbital
+                        KubernetesCluster.backup edge. Absent = no backup config for this cluster.
+                      properties:
+                        etcd:
+                          description: Etcd holds desired etcd backup configuration.
+                          properties:
+                            enabled:
+                              description: Enabled toggles the backup mechanism on
+                                or off.
+                              type: boolean
+                            location:
+                              description: Location is the storage location the backup
+                                writes to.
+                              type: string
+                            orbId:
+                              description: |-
+                                OrbID is the immutable Orbital identifier for this EtcdBackup node
+                                (e.g. "colo:cluster-001-etcd"). Set by the bundler; identity-only.
+                              type: string
+                            schedule:
+                              description: Schedule is a cron expression for when
+                                the backup runs (e.g. "0 3 * * *").
+                              type: string
+                          required:
+                          - orbId
+                          type: object
+                        orbId:
+                          description: |-
+                            OrbID is the immutable Orbital identifier for this ClusterBackup node
+                            (e.g. "colo:cluster-001-backup"). Set by the bundler; identity-only.
+                          type: string
+                        s3Sync:
+                          description: S3Sync holds desired S3-sync backup configuration.
+                          properties:
+                            enabled:
+                              description: Enabled toggles the S3-sync mechanism on
+                                or off.
+                              type: boolean
+                            orbId:
+                              description: |-
+                                OrbID is the immutable Orbital identifier for this S3Sync node
+                                (e.g. "colo:cluster-001-s3sync"). Set by the bundler; identity-only.
+                              type: string
+                          required:
+                          - orbId
+                          type: object
+                        velero:
+                          description: Velero holds desired Velero backup configuration.
+                          properties:
+                            enabled:
+                              description: Enabled toggles the backup mechanism on
+                                or off.
+                              type: boolean
+                            location:
+                              description: |-
+                                Location is the storage location the backup writes to (e.g. an S3 URL or
+                                a Velero BackupStorageLocation name).
+                              type: string
+                            orbId:
+                              description: |-
+                                OrbID is the immutable Orbital identifier for this VeleroBackup node
+                                (e.g. "colo:cluster-001-velero"). Set by the bundler; identity-only.
+                              type: string
+                            schedule:
+                              description: Schedule is a cron expression for when
+                                the backup runs (e.g. "0 2 * * *").
+                              type: string
+                          required:
+                          - orbId
+                          type: object
+                      required:
+                      - orbId
+                      type: object
+                    name:
+                      description: |-
+                        Name is the cluster's display name. Informational — not used for routing
+                        or identity.
+                      type: string
+                    orbId:
+                      description: |-
+                        OrbID is the immutable Orbital identifier for this cluster (e.g.
+                        "colo:cluster-001"). Used as the SSA listMapKey for
+                        spec.kubernetesClusters[].
+                      type: string
+                  required:
+                  - orbId
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - orbId
+                x-kubernetes-list-type: map
               orbId:
                 description: |-
                   OrbID is the immutable Orbital identifier for this datacenter (e.g. "colo:colo-galleon").
@@ -192,7 +219,8 @@ spec:
                   datacenter.
                 items:
                   description: |-
-                    ServerSpec describes one server's desired configuration within a ConfigBundle.
+                    ServerSpec describes one server's desired configuration within a ConfigBundle,
+                    mirroring orbital Server.
 
                     Hostname and OobIP are pointers so SSA partial patches can omit admin-owned
                     fields (see ADR-007). OrbID is the listMapKey — Orbital's immutable identifier
@@ -203,10 +231,11 @@ spec:
                       description: Hostname is the server's hostname. Mandatory —
                         the bundler skips servers without one.
                       type: string
-                    idrac:
+                    idracSettings:
                       description: |-
-                        Idrac holds desired iDRAC configuration. Idrac itself is a value type;
-                        its leaf fields are pointers (see IdracSpec).
+                        IdracSettings holds desired iDRAC configuration, mirroring the orbital
+                        Server.idracSettings edge. Value type; its leaf fields are pointers
+                        (see IdracSettingsSpec).
                       properties:
                         dhcpEnabled:
                           type: boolean
@@ -224,7 +253,7 @@ spec:
                             OrbID is the immutable Orbital identifier for this IdracSettings node
                             (e.g. "colo:srv-001-idrac"). Set by the bundler; identity-only, never
                             admin-overridable. Required so a malformed bundle (bundler bug — forgot
-                            to set orbId on an idrac block) fails at apply time, not later.
+                            to set orbId on an idracSettings block) fails at apply time, not later.
                           type: string
                         osToIdracPassThroughEnabled:
                           type: boolean
@@ -277,13 +306,14 @@ spec:
                     field:
                       description: |-
                         Field is the leaf field name to reclaim (e.g. "sshEnabled").
-                        Must match the JSON tag name on IdracSpec (or ServerSpec for top-level fields).
+                        Must match the JSON tag name on IdracSettingsSpec (or ServerSpec for
+                        top-level fields).
                       type: string
                     orbId:
                       description: |-
                         OrbID is the Orbital ConfigItem identifier of the node that owns the field
-                        (e.g. "colo:srv-001-idrac" for an iDRAC field). Informational — used for
-                        audit and divergence-resolution correlation.
+                        (e.g. "colo:srv-001-idrac" for an idracSettings field). Informational —
+                        used for audit and divergence-resolution correlation.
                       type: string
                     serverOrbId:
                       description: |-

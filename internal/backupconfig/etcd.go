@@ -70,7 +70,7 @@ func (r *BackupConfigReconciler) reconcileEtcd(ctx context.Context, bc *armadav1
 // Image is the placeholder default until the real etcd-snapshot image ships.
 // BACKUP_LOCATION env carries the location string; honored by the real image
 // once it lands.
-func buildEtcdCronJob(name, namespace, image string, block *armadav1.BackupBlock) *batchv1.CronJob {
+func buildEtcdCronJob(name, namespace, image string, block *armadav1.EtcdBackupSpec) *batchv1.CronJob {
 	schedule := ""
 	if block.Schedule != nil {
 		schedule = *block.Schedule
@@ -114,9 +114,45 @@ func buildEtcdCronJob(name, namespace, image string, block *armadav1.BackupBlock
 	return cj
 }
 
+// observeEtcd reads the live etcd-backup CronJob and projects the fields
+// bc-controller manages into an ObservedEtcdStatus. Returns nil when the
+// CronJob does not exist (same semantics as observeVelero — nil means "no
+// live resource present," distinct from "present with empty fields").
+//
+// Field mapping mirrors the intent-writer in reconcileEtcd:
+//   - live.spec.suspend (bool, nil-safe)                     → observed.Enabled (inverted)
+//   - live.spec.schedule (string)                            → observed.Schedule
+//   - container BACKUP_LOCATION env var on the managed image → observed.Location
+func observeEtcd(ctx context.Context, c client.Client, namespace, name string) (*armadav1.ObservedEtcdStatus, error) {
+	var live batchv1.CronJob
+	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get etcd cronjob for observe: %w", err)
+	}
+	out := &armadav1.ObservedEtcdStatus{}
+	if live.Spec.Schedule != "" {
+		s := live.Spec.Schedule
+		out.Schedule = &s
+	}
+	enabled := true
+	if live.Spec.Suspend != nil {
+		enabled = !*live.Spec.Suspend
+	}
+	out.Enabled = &enabled
+	if c := findContainer(live.Spec.JobTemplate.Spec.Template.Spec.Containers, etcdBackupContainerName); c != nil {
+		if v := envValue(c.Env, etcdBackupLocationEnv); v != "" {
+			l := v
+			out.Location = &l
+		}
+	}
+	return out, nil
+}
+
 // etcdDeltas returns the set of fields that differ between the live CronJob and
 // the intent. NotFound means all intent fields are deltas (create-on-first-apply).
-func etcdDeltas(ctx context.Context, c client.Client, namespace, name string, block *armadav1.BackupBlock, image string) (map[string]string, error) {
+func etcdDeltas(ctx context.Context, c client.Client, namespace, name string, block *armadav1.EtcdBackupSpec, image string) (map[string]string, error) {
 	out := map[string]string{}
 
 	var live batchv1.CronJob

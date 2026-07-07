@@ -72,8 +72,10 @@ spec:
               hostname:
                 description: Hostname is the server's hostname for display and logging.
                 type: string
-              idrac:
-                description: Idrac holds desired iDRAC configuration.
+              idracSettings:
+                description: |-
+                  IdracSettings holds desired iDRAC configuration, mirroring the orbital
+                  Server.idracSettings edge.
                 properties:
                   dhcpEnabled:
                     type: boolean
@@ -91,7 +93,7 @@ spec:
                       OrbID is the immutable Orbital identifier for this IdracSettings node
                       (e.g. "colo:srv-001-idrac"). Set by the bundler; identity-only, never
                       admin-overridable. Required so a malformed bundle (bundler bug — forgot
-                      to set orbId on an idrac block) fails at apply time, not later.
+                      to set orbId on an idracSettings block) fails at apply time, not later.
                     type: string
                   osToIdracPassThroughEnabled:
                     type: boolean
@@ -197,9 +199,9 @@ spec:
                   reconciles where the condition message can only hold the most recent
                   action. Absence of a field means the controller has never confirmed it.
                 properties:
-                  idrac:
-                    description: Idrac holds the controller-confirmed iDRAC field
-                      values.
+                  idracSettings:
+                    description: IdracSettings holds the controller-confirmed iDRAC
+                      field values.
                     properties:
                       ipmiEnabled:
                         type: boolean

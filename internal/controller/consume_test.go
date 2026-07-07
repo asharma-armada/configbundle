@@ -233,24 +233,24 @@ func TestOmitAdminOwnedFields_BowsOutOnValueMismatch(t *testing.T) {
 	intent := armadav1.ConfigBundleSpec{
 		Datacenter: "colo:test",
 		Servers: []armadav1.ServerSpec{{
-			OrbID:      "colo:srv-1",
-			ServiceTag: "T1",
-			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(false)},
+			OrbID:         "colo:srv-1",
+			ServiceTag:    "T1",
+			IdracSettings: armadav1.IdracSettingsSpec{SSHEnabled: ptr.To(false)},
 		}},
 	}
 	live := armadav1.ConfigBundleSpec{
 		Datacenter: "colo:test",
 		Servers: []armadav1.ServerSpec{{
-			OrbID:      "colo:srv-1",
-			ServiceTag: "T1",
-			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(true)},
+			OrbID:         "colo:srv-1",
+			ServiceTag:    "T1",
+			IdracSettings: armadav1.IdracSettingsSpec{SSHEnabled: ptr.To(true)},
 		}},
 	}
 	mf := managedFieldsClaim(t, "local:admin", map[string]any{
 		"f:spec": map[string]any{
 			"f:servers": map[string]any{
 				`k:{"orbId":"colo:srv-1"}`: map[string]any{
-					"f:idrac": map[string]any{"f:sshEnabled": map[string]any{}},
+					"f:idracSettings": map[string]any{"f:sshEnabled": map[string]any{}},
 				},
 			},
 		},
@@ -263,8 +263,8 @@ func TestOmitAdminOwnedFields_BowsOutOnValueMismatch(t *testing.T) {
 	if len(out.Servers) != 1 {
 		t.Fatalf("expected 1 server, got %d", len(out.Servers))
 	}
-	if out.Servers[0].Idrac.SSHEnabled != nil {
-		t.Errorf("sshEnabled should be omitted (genuine override, values differ), got %v", *out.Servers[0].Idrac.SSHEnabled)
+	if out.Servers[0].IdracSettings.SSHEnabled != nil {
+		t.Errorf("sshEnabled should be omitted (genuine override, values differ), got %v", *out.Servers[0].IdracSettings.SSHEnabled)
 	}
 }
 
@@ -274,24 +274,24 @@ func TestOmitAdminOwnedFields_KeepsOnValueMatchForAutoClaim(t *testing.T) {
 	intent := armadav1.ConfigBundleSpec{
 		Datacenter: "colo:test",
 		Servers: []armadav1.ServerSpec{{
-			OrbID:      "colo:srv-1",
-			ServiceTag: "T1",
-			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(true)},
+			OrbID:         "colo:srv-1",
+			ServiceTag:    "T1",
+			IdracSettings: armadav1.IdracSettingsSpec{SSHEnabled: ptr.To(true)},
 		}},
 	}
 	live := armadav1.ConfigBundleSpec{
 		Datacenter: "colo:test",
 		Servers: []armadav1.ServerSpec{{
-			OrbID:      "colo:srv-1",
-			ServiceTag: "T1",
-			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(true)},
+			OrbID:         "colo:srv-1",
+			ServiceTag:    "T1",
+			IdracSettings: armadav1.IdracSettingsSpec{SSHEnabled: ptr.To(true)},
 		}},
 	}
 	mf := managedFieldsClaim(t, "local:admin", map[string]any{
 		"f:spec": map[string]any{
 			"f:servers": map[string]any{
 				`k:{"orbId":"colo:srv-1"}`: map[string]any{
-					"f:idrac": map[string]any{"f:sshEnabled": map[string]any{}},
+					"f:idracSettings": map[string]any{"f:sshEnabled": map[string]any{}},
 				},
 			},
 		},
@@ -304,9 +304,9 @@ func TestOmitAdminOwnedFields_KeepsOnValueMatchForAutoClaim(t *testing.T) {
 	if len(out.Servers) != 1 {
 		t.Fatalf("expected 1 server, got %d", len(out.Servers))
 	}
-	if out.Servers[0].Idrac.SSHEnabled == nil || *out.Servers[0].Idrac.SSHEnabled != true {
+	if out.Servers[0].IdracSettings.SSHEnabled == nil || *out.Servers[0].IdracSettings.SSHEnabled != true {
 		t.Errorf("sshEnabled should be KEPT when values match (auto-claim case); got %v",
-			out.Servers[0].Idrac.SSHEnabled)
+			out.Servers[0].IdracSettings.SSHEnabled)
 	}
 }
 
@@ -315,9 +315,9 @@ func TestOmitAdminOwnedFields_KeepsTakeoverTargetEvenOnMismatch(t *testing.T) {
 	intent := armadav1.ConfigBundleSpec{
 		Datacenter: "colo:test",
 		Servers: []armadav1.ServerSpec{{
-			OrbID:      "colo:srv-1",
-			ServiceTag: "T1",
-			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(false)},
+			OrbID:         "colo:srv-1",
+			ServiceTag:    "T1",
+			IdracSettings: armadav1.IdracSettingsSpec{SSHEnabled: ptr.To(false)},
 		}},
 		Takeover: []armadav1.TakeoverEntry{{
 			OrbID: "colo:srv-1-idrac", ServerOrbID: "colo:srv-1", Field: "sshEnabled",
@@ -326,16 +326,16 @@ func TestOmitAdminOwnedFields_KeepsTakeoverTargetEvenOnMismatch(t *testing.T) {
 	live := armadav1.ConfigBundleSpec{
 		Datacenter: "colo:test",
 		Servers: []armadav1.ServerSpec{{
-			OrbID:      "colo:srv-1",
-			ServiceTag: "T1",
-			Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(true)},
+			OrbID:         "colo:srv-1",
+			ServiceTag:    "T1",
+			IdracSettings: armadav1.IdracSettingsSpec{SSHEnabled: ptr.To(true)},
 		}},
 	}
 	mf := managedFieldsClaim(t, "local:admin", map[string]any{
 		"f:spec": map[string]any{
 			"f:servers": map[string]any{
 				`k:{"orbId":"colo:srv-1"}`: map[string]any{
-					"f:idrac": map[string]any{"f:sshEnabled": map[string]any{}},
+					"f:idracSettings": map[string]any{"f:sshEnabled": map[string]any{}},
 				},
 			},
 		},
@@ -345,9 +345,9 @@ func TestOmitAdminOwnedFields_KeepsTakeoverTargetEvenOnMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("omit: %v", err)
 	}
-	if out.Servers[0].Idrac.SSHEnabled == nil || *out.Servers[0].Idrac.SSHEnabled != false {
+	if out.Servers[0].IdracSettings.SSHEnabled == nil || *out.Servers[0].IdracSettings.SSHEnabled != false {
 		t.Errorf("takeover-target sshEnabled should be KEPT for force-apply, got %v",
-			out.Servers[0].Idrac.SSHEnabled)
+			out.Servers[0].IdracSettings.SSHEnabled)
 	}
 }
 
@@ -358,9 +358,9 @@ func TestOmitAdminOwnedFields_IgnoredAlwaysOmittedEvenOnValueMatch(t *testing.T)
 	intent := armadav1.ConfigBundleSpec{
 		Datacenter: "colo:test",
 		Servers: []armadav1.ServerSpec{{
-			OrbID:      "colo:srv-1",
-			ServiceTag: "T1",
-			Idrac:      armadav1.IdracSpec{RacadmEnabled: ptr.To(true)},
+			OrbID:         "colo:srv-1",
+			ServiceTag:    "T1",
+			IdracSettings: armadav1.IdracSettingsSpec{RacadmEnabled: ptr.To(true)},
 		}},
 		Ignored: []armadav1.IgnoredEntry{{
 			OrbID: "colo:srv-1-idrac", ServerOrbID: "colo:srv-1", Field: "racadmEnabled",
@@ -370,16 +370,16 @@ func TestOmitAdminOwnedFields_IgnoredAlwaysOmittedEvenOnValueMatch(t *testing.T)
 	live := armadav1.ConfigBundleSpec{
 		Datacenter: "colo:test",
 		Servers: []armadav1.ServerSpec{{
-			OrbID:      "colo:srv-1",
-			ServiceTag: "T1",
-			Idrac:      armadav1.IdracSpec{RacadmEnabled: ptr.To(true)},
+			OrbID:         "colo:srv-1",
+			ServiceTag:    "T1",
+			IdracSettings: armadav1.IdracSettingsSpec{RacadmEnabled: ptr.To(true)},
 		}},
 	}
 	mf := managedFieldsClaim(t, "local:admin", map[string]any{
 		"f:spec": map[string]any{
 			"f:servers": map[string]any{
 				`k:{"orbId":"colo:srv-1"}`: map[string]any{
-					"f:idrac": map[string]any{"f:racadmEnabled": map[string]any{}},
+					"f:idracSettings": map[string]any{"f:racadmEnabled": map[string]any{}},
 				},
 			},
 		},
@@ -389,9 +389,9 @@ func TestOmitAdminOwnedFields_IgnoredAlwaysOmittedEvenOnValueMatch(t *testing.T)
 	if err != nil {
 		t.Fatalf("omit: %v", err)
 	}
-	if len(out.Servers) > 0 && out.Servers[0].Idrac.RacadmEnabled != nil {
+	if len(out.Servers) > 0 && out.Servers[0].IdracSettings.RacadmEnabled != nil {
 		t.Errorf("ignored field must be OMITTED from apply body regardless of value match (Ignore preserves local ownership); got %v",
-			*out.Servers[0].Idrac.RacadmEnabled)
+			*out.Servers[0].IdracSettings.RacadmEnabled)
 	}
 }
 
@@ -403,9 +403,9 @@ func TestOmitAdminOwnedFields_IgnoredWithoutLocalClaim_StaysInApplyForReclaim(t 
 	intent := armadav1.ConfigBundleSpec{
 		Datacenter: "colo:test",
 		Servers: []armadav1.ServerSpec{{
-			OrbID:      "colo:srv-1",
-			ServiceTag: "T1",
-			Idrac:      armadav1.IdracSpec{RacadmEnabled: ptr.To(true)},
+			OrbID:         "colo:srv-1",
+			ServiceTag:    "T1",
+			IdracSettings: armadav1.IdracSettingsSpec{RacadmEnabled: ptr.To(true)},
 		}},
 		Ignored: []armadav1.IgnoredEntry{{
 			OrbID: "colo:srv-1-idrac", ServerOrbID: "colo:srv-1", Field: "racadmEnabled",
@@ -414,9 +414,9 @@ func TestOmitAdminOwnedFields_IgnoredWithoutLocalClaim_StaysInApplyForReclaim(t 
 	live := armadav1.ConfigBundleSpec{
 		Datacenter: "colo:test",
 		Servers: []armadav1.ServerSpec{{
-			OrbID:      "colo:srv-1",
-			ServiceTag: "T1",
-			Idrac:      armadav1.IdracSpec{RacadmEnabled: ptr.To(true)},
+			OrbID:         "colo:srv-1",
+			ServiceTag:    "T1",
+			IdracSettings: armadav1.IdracSettingsSpec{RacadmEnabled: ptr.To(true)},
 		}},
 	}
 	// No managedFields entries for local:* — controller currently sole owner.
@@ -424,11 +424,11 @@ func TestOmitAdminOwnedFields_IgnoredWithoutLocalClaim_StaysInApplyForReclaim(t 
 	if err != nil {
 		t.Fatalf("omit: %v", err)
 	}
-	if len(out.Servers) == 0 || out.Servers[0].Idrac.RacadmEnabled == nil {
+	if len(out.Servers) == 0 || out.Servers[0].IdracSettings.RacadmEnabled == nil {
 		t.Fatalf("ignored field with no local:* claim must be RETAINED in apply body (ADR-009 reclaim semantic); got nil")
 	}
-	if *out.Servers[0].Idrac.RacadmEnabled != true {
-		t.Errorf("expected intent value true to flow through; got %v", *out.Servers[0].Idrac.RacadmEnabled)
+	if *out.Servers[0].IdracSettings.RacadmEnabled != true {
+		t.Errorf("expected intent value true to flow through; got %v", *out.Servers[0].IdracSettings.RacadmEnabled)
 	}
 }
 
@@ -443,7 +443,7 @@ func TestOmitAdminOwnedFields_BatchSiblingsOnSameServer(t *testing.T) {
 		Servers: []armadav1.ServerSpec{{
 			OrbID:      "colo:srv-1",
 			ServiceTag: "T1",
-			Idrac: armadav1.IdracSpec{
+			IdracSettings: armadav1.IdracSettingsSpec{
 				SSHEnabled:  ptr.To(false), // reject: keep intent at false
 				IPMIEnabled: ptr.To(true),  // accept: intent updated to override
 			},
@@ -457,7 +457,7 @@ func TestOmitAdminOwnedFields_BatchSiblingsOnSameServer(t *testing.T) {
 		Servers: []armadav1.ServerSpec{{
 			OrbID:      "colo:srv-1",
 			ServiceTag: "T1",
-			Idrac: armadav1.IdracSpec{
+			IdracSettings: armadav1.IdracSettingsSpec{
 				SSHEnabled:  ptr.To(true), // override still at edge
 				IPMIEnabled: ptr.To(true), // override matches new intent post-Accept
 			},
@@ -467,7 +467,7 @@ func TestOmitAdminOwnedFields_BatchSiblingsOnSameServer(t *testing.T) {
 		"f:spec": map[string]any{
 			"f:servers": map[string]any{
 				`k:{"orbId":"colo:srv-1"}`: map[string]any{
-					"f:idrac": map[string]any{
+					"f:idracSettings": map[string]any{
 						"f:sshEnabled":  map[string]any{},
 						"f:ipmiEnabled": map[string]any{},
 					},
@@ -481,11 +481,11 @@ func TestOmitAdminOwnedFields_BatchSiblingsOnSameServer(t *testing.T) {
 		t.Fatalf("omit: %v", err)
 	}
 	srv := out.Servers[0]
-	if srv.Idrac.SSHEnabled == nil || *srv.Idrac.SSHEnabled != false {
-		t.Errorf("sshEnabled (in takeover) must stay in apply; got %v", srv.Idrac.SSHEnabled)
+	if srv.IdracSettings.SSHEnabled == nil || *srv.IdracSettings.SSHEnabled != false {
+		t.Errorf("sshEnabled (in takeover) must stay in apply; got %v", srv.IdracSettings.SSHEnabled)
 	}
-	if srv.Idrac.IPMIEnabled == nil || *srv.Idrac.IPMIEnabled != true {
-		t.Errorf("ipmiEnabled (values match post-Accept) must stay for auto-claim; got %v", srv.Idrac.IPMIEnabled)
+	if srv.IdracSettings.IPMIEnabled == nil || *srv.IdracSettings.IPMIEnabled != true {
+		t.Errorf("ipmiEnabled (values match post-Accept) must stay for auto-claim; got %v", srv.IdracSettings.IPMIEnabled)
 	}
 }
 
@@ -496,7 +496,7 @@ func TestCollectLocalClaimedKeys_LocalIdracClaim(t *testing.T) {
 		"f:spec": map[string]any{
 			"f:servers": map[string]any{
 				`k:{"orbId":"colo:srv-1"}`: map[string]any{
-					"f:idrac": map[string]any{"f:racadmEnabled": map[string]any{}},
+					"f:idracSettings": map[string]any{"f:racadmEnabled": map[string]any{}},
 				},
 			},
 		},
@@ -512,7 +512,7 @@ func TestCollectLocalClaimedKeys_IgnoresControllerManager(t *testing.T) {
 		"f:spec": map[string]any{
 			"f:servers": map[string]any{
 				`k:{"orbId":"colo:srv-1"}`: map[string]any{
-					"f:idrac": map[string]any{"f:racadmEnabled": map[string]any{}},
+					"f:idracSettings": map[string]any{"f:racadmEnabled": map[string]any{}},
 				},
 			},
 		},

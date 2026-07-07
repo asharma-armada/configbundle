@@ -64,7 +64,7 @@ func (r *ConfigBundleReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if isSpecChange {
 		log.Info("reconciling ConfigBundle",
 			"name", cb.Name, "generation", cb.Generation,
-			"servers", len(cb.Spec.Servers), "clusters", len(cb.Spec.Clusters))
+			"servers", len(cb.Spec.Servers), "clusters", len(cb.Spec.KubernetesClusters))
 	} else {
 		log.V(1).Info("reconciling ConfigBundle (drift/owns event)",
 			"name", cb.Name, "generation", cb.Generation)
@@ -77,9 +77,16 @@ func (r *ConfigBundleReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	}
 
-	for _, cluster := range cb.Spec.Clusters {
+	for _, cluster := range cb.Spec.KubernetesClusters {
+		// Skip clusters with no backup config — nothing to project into a
+		// BackupConfig CR. Cluster is still present on the ConfigBundle spec
+		// for other future projections; just no BackupConfig for this pass.
+		if cluster.Backup == nil {
+			continue
+		}
 		if err := r.applyBackupConfig(ctx, &cb, cluster); err != nil {
-			log.Error(err, "failed to apply BackupConfig", "clusterOrbID", cluster.OrbID)
+			log.Error(err, "failed to apply BackupConfig",
+				"clusterOrbID", cluster.OrbID, "backupOrbID", cluster.Backup.OrbID)
 			return ctrl.Result{}, err
 		}
 	}
@@ -87,7 +94,7 @@ func (r *ConfigBundleReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if isSpecChange {
 		log.Info("applied child CRs",
 			"servers", len(cb.Spec.Servers),
-			"clusters", len(cb.Spec.Clusters),
+			"clusters", len(cb.Spec.KubernetesClusters),
 			"generation", cb.Generation)
 		// Retry on conflict: ConsumeServer also writes Status (LastAppliedDigest, etc.)
 		// which races our ObservedGeneration update. RetryOnConflict refetches and reapplies.
@@ -109,29 +116,33 @@ func (r *ConfigBundleReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		}
 	} else {
 		log.V(1).Info("applied child CRs (idempotent)",
-			"servers", len(cb.Spec.Servers), "clusters", len(cb.Spec.Clusters))
+			"servers", len(cb.Spec.Servers), "clusters", len(cb.Spec.KubernetesClusters))
 	}
 	return ctrl.Result{}, nil
 }
 
 // applyBackupConfig creates or updates a BackupConfig CR for the given cluster
-// using Server-Side Apply with field manager "configbundle-controller". CR name
-// is derived from the cluster's orbId — colons replaced with dashes so the name
-// conforms to RFC 1123. Identity stays in spec.orbId; only the K8s resource
-// name is transformed for syntactic compliance. Mirror of applyServerConfig.
-func (r *ConfigBundleReconciler) applyBackupConfig(ctx context.Context, cb *armadav1.ConfigBundle, cluster armadav1.ClusterSpec) error {
+// using Server-Side Apply with field manager "configbundle-controller". The
+// child CR maps 1:1 to the ClusterBackup graph node, not the cluster — CR name
+// is derived from cluster.Backup.OrbID; spec.orbId carries the ClusterBackup
+// identity; spec.clusterOrbId carries the parent cluster identity for
+// downstream correlation. Caller must ensure cluster.Backup != nil.
+func (r *ConfigBundleReconciler) applyBackupConfig(ctx context.Context, cb *armadav1.ConfigBundle, cluster armadav1.KubernetesClusterSpec) error {
+	backup := cluster.Backup
 	bc := &armadav1.BackupConfig{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: armadav1.GroupVersion.String(),
 			Kind:       "BackupConfig",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: orbIDToK8sName(cluster.OrbID),
+			Name: orbIDToK8sName(backup.OrbID),
 		},
 		Spec: armadav1.BackupConfigSpec{
-			OrbID:  cluster.OrbID,
-			Velero: cluster.Velero,
-			Etcd:   cluster.Etcd,
+			OrbID:        backup.OrbID,
+			ClusterOrbID: cluster.OrbID,
+			Velero:       backup.Velero,
+			Etcd:         backup.Etcd,
+			S3Sync:       backup.S3Sync,
 		},
 	}
 
@@ -169,11 +180,11 @@ func (r *ConfigBundleReconciler) applyServerConfig(ctx context.Context, cb *arma
 			Name: strings.ToLower(hostname),
 		},
 		Spec: armadav1.ServerConfigSpec{
-			OrbID:      server.OrbID,
-			ServiceTag: server.ServiceTag,
-			Hostname:   server.Hostname,
-			OobIP:      server.OobIP,
-			Idrac:      server.Idrac,
+			OrbID:         server.OrbID,
+			ServiceTag:    server.ServiceTag,
+			Hostname:      server.Hostname,
+			OobIP:         server.OobIP,
+			IdracSettings: server.IdracSettings,
 		},
 	}
 

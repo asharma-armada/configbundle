@@ -20,19 +20,35 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// BackupBlock holds desired backup configuration for one mechanism (velero or
-// etcd), sourced from Orbital VeleroBackup / EtcdBackup nodes. Shared shape
-// because the two mechanisms expose identical knobs today (enabled, schedule,
-// location); when they diverge in the future, split into VeleroBackupSpec and
-// EtcdBackupSpec.
-//
-// All admin-overridable fields are pointers with omitempty so SSA partial
-// patches can omit admin-owned fields (matches the IdracSpec / ADR-007 pattern).
-// OrbID is identity metadata set by the bundler — required, never overridable.
-type BackupBlock struct {
-	// OrbID is the immutable Orbital identifier for the backup-node this block
-	// represents (e.g. "colo:cluster-001-velero"). Set by the bundler.
-	// Identity-only; admin overrides never touch it.
+// ClusterBackupSpec projects the orbital ClusterBackup ConfigItem — the
+// grouping node between a KubernetesCluster and its per-mechanism backup
+// children (etcd, velero, s3Sync). Its OrbID is distinct from the parent
+// cluster's, matching the graph's identity for this node.
+type ClusterBackupSpec struct {
+	// OrbID is the immutable Orbital identifier for this ClusterBackup node
+	// (e.g. "colo:cluster-001-backup"). Set by the bundler; identity-only.
+	// +kubebuilder:validation:Required
+	OrbID string `json:"orbId"`
+
+	// Velero holds desired Velero backup configuration.
+	// +optional
+	Velero *VeleroBackupSpec `json:"velero,omitempty"`
+
+	// Etcd holds desired etcd backup configuration.
+	// +optional
+	Etcd *EtcdBackupSpec `json:"etcd,omitempty"`
+
+	// S3Sync holds desired S3-sync backup configuration.
+	// +optional
+	S3Sync *S3SyncSpec `json:"s3Sync,omitempty"`
+}
+
+// VeleroBackupSpec mirrors orbital VeleroBackup — the Velero-Schedule-backed
+// mechanism. Shape currently equals EtcdBackupSpec but they are declared
+// separately so grep, divergence audit, and future divergence remain honest.
+type VeleroBackupSpec struct {
+	// OrbID is the immutable Orbital identifier for this VeleroBackup node
+	// (e.g. "colo:cluster-001-velero"). Set by the bundler; identity-only.
 	// +kubebuilder:validation:Required
 	OrbID string `json:"orbId"`
 
@@ -44,42 +60,79 @@ type BackupBlock struct {
 	// +optional
 	Schedule *string `json:"schedule,omitempty"`
 
-	// Location is the storage location the backup writes to (e.g. an S3 URL or a
-	// Velero BackupStorageLocation name). Free-form; mechanism-specific.
+	// Location is the storage location the backup writes to (e.g. an S3 URL or
+	// a Velero BackupStorageLocation name).
 	// +optional
 	Location *string `json:"location,omitempty"`
 }
 
-// VeleroTypeName / EtcdTypeName are the orbital GraphQL type names for the
-// backup-block nodes. Used in TakeoverEntry.Type / IgnoredEntry.Type when the
-// divergence reporter emits an entry for a local override on a backup field.
-// One constant per nested struct that has its own orbital identity; when adding
-// a new nested type (e.g. S3Sync), add a sibling constant.
-const (
-	VeleroTypeName = "VeleroBackup"
-	EtcdTypeName   = "EtcdBackup"
-)
-
-// BackupConfigSpec describes one Kubernetes cluster's desired backup configuration.
-// Created and updated by the ConfigBundle Controller via SSA. BackupConfig is
-// derived state — admin overrides happen on the parent ConfigBundle CR only.
-type BackupConfigSpec struct {
-	// OrbID is the immutable Orbital identifier for this cluster
-	// (mirrors ConfigBundle.spec.clusters[].orbId). Carried on the child so
-	// cross-system grep, audit logs, and downstream telemetry can correlate
-	// without a parent round-trip.
+// EtcdBackupSpec mirrors orbital EtcdBackup — the etcd-snapshot mechanism.
+// See VeleroBackupSpec for why this is a distinct type despite shape overlap.
+type EtcdBackupSpec struct {
+	// OrbID is the immutable Orbital identifier for this EtcdBackup node
+	// (e.g. "colo:cluster-001-etcd"). Set by the bundler; identity-only.
 	// +kubebuilder:validation:Required
 	OrbID string `json:"orbId"`
 
-	// Velero holds desired Velero backup configuration. Absent = the controller
-	// does not manage Velero for this cluster.
+	// Enabled toggles the backup mechanism on or off.
 	// +optional
-	Velero *BackupBlock `json:"velero,omitempty"`
+	Enabled *bool `json:"enabled,omitempty"`
 
-	// Etcd holds desired etcd backup configuration. Absent = the controller does
-	// not manage etcd backups for this cluster.
+	// Schedule is a cron expression for when the backup runs (e.g. "0 3 * * *").
 	// +optional
-	Etcd *BackupBlock `json:"etcd,omitempty"`
+	Schedule *string `json:"schedule,omitempty"`
+
+	// Location is the storage location the backup writes to.
+	// +optional
+	Location *string `json:"location,omitempty"`
+}
+
+// S3SyncSpec mirrors orbital S3Sync. Orbital exposes only `enabled` on this
+// node today; schedule/location live on the sibling velero/etcd types.
+type S3SyncSpec struct {
+	// OrbID is the immutable Orbital identifier for this S3Sync node
+	// (e.g. "colo:cluster-001-s3sync"). Set by the bundler; identity-only.
+	// +kubebuilder:validation:Required
+	OrbID string `json:"orbId"`
+
+	// Enabled toggles the S3-sync mechanism on or off.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// BackupConfigSpec is the projected desired state for one ClusterBackup node.
+// The ConfigBundle controller creates and updates this CR via SSA from
+// ConfigBundleSpec.kubernetesClusters[].backup entries. One BackupConfig CR
+// per ClusterBackup graph node.
+type BackupConfigSpec struct {
+	// OrbID is the immutable Orbital identifier for the ClusterBackup node
+	// this CR projects (matches ClusterBackupSpec.OrbID on the parent).
+	// Named to match the "resource identity = orbId" convention.
+	// +kubebuilder:validation:Required
+	OrbID string `json:"orbId"`
+
+	// ClusterOrbID is the OrbID of the parent KubernetesCluster this backup
+	// belongs to. Carried on the child so cross-system grep, audit logs, and
+	// downstream telemetry can correlate back to the cluster without a parent
+	// round-trip.
+	// +kubebuilder:validation:Required
+	ClusterOrbID string `json:"clusterOrbId"`
+
+	// Velero holds desired Velero backup configuration. Absent = the
+	// controller does not manage Velero for this cluster.
+	// +optional
+	Velero *VeleroBackupSpec `json:"velero,omitempty"`
+
+	// Etcd holds desired etcd backup configuration. Absent = the controller
+	// does not manage etcd backups for this cluster.
+	// +optional
+	Etcd *EtcdBackupSpec `json:"etcd,omitempty"`
+
+	// S3Sync holds desired S3-sync backup configuration. Absent = the
+	// controller does not manage S3-sync for this cluster. Actuation not
+	// implemented yet — bc-controller logs the spec and moves on.
+	// +optional
+	S3Sync *S3SyncSpec `json:"s3Sync,omitempty"`
 }
 
 // BackupConfigPhase represents the current lifecycle phase.
@@ -94,8 +147,8 @@ const (
 
 // BackupConfigStatus records the controller's observed state. Mirrors the
 // ServerConfigStatus shape so operators can reason about both child kinds the
-// same way (Phase, ObservedGeneration, Conditions, per-field Observed ledger,
-// bounded RecentPatches action history).
+// same way (Phase, ObservedGeneration, Conditions, per-mechanism Observed
+// ledger, bounded RecentPatches action history).
 type BackupConfigStatus struct {
 	// Phase is the current lifecycle phase.
 	// +optional
@@ -112,11 +165,7 @@ type BackupConfigStatus struct {
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// Observed holds the controller's per-field confirmed values — values the
-	// controller has successfully landed on the target (Velero Schedule PATCH
-	// success, or etcd CronJob PATCH success), or confirmed already match on a
-	// no-op reconcile. Absence of a field means the controller has never
-	// confirmed it.
+	// Observed holds the controller's per-mechanism confirmed values.
 	// +optional
 	Observed ObservedBackup `json:"observed,omitempty"`
 
@@ -127,20 +176,31 @@ type BackupConfigStatus struct {
 	RecentPatches []RecentPatch `json:"recentPatches,omitempty"`
 }
 
-// ObservedBackup contains per-mechanism observed-state ledgers.
+// ObservedBackup contains per-mechanism observed-state ledgers. Each block is
+// a pointer so absence in status means "controller does not manage this
+// mechanism" — distinct from "manages it but all fields are unset". Value-type
+// structs with omitempty still marshal to `{}` in JSON, which reads as "yes I
+// looked, and it's empty" — a lie for unmanaged mechanisms like S3Sync today.
 type ObservedBackup struct {
-	// Velero holds controller-confirmed Velero backup field values.
+	// Velero holds controller-confirmed Velero field values. Nil = not managed.
 	// +optional
-	Velero ObservedBackupBlock `json:"velero,omitempty"`
+	Velero *ObservedVeleroStatus `json:"velero,omitempty"`
 
-	// Etcd holds controller-confirmed etcd backup field values.
+	// Etcd holds controller-confirmed etcd field values. Nil = not managed.
 	// +optional
-	Etcd ObservedBackupBlock `json:"etcd,omitempty"`
+	Etcd *ObservedEtcdStatus `json:"etcd,omitempty"`
+
+	// S3Sync holds controller-confirmed S3-sync field values. Nil = not
+	// managed (which is always the case today — S3Sync actuation is not yet
+	// implemented; the S3SyncSupported condition surfaces that fact).
+	// +optional
+	S3Sync *ObservedS3SyncStatus `json:"s3Sync,omitempty"`
 }
 
-// ObservedBackupBlock mirrors the controller-managed subset of BackupBlock.
-// Pointer types so absence means "never confirmed" (vs. "confirmed and false").
-type ObservedBackupBlock struct {
+// ObservedVeleroStatus mirrors the controller-managed subset of
+// VeleroBackupSpec. Pointer types so absence means "never confirmed"
+// (vs. "confirmed and false").
+type ObservedVeleroStatus struct {
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
 	// +optional
@@ -149,18 +209,35 @@ type ObservedBackupBlock struct {
 	Location *string `json:"location,omitempty"`
 }
 
+// ObservedEtcdStatus mirrors the controller-managed subset of EtcdBackupSpec.
+type ObservedEtcdStatus struct {
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+	// +optional
+	Schedule *string `json:"schedule,omitempty"`
+	// +optional
+	Location *string `json:"location,omitempty"`
+}
+
+// ObservedS3SyncStatus mirrors the controller-managed subset of S3SyncSpec.
+type ObservedS3SyncStatus struct {
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=bc
 // +kubebuilder:printcolumn:name="OrbID",type=string,JSONPath=`.spec.orbId`
+// +kubebuilder:printcolumn:name="ClusterOrbID",type=string,JSONPath=`.spec.clusterOrbId`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // BackupConfig is a domain child CR owned by a ConfigBundle.
 // Created and updated by the ConfigBundle Controller via SSA (field manager:
-// "configbundle-controller"). The BackupConfig Controller (separate repo)
-// actuates the spec by SSA-patching Velero Schedule CRDs and an etcd backup
-// CronJob in the same cluster.
+// "configbundle-controller"). The BackupConfig Controller actuates the spec
+// by SSA-patching Velero Schedule CRDs and an etcd backup CronJob in the
+// same cluster.
 type BackupConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

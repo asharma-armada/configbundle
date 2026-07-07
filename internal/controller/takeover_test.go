@@ -15,7 +15,7 @@ func TestSetFieldOnServer_IdracFields(t *testing.T) {
 		ServiceTag: "3RK3V64",
 		Hostname:   ptr.To("host-01"),
 		OobIP:      ptr.To("10.10.1.45"),
-		Idrac: armadav1.IdracSpec{
+		IdracSettings: armadav1.IdracSettingsSpec{
 			FirmwareVersion:             ptr.To("7.20.10.05"),
 			SSHEnabled:                  ptr.To(true),
 			IPMIEnabled:                 ptr.To(false),
@@ -31,23 +31,29 @@ func TestSetFieldOnServer_IdracFields(t *testing.T) {
 		field string
 		check func(dst *armadav1.ServerSpec) bool
 	}{
-		{"sshEnabled", func(d *armadav1.ServerSpec) bool { return d.Idrac.SSHEnabled != nil && *d.Idrac.SSHEnabled == true }},
-		{"ipmiEnabled", func(d *armadav1.ServerSpec) bool { return d.Idrac.IPMIEnabled != nil && *d.Idrac.IPMIEnabled == false }},
+		{"sshEnabled", func(d *armadav1.ServerSpec) bool {
+			return d.IdracSettings.SSHEnabled != nil && *d.IdracSettings.SSHEnabled == true
+		}},
+		{"ipmiEnabled", func(d *armadav1.ServerSpec) bool {
+			return d.IdracSettings.IPMIEnabled != nil && *d.IdracSettings.IPMIEnabled == false
+		}},
 		{"lockdownModeEnabled", func(d *armadav1.ServerSpec) bool {
-			return d.Idrac.LockdownModeEnabled != nil && *d.Idrac.LockdownModeEnabled == true
+			return d.IdracSettings.LockdownModeEnabled != nil && *d.IdracSettings.LockdownModeEnabled == true
 		}},
 		{"osToIdracPassThroughEnabled", func(d *armadav1.ServerSpec) bool {
-			return d.Idrac.OsToIdracPassThroughEnabled != nil && *d.Idrac.OsToIdracPassThroughEnabled == true
+			return d.IdracSettings.OsToIdracPassThroughEnabled != nil && *d.IdracSettings.OsToIdracPassThroughEnabled == true
 		}},
 		{"usbManagementPortEnabled", func(d *armadav1.ServerSpec) bool {
-			return d.Idrac.UsbManagementPortEnabled != nil && *d.Idrac.UsbManagementPortEnabled == false
+			return d.IdracSettings.UsbManagementPortEnabled != nil && *d.IdracSettings.UsbManagementPortEnabled == false
 		}},
-		{"dhcpEnabled", func(d *armadav1.ServerSpec) bool { return d.Idrac.DHCPEnabled != nil && *d.Idrac.DHCPEnabled == true }},
+		{"dhcpEnabled", func(d *armadav1.ServerSpec) bool {
+			return d.IdracSettings.DHCPEnabled != nil && *d.IdracSettings.DHCPEnabled == true
+		}},
 		{"racadmEnabled", func(d *armadav1.ServerSpec) bool {
-			return d.Idrac.RacadmEnabled != nil && *d.Idrac.RacadmEnabled == false
+			return d.IdracSettings.RacadmEnabled != nil && *d.IdracSettings.RacadmEnabled == false
 		}},
 		{"firmwareVersion", func(d *armadav1.ServerSpec) bool {
-			return d.Idrac.FirmwareVersion != nil && *d.Idrac.FirmwareVersion == "7.20.10.05"
+			return d.IdracSettings.FirmwareVersion != nil && *d.IdracSettings.FirmwareVersion == "7.20.10.05"
 		}},
 		{"hostname", func(d *armadav1.ServerSpec) bool { return d.Hostname != nil && *d.Hostname == "host-01" }},
 		{"oobIP", func(d *armadav1.ServerSpec) bool { return d.OobIP != nil && *d.OobIP == "10.10.1.45" }},
@@ -89,7 +95,7 @@ func TestSetFieldOnServer_MinimalPatch(t *testing.T) {
 		ServiceTag: "3RK3V64",
 		Hostname:   ptr.To("host-01"),
 		OobIP:      ptr.To("10.10.1.45"),
-		Idrac: armadav1.IdracSpec{
+		IdracSettings: armadav1.IdracSettingsSpec{
 			SSHEnabled:    ptr.To(true),
 			IPMIEnabled:   ptr.To(true),
 			RacadmEnabled: ptr.To(true),
@@ -102,13 +108,13 @@ func TestSetFieldOnServer_MinimalPatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if dst.Idrac.SSHEnabled == nil || *dst.Idrac.SSHEnabled != true {
+	if dst.IdracSettings.SSHEnabled == nil || *dst.IdracSettings.SSHEnabled != true {
 		t.Error("sshEnabled should be true")
 	}
-	if dst.Idrac.IPMIEnabled != nil {
+	if dst.IdracSettings.IPMIEnabled != nil {
 		t.Error("ipmiEnabled should remain nil (not set)")
 	}
-	if dst.Idrac.RacadmEnabled != nil {
+	if dst.IdracSettings.RacadmEnabled != nil {
 		t.Error("racadmEnabled should remain nil (not set)")
 	}
 	if dst.Hostname != nil {
@@ -136,7 +142,7 @@ func TestReconstructApplyExcluding(t *testing.T) {
 				"serviceTag": "CWJHDX3",
 				"hostname":   "r09-u02.colo-galleon",
 				"oobIP":      "10.10.1.45",
-				"idrac": map[string]any{
+				"idracSettings": map[string]any{
 					"sshEnabled":    true,
 					"dhcpEnabled":   true,
 					"ipmiEnabled":   false,
@@ -151,7 +157,7 @@ func TestReconstructApplyExcluding(t *testing.T) {
 			"f:servers": {
 				"k:{\"orbId\":\"colo:CWJHDX3\"}": {
 					".": {},
-					"f:idrac": {"f:sshEnabled": {}, "f:dhcpEnabled": {}},
+					"f:idracSettings": {"f:sshEnabled": {}, "f:dhcpEnabled": {}},
 					"f:orbId": {}
 				}
 			}
@@ -176,7 +182,7 @@ func TestReconstructApplyExcluding(t *testing.T) {
 		if _, has := entry["serviceTag"]; has {
 			t.Error("serviceTag should not be injected; would silently extend claims")
 		}
-		idrac, _ := entry["idrac"].(map[string]any)
+		idrac, _ := entry["idracSettings"].(map[string]any)
 		if _, has := idrac["sshEnabled"]; has {
 			t.Error("sshEnabled (takeover target) should be omitted")
 		}
@@ -195,7 +201,7 @@ func TestReconstructApplyExcluding(t *testing.T) {
 			"f:servers": {
 				"k:{\"orbId\":\"colo:CWJHDX3\"}": {
 					".": {},
-					"f:idrac": {"f:sshEnabled": {}},
+					"f:idracSettings": {"f:sshEnabled": {}},
 					"f:orbId": {}
 				}
 			}
@@ -218,7 +224,7 @@ func TestReconstructApplyExcluding(t *testing.T) {
 			"f:servers": {
 				"k:{\"orbId\":\"colo:CWJHDX3\"}": {
 					".": {},
-					"f:idrac": {"f:dhcpEnabled": {}},
+					"f:idracSettings": {"f:dhcpEnabled": {}},
 					"f:orbId": {}
 				}
 			}

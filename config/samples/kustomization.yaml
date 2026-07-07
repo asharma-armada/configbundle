@@ -2,4 +2,5 @@
 resources:
 - v1_configbundle.yaml
 - v1_serverconfig.yaml
+- v1_backupconfig.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

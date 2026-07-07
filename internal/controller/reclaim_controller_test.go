@@ -27,7 +27,7 @@ func claim(field string) map[string]any {
 		"f:spec": map[string]any{
 			"f:servers": map[string]any{
 				`k:{"orbId":"colo:srv-1"}`: map[string]any{
-					"f:idrac": map[string]any{
+					"f:idracSettings": map[string]any{
 						"f:" + field: map[string]any{},
 					},
 				},
@@ -46,7 +46,7 @@ func multiClaim(fields ...string) map[string]any {
 		"f:spec": map[string]any{
 			"f:servers": map[string]any{
 				`k:{"orbId":"colo:srv-1"}`: map[string]any{
-					"f:idrac": idrac,
+					"f:idracSettings": idrac,
 				},
 			},
 		},

@@ -161,7 +161,7 @@ servers:
   serviceTag: JQK3V64            # mutable hardware tag
   hostname: r09-u22.colo-galleon
   oobIP: 10.20.21.65
-  idrac: { ... }
+  idracSettings: { ... }
 ```
 
 The mapping layer JSON carries only **field-level** entries for Orbital nodes
@@ -182,7 +182,7 @@ metadata:
 spec:
   servers:
     - orbId: $ORB_ID
-      idrac:
+      idracSettings:
         sshEnabled: true
 EOF
 ```

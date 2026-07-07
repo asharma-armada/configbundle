@@ -36,7 +36,7 @@ spec:
     - serviceTag: 3RK3V64
       hostname: colo-r740-01
       oobIP: 10.10.1.45
-      idrac:
+      idracSettings:
         firmwareVersion: "7.20.10.05"
         sshEnabled: false
         ipmiEnabled: false
@@ -82,7 +82,7 @@ spec:
   serviceTag: 3RK3V64
   hostname: colo-r740-01
   oobIP: 10.10.1.45
-  idrac:
+  idracSettings:
     firmwareVersion: "7.20.10.05"
     sshEnabled: false
     ipmiEnabled: false

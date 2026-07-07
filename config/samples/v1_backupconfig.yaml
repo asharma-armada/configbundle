@@ -1,0 +1,35 @@
+# Standalone BackupConfig sample — parity with v1_serverconfig.yaml.
+#
+# In production, BackupConfig CRs are created by cb-controller decomposing
+# ConfigBundle.spec.kubernetesClusters[].backup entries. This sample exists so
+# bc-controller can be exercised in isolation without needing a parent
+# ConfigBundle.
+#
+# spec.orbId is the ClusterBackup identity (matches the orbital ClusterBackup
+# node this CR projects). spec.clusterOrbId points back to the parent
+# KubernetesCluster; used for cross-system correlation and audit.
+#
+# Cluster-scoped resource — no namespace field.
+apiVersion: armada.ai/v1
+kind: BackupConfig
+metadata:
+  labels:
+    app.kubernetes.io/name: configbundle
+    app.kubernetes.io/managed-by: kustomize
+  name: colo-cluster-001-backup
+spec:
+  orbId: "colo:cluster-001-backup"
+  clusterOrbId: "colo:cluster-001"
+  velero:
+    orbId: "colo:cluster-001-velero"
+    enabled: true
+    schedule: "0 2 * * *"
+    location: "s3://colo-backups/velero"
+  etcd:
+    orbId: "colo:cluster-001-etcd"
+    enabled: true
+    schedule: "0 3 * * *"
+    location: "s3://colo-backups/etcd"
+  s3Sync:
+    orbId: "colo:cluster-001-s3sync"
+    enabled: true

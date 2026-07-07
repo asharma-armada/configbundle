@@ -2,11 +2,11 @@
 
 ## Recent accomplishments
 
-- **2026-07-06** — Monorepo consolidation: sc-controller + bc-controller folded into configbundle; one Go module, one Dockerfile with 4 targets (controller / bundler / serverconfig / backupconfig), one `kubectl apply -k config/default/`; BackupConfig CRD cherry-extracted onto main; cluster-api / cert-manager pattern
+- **2026-07-06** — Orbital schema alignment across api/v1 (IdracSettingsSpec / KubernetesClusterSpec / ClusterBackupSpec / VeleroBackupSpec / EtcdBackupSpec / S3SyncSpec; JSON edges mirror orbital verbatim); honest live-observed status (reads Velero Schedule + Redfish, not spec-copy); metrics namespace `armada_*` → `configbundle_*` + pipeline-health gauges
+- **2026-07-06** — Monorepo consolidation: sc-controller + bc-controller folded into configbundle; one Go module, one Dockerfile with 4 targets, one `kubectl apply -k config/default/`; BackupConfig CRD; cluster-api / cert-manager pattern
 - **2026-07-03** — Phase 2: reporter dedup on `cb.Status.DivergenceReporting` (pointer-int nil/*0/*N fixes cold-start orb-stuck); managedFields cleanup unified to one `reconcileLocalClaims` pass; README ConfigBundle-first rewrite
 - **2026-06-22** — Race fix: reclaim defers when consume.applyManifest is in-flight, reads in-memory manifest not stale CM; divergence reporter silent at steady state (skip POST when overrides=0); ServerConfig status.observed + recentPatches[] for race-proof per-field ledger
 - **2026-06-20** — ADR-011: dropped mapping OCI layer, idrac.orbId now saturated on CR (1-layer bundle); e2e-validated minikube. Drift-detection (serverconfig-controller): intent/observed/ignored Prom gauges, feature-gated via IDRAC_OBSERVE_INTERVAL
-- **2026-06-18** — Edge handback shipped: local:* SSA release triggers new ReclaimController to replay the last-imported manifest; `applyManifest` scrubs `spec.Ignored` entries with no active local:* claim (invariant: Ignore is meaningless without an override); deleted defensive Ignored strip; controller deploy manifests (kustomize, `configbundle-system` namespace, dispatch Service on :8095); Makefile `VERSION`/`BUNDLER_VERSION`/`CONTROLLER_VERSION` overrides for image builds; e2e-validated round-trip on minikube
 
 ## Development Timeline
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -25,6 +26,13 @@ import (
 // controller. Type=True ⇒ live state matches intent (after PATCH, or already
 // matching on read). Type=False ⇒ a step failed; Reason names which.
 const ConditionReconciled = "Reconciled"
+
+// ConditionS3SyncSupported surfaces the "spec.s3Sync is present but bc-
+// controller does not yet actuate it" gap in status. Set to False + Reason
+// NotImplemented whenever spec.s3Sync is non-nil; removed when spec.s3Sync
+// is absent so operators do not see stale "unsupported" state on a CR that
+// no longer requests S3Sync. When S3Sync actuation ships, flip to True.
+const ConditionS3SyncSupported = "S3SyncSupported"
 
 // fieldManager is the SSA field-owner string this controller uses when writing
 // Velero Schedule CRDs and the etcd-backup CronJob. Matches the convention
@@ -89,6 +97,16 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 		return reconcile.Result{}, err
 	}
 
+	// S3Sync actuation is not implemented yet — a spec.s3Sync block travels
+	// end-to-end (bundler → cb-controller decomposition → BackupConfig CR)
+	// but no reconciler writes it to a cluster resource. Log at V(1) so the
+	// spec presence is visible without cluttering the info-level log stream.
+	// TODO: implement S3Sync reconciler (needs its own actuator design).
+	if bc.Spec.S3Sync != nil {
+		logger.V(1).Info("spec.s3Sync present but S3Sync actuation not implemented; ignoring",
+			"name", bc.Name, "s3SyncOrbId", bc.Spec.S3Sync.OrbID)
+	}
+
 	// No reconcilable blocks — log and skip without status write.
 	if bc.Spec.Velero == nil && bc.Spec.Etcd == nil {
 		logger.Info("no velero or etcd block on backupconfig; skipping",
@@ -110,6 +128,7 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 		if err != nil {
 			logger.Error(err, "reconcile Velero Schedule", "name", bc.Name)
 			r.setStatusFailed(ctx, &bc, "VeleroPatchFailed", err.Error())
+			recordReconcileError(bc.Name, "VeleroPatchFailed")
 			return reconcile.Result{}, fmt.Errorf("reconcile velero: %w", err)
 		}
 		if msg != "" {
@@ -122,6 +141,7 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 		if err != nil {
 			logger.Error(err, "reconcile etcd CronJob", "name", bc.Name)
 			r.setStatusFailed(ctx, &bc, "EtcdPatchFailed", err.Error())
+			recordReconcileError(bc.Name, "EtcdPatchFailed")
 			return reconcile.Result{}, fmt.Errorf("reconcile etcd: %w", err)
 		}
 		if msg != "" {
@@ -129,8 +149,15 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 		}
 	}
 
-	r.recordObserved(ctx, &bc)
-	recordObservedMetric(&bc)
+	// One live read, several independent consumers: Prom gauges (field-level,
+	// resource-presence) and CR status. Mirrors sc-controller's shape:
+	// metrics never depend on the status subresource write succeeding.
+	live := r.readLiveObserved(ctx, &bc, logger)
+	recordObservedMetric(bc.Name, live)
+	recordPresence(bc.Name, &bc, live)
+	r.updateObservedStatus(ctx, &bc, live)
+
+	recordReconcileSuccess(bc.Name, time.Now().Unix())
 
 	if len(patchMessages) == 0 {
 		logger.Info("reconciled (no PATCH needed)", "name", bc.Name)
@@ -152,16 +179,18 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	return reconcile.Result{RequeueAfter: r.ObserveInterval}, nil
 }
 
-// recordObserved updates status.observed.{velero,etcd} from the spec intent
-// for blocks the controller successfully patched (or confirmed already match
-// on a no-op). Mirror of serverconfig-controller.recordObserved — trusts the
-// PATCH 2xx as confirmation, no separate read-back.
+// updateObservedStatus writes the pre-computed live-observed snapshot to
+// status.observed. Takes `live` as an argument (rather than re-reading here)
+// so metrics and status share the exact same snapshot — no possibility of
+// scrape-timing races where the two surfaces disagree on what the live
+// resource looked like this reconcile.
 //
-// Read-modify-write with RetryOnConflict; skipped entirely when nothing would
-// change so periodic polls in steady state are zero-cost.
-func (r *BackupConfigReconciler) recordObserved(ctx context.Context, bc *armadav1.BackupConfig) {
-	desired := buildObserved(bc.Spec)
-	if observedEqual(bc.Status.Observed, desired) {
+// Read-modify-write with RetryOnConflict; skipped when the snapshot equals
+// what's already in status so periodic polls in steady state are zero-cost.
+// S3Sync is never written because actuation is not implemented (see
+// ConditionS3SyncSupported).
+func (r *BackupConfigReconciler) updateObservedStatus(ctx context.Context, bc *armadav1.BackupConfig, live armadav1.ObservedBackup) {
+	if observedEqual(bc.Status.Observed, live) {
 		return
 	}
 	logger := log.FromContext(ctx).WithName("backupconfig.status")
@@ -170,11 +199,10 @@ func (r *BackupConfigReconciler) recordObserved(ctx context.Context, bc *armadav
 		if err := r.Get(ctx, client.ObjectKeyFromObject(bc), &fresh); err != nil {
 			return err
 		}
-		d := buildObserved(fresh.Spec)
-		if observedEqual(fresh.Status.Observed, d) {
+		if observedEqual(fresh.Status.Observed, live) {
 			return nil
 		}
-		fresh.Status.Observed = d
+		fresh.Status.Observed = live
 		return r.Status().Update(ctx, &fresh)
 	})
 	if err != nil {
@@ -182,32 +210,60 @@ func (r *BackupConfigReconciler) recordObserved(ctx context.Context, bc *armadav
 	}
 }
 
-// buildObserved snapshots the spec into the observed-ledger shape. Fields with
-// no intent stay absent — observed only reflects what the controller manages.
-func buildObserved(spec armadav1.BackupConfigSpec) armadav1.ObservedBackup {
+// readLiveObserved builds an ObservedBackup by reading the actual Velero
+// Schedule and etcd CronJob from the cluster. Only reads mechanisms the CR's
+// spec asks for — a stray Schedule for a cluster we don't manage is not our
+// business to observe. A Get error other than NotFound leaves that block nil
+// and logs; nil semantics ("no live resource present") is the same shape the
+// caller sees on a real NotFound, and next reconcile retries.
+func (r *BackupConfigReconciler) readLiveObserved(ctx context.Context, bc *armadav1.BackupConfig, logger logr.Logger) armadav1.ObservedBackup {
 	var out armadav1.ObservedBackup
-	if spec.Velero != nil {
-		out.Velero = armadav1.ObservedBackupBlock{
-			Enabled:  spec.Velero.Enabled,
-			Schedule: spec.Velero.Schedule,
-			Location: spec.Velero.Location,
+	if bc.Spec.Velero != nil {
+		v, err := observeVelero(ctx, r.Client, r.VeleroNamespace, veleroScheduleName(bc))
+		if err != nil {
+			logger.Info("observe velero live state failed; reporting as absent this reconcile",
+				"name", bc.Name, "err", err.Error())
 		}
+		out.Velero = v
 	}
-	if spec.Etcd != nil {
-		out.Etcd = armadav1.ObservedBackupBlock{
-			Enabled:  spec.Etcd.Enabled,
-			Schedule: spec.Etcd.Schedule,
-			Location: spec.Etcd.Location,
+	if bc.Spec.Etcd != nil {
+		e, err := observeEtcd(ctx, r.Client, r.EtcdBackupNamespace, etcdCronJobName(bc))
+		if err != nil {
+			logger.Info("observe etcd live state failed; reporting as absent this reconcile",
+				"name", bc.Name, "err", err.Error())
 		}
+		out.Etcd = e
 	}
 	return out
 }
 
+// observedEqual returns true when both ledgers point at the same
+// (present/absent, value) state per mechanism. Comparing pointer-triples
+// handles the nil-vs-empty distinction inline.
 func observedEqual(a, b armadav1.ObservedBackup) bool {
-	return observedBlockEqual(a.Velero, b.Velero) && observedBlockEqual(a.Etcd, b.Etcd)
+	return backupBlockEqual(a.Velero, b.Velero) &&
+		etcdBlockEqual(a.Etcd, b.Etcd)
 }
 
-func observedBlockEqual(a, b armadav1.ObservedBackupBlock) bool {
+func backupBlockEqual(a, b *armadav1.ObservedVeleroStatus) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return boolPtrEqual(a.Enabled, b.Enabled) &&
+		stringPtrEqual(a.Schedule, b.Schedule) &&
+		stringPtrEqual(a.Location, b.Location)
+}
+
+func etcdBlockEqual(a, b *armadav1.ObservedEtcdStatus) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
 	return boolPtrEqual(a.Enabled, b.Enabled) &&
 		stringPtrEqual(a.Schedule, b.Schedule) &&
 		stringPtrEqual(a.Location, b.Location)
@@ -254,11 +310,27 @@ func (r *BackupConfigReconciler) writeStatus(ctx context.Context, bc *armadav1.B
 		fresh.Status.Phase = phase
 		fresh.Status.ObservedGeneration = fresh.Generation
 		setCondition(&fresh.Status.Conditions, ConditionReconciled, condStatus, reason, msg)
+		syncS3SyncCondition(&fresh)
 		return r.Status().Update(ctx, &fresh)
 	})
 	if err != nil {
 		logger.Info("status update failed (will retry next reconcile)", "name", bc.Name, "err", err.Error())
 	}
+}
+
+// syncS3SyncCondition mirrors spec.s3Sync presence into the S3SyncSupported
+// condition. Present → False/NotImplemented. Absent → condition removed so
+// stale "unsupported" state does not linger on a CR that dropped its s3Sync
+// block. Called from writeStatus so every status write keeps the condition
+// in lockstep with the current spec.
+func syncS3SyncCondition(bc *armadav1.BackupConfig) {
+	if bc.Spec.S3Sync != nil {
+		setCondition(&bc.Status.Conditions, ConditionS3SyncSupported,
+			metav1.ConditionFalse, "NotImplemented",
+			"spec.s3Sync present; S3Sync actuation not yet implemented")
+		return
+	}
+	removeCondition(&bc.Status.Conditions, ConditionS3SyncSupported)
 }
 
 // appendRecentPatch prepends a new PATCH-action entry to status.recentPatches
@@ -313,6 +385,18 @@ func isCurrentlyReconciled(bc *armadav1.BackupConfig) bool {
 		}
 	}
 	return false
+}
+
+// removeCondition drops any entry with the given Type from the slice. No-op
+// when the condition is absent. Preserves order of the remaining entries.
+func removeCondition(conds *[]metav1.Condition, condType string) {
+	filtered := (*conds)[:0]
+	for _, c := range *conds {
+		if c.Type != condType {
+			filtered = append(filtered, c)
+		}
+	}
+	*conds = filtered
 }
 
 func setCondition(conds *[]metav1.Condition, condType string, status metav1.ConditionStatus, reason, message string) {

@@ -52,7 +52,7 @@ func TestExtractAdminPaths_NestedServerField(t *testing.T) {
 		"f:spec": {
 			"f:servers": {
 				"k:{\"orbId\":\"colo:srv-3rk3v64\"}": {
-					"f:idrac": {
+					"f:idracSettings": {
 						"f:sshEnabled": {}
 					}
 				}
@@ -70,7 +70,7 @@ func TestExtractAdminPaths_NestedServerField(t *testing.T) {
 	if len(paths) != 1 {
 		t.Fatalf("expected 1 path, got %d: %+v", len(paths), paths)
 	}
-	expected := "spec.servers[orbId=colo:srv-3rk3v64].idrac.sshEnabled"
+	expected := "spec.servers[orbId=colo:srv-3rk3v64].idracSettings.sshEnabled"
 	if paths[0].path != expected {
 		t.Errorf("expected %q, got %q", expected, paths[0].path)
 	}
@@ -82,7 +82,7 @@ func TestExtractAdminPaths_MultipleFields(t *testing.T) {
 		"f:spec": {
 			"f:servers": {
 				"k:{\"orbId\":\"colo:srv-3rk3v64\"}": {
-					"f:idrac": {
+					"f:idracSettings": {
 						"f:sshEnabled": {},
 						"f:ipmiEnabled": {}
 					}
@@ -106,8 +106,8 @@ func TestExtractAdminPaths_MultipleFields(t *testing.T) {
 		pathSet[p.path] = true
 	}
 	for _, want := range []string{
-		"spec.servers[orbId=colo:srv-3rk3v64].idrac.sshEnabled",
-		"spec.servers[orbId=colo:srv-3rk3v64].idrac.ipmiEnabled",
+		"spec.servers[orbId=colo:srv-3rk3v64].idracSettings.sshEnabled",
+		"spec.servers[orbId=colo:srv-3rk3v64].idracSettings.ipmiEnabled",
 	} {
 		if !pathSet[want] {
 			t.Errorf("missing expected path %q, got %v", want, pathSet)
@@ -122,12 +122,12 @@ func TestSplitPath(t *testing.T) {
 	}{
 		{"spec.datacenter", []pathPart{{field: "spec"}, {field: "datacenter"}}},
 		{
-			"spec.servers[orbId=colo:srv-3rk3v64].idrac.sshEnabled",
+			"spec.servers[orbId=colo:srv-3rk3v64].idracSettings.sshEnabled",
 			[]pathPart{
 				{field: "spec"},
 				{field: "servers"},
 				{selector: "colo:srv-3rk3v64"},
-				{field: "idrac"},
+				{field: "idracSettings"},
 				{field: "sshEnabled"},
 			},
 		},
@@ -156,7 +156,7 @@ func TestResolveValue(t *testing.T) {
 				ServiceTag: "3RK3V64",
 				Hostname:   ptr.To("host-01"),
 				OobIP:      ptr.To("10.10.1.45"),
-				Idrac: armadav1.IdracSpec{
+				IdracSettings: armadav1.IdracSettingsSpec{
 					SSHEnabled:      ptr.To(false),
 					FirmwareVersion: ptr.To("7.20.10.05"),
 				},
@@ -170,8 +170,8 @@ func TestResolveValue(t *testing.T) {
 	}{
 		{"spec.datacenter", "colo"},
 		{"spec.servers[orbId=colo:srv-3rk3v64].hostname", ptr.To("host-01")},
-		{"spec.servers[orbId=colo:srv-3rk3v64].idrac.sshEnabled", ptr.To(false)},
-		{"spec.servers[orbId=colo:srv-3rk3v64].idrac.firmwareVersion", ptr.To("7.20.10.05")},
+		{"spec.servers[orbId=colo:srv-3rk3v64].idracSettings.sshEnabled", ptr.To(false)},
+		{"spec.servers[orbId=colo:srv-3rk3v64].idracSettings.firmwareVersion", ptr.To("7.20.10.05")},
 		{"spec.servers[orbId=colo:srv-nonexist].hostname", nil},
 	}
 
@@ -189,10 +189,10 @@ func TestExtractOverrides_NoDivergence(t *testing.T) {
 		Datacenter: "colo",
 		Servers: []armadav1.ServerSpec{
 			{
-				OrbID:      "colo:srv-3rk3v64",
-				ServiceTag: "3RK3V64",
-				Hostname:   ptr.To("host-01"),
-				Idrac:      armadav1.IdracSpec{SSHEnabled: ptr.To(false)},
+				OrbID:         "colo:srv-3rk3v64",
+				ServiceTag:    "3RK3V64",
+				Hostname:      ptr.To("host-01"),
+				IdracSettings: armadav1.IdracSettingsSpec{SSHEnabled: ptr.To(false)},
 			},
 		},
 	}
@@ -202,7 +202,7 @@ func TestExtractOverrides_NoDivergence(t *testing.T) {
 		"f:spec": {
 			"f:servers": {
 				"k:{\"orbId\":\"colo:srv-3rk3v64\"}": {
-					"f:idrac": {
+					"f:idracSettings": {
 						"f:sshEnabled": {}
 					}
 				}
@@ -241,10 +241,10 @@ func TestExtractOverrides_WithDivergence(t *testing.T) {
 		Datacenter: "colo",
 		Servers: []armadav1.ServerSpec{
 			{
-				OrbID:      "colo:srv-3rk3v64",
-				ServiceTag: "3RK3V64",
-				Hostname:   ptr.To("host-01"),
-				Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(false)},
+				OrbID:         "colo:srv-3rk3v64",
+				ServiceTag:    "3RK3V64",
+				Hostname:      ptr.To("host-01"),
+				IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(false)},
 			},
 		},
 	}
@@ -254,10 +254,10 @@ func TestExtractOverrides_WithDivergence(t *testing.T) {
 		Datacenter: "colo",
 		Servers: []armadav1.ServerSpec{
 			{
-				OrbID:      "colo:srv-3rk3v64",
-				ServiceTag: "3RK3V64",
-				Hostname:   ptr.To("host-01"),
-				Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(true)},
+				OrbID:         "colo:srv-3rk3v64",
+				ServiceTag:    "3RK3V64",
+				Hostname:      ptr.To("host-01"),
+				IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(true)},
 			},
 		},
 	}
@@ -267,7 +267,7 @@ func TestExtractOverrides_WithDivergence(t *testing.T) {
 		"f:spec": {
 			"f:servers": {
 				"k:{\"orbId\":\"colo:srv-3rk3v64\"}": {
-					"f:idrac": {
+					"f:idracSettings": {
 						"f:sshEnabled": {}
 					}
 				}
@@ -339,7 +339,7 @@ func TestExtractOverrides_IgnoreResolution_NoLoop(t *testing.T) {
 				ServiceTag: "3RK3V64",
 				Hostname:   ptr.To("host-01"),
 				// Idrac.SSHEnabled intentionally nil — orbital resolved as ignore.
-				Idrac: armadav1.IdracSpec{RacadmEnabled: ptr.To(false)},
+				IdracSettings: armadav1.IdracSettingsSpec{RacadmEnabled: ptr.To(false)},
 			},
 		},
 	}
@@ -353,7 +353,7 @@ func TestExtractOverrides_IgnoreResolution_NoLoop(t *testing.T) {
 				OrbID:      "colo:srv-3rk3v64",
 				ServiceTag: "3RK3V64",
 				Hostname:   ptr.To("host-01"),
-				Idrac: armadav1.IdracSpec{
+				IdracSettings: armadav1.IdracSettingsSpec{
 					SSHEnabled:    ptr.To(true), // admin override
 					RacadmEnabled: ptr.To(false),
 				},
@@ -366,7 +366,7 @@ func TestExtractOverrides_IgnoreResolution_NoLoop(t *testing.T) {
 		"f:spec": {
 			"f:servers": {
 				"k:{\"orbId\":\"colo:srv-3rk3v64\"}": {
-					"f:idrac": {
+					"f:idracSettings": {
 						"f:sshEnabled": {}
 					}
 				}

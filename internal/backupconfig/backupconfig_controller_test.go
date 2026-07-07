@@ -4,7 +4,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,6 +19,26 @@ import (
 
 	armadav1 "github.com/armada/configbundle/api/v1"
 )
+
+// testLogger returns a no-op logr.Logger for tests that call methods
+// requiring a logger but don't care about the output.
+func testLogger() logr.Logger { return logr.Discard() }
+
+// makeEtcdPodSpec builds a minimal PodTemplateSpec matching the shape
+// buildEtcdCronJob writes: one container named etcdBackupContainerName with
+// the location wired through BACKUP_LOCATION env. Used by observed-status
+// tests that need a live CronJob to read.
+func makeEtcdPodSpec(location string) corev1.PodTemplateSpec {
+	return corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:  etcdBackupContainerName,
+				Image: testImage,
+				Env:   []corev1.EnvVar{{Name: etcdBackupLocationEnv, Value: location}},
+			}},
+		},
+	}
+}
 
 const (
 	testVeleroNs = "velero"
@@ -53,13 +75,13 @@ func sampleBackupConfig() *armadav1.BackupConfig {
 		ObjectMeta: metav1.ObjectMeta{Name: "colo-cluster-001"},
 		Spec: armadav1.BackupConfigSpec{
 			OrbID: "colo:cluster-001",
-			Velero: &armadav1.BackupBlock{
+			Velero: &armadav1.VeleroBackupSpec{
 				OrbID:    "colo:cluster-001-velero",
 				Enabled:  ptr.To(true),
 				Schedule: ptr.To("0 2 * * *"),
 				Location: ptr.To("default"),
 			},
-			Etcd: &armadav1.BackupBlock{
+			Etcd: &armadav1.EtcdBackupSpec{
 				OrbID:    "colo:cluster-001-etcd",
 				Enabled:  ptr.To(true),
 				Schedule: ptr.To("0 3 * * *"),
@@ -164,7 +186,7 @@ func TestReconcile_PausedWhenEnabledFalse(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "paused"},
 		Spec: armadav1.BackupConfigSpec{
 			OrbID: "colo:cluster-paused",
-			Velero: &armadav1.BackupBlock{
+			Velero: &armadav1.VeleroBackupSpec{
 				OrbID:    "colo:cluster-paused-velero",
 				Enabled:  ptr.To(false),
 				Schedule: ptr.To("0 4 * * *"),
@@ -216,7 +238,7 @@ func TestReconcile_Idempotent(t *testing.T) {
 
 func TestVeleroDeltas_NotFound(t *testing.T) {
 	r, c := newReconciler(t)
-	block := &armadav1.BackupBlock{
+	block := &armadav1.VeleroBackupSpec{
 		Schedule: ptr.To("0 2 * * *"),
 		Location: ptr.To("default"),
 		Enabled:  ptr.To(true),
@@ -232,7 +254,7 @@ func TestVeleroDeltas_NotFound(t *testing.T) {
 
 func TestEtcdDeltas_NotFound(t *testing.T) {
 	r, c := newReconciler(t)
-	block := &armadav1.BackupBlock{
+	block := &armadav1.EtcdBackupSpec{
 		Schedule: ptr.To("0 3 * * *"),
 		Location: ptr.To("s3://backups/etcd"),
 		Enabled:  ptr.To(true),
@@ -246,31 +268,132 @@ func TestEtcdDeltas_NotFound(t *testing.T) {
 	}
 }
 
-func TestBuildObserved_PointersRoundTrip(t *testing.T) {
-	spec := armadav1.BackupConfigSpec{
-		Velero: &armadav1.BackupBlock{
-			Enabled:  ptr.To(true),
-			Schedule: ptr.To("0 2 * * *"),
+// TestReadLiveObserved covers the honest-observer contract: observed reflects
+// what actually exists on the cluster, not what was intended. Every case
+// pins one of the shapes readLiveObserved must produce.
+func TestReadLiveObserved_LivesResourcesPresent(t *testing.T) {
+	// Both a Velero Schedule and etcd CronJob exist. Observed should read
+	// them and populate all four fields per mechanism from live state.
+	sched := &unstructured.Unstructured{}
+	sched.SetGroupVersionKind(veleroScheduleGVK)
+	sched.SetNamespace(testVeleroNs)
+	sched.SetName("colo-cluster-001-velero")
+	_ = unstructured.SetNestedField(sched.Object, "0 2 * * *", "spec", "schedule")
+	_ = unstructured.SetNestedField(sched.Object, "default", "spec", "template", "storageLocation")
+	_ = unstructured.SetNestedField(sched.Object, false, "spec", "paused")
+
+	cj := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "colo-cluster-001-etcd-backup", Namespace: testEtcdNs},
+		Spec: batchv1.CronJobSpec{
+			Schedule: "0 3 * * *",
+			Suspend:  ptr.To(false),
+			JobTemplate: batchv1.JobTemplateSpec{
+				Spec: batchv1.JobSpec{Template: makeEtcdPodSpec("s3://backups/etcd")},
+			},
 		},
 	}
-	got := buildObserved(spec)
+	r, _ := newReconciler(t, sched, cj)
+	bc := sampleBackupConfig()
+
+	got := r.readLiveObserved(context.Background(), bc, testLogger())
+
+	if got.Velero == nil {
+		t.Fatal("velero: expected non-nil for present live Schedule")
+	}
 	if !boolPtrEqual(got.Velero.Enabled, ptr.To(true)) {
-		t.Errorf("velero.enabled: got %v", got.Velero.Enabled)
+		t.Errorf("velero.enabled: got %v want true (live paused=false)", got.Velero.Enabled)
 	}
 	if !stringPtrEqual(got.Velero.Schedule, ptr.To("0 2 * * *")) {
 		t.Errorf("velero.schedule: got %v", got.Velero.Schedule)
 	}
-	if got.Etcd.Enabled != nil || got.Etcd.Schedule != nil || got.Etcd.Location != nil {
-		t.Errorf("etcd block: expected all-nil for absent intent, got %+v", got.Etcd)
+	if !stringPtrEqual(got.Velero.Location, ptr.To("default")) {
+		t.Errorf("velero.location: got %v", got.Velero.Location)
+	}
+	if got.Etcd == nil {
+		t.Fatal("etcd: expected non-nil for present live CronJob")
+	}
+	if !boolPtrEqual(got.Etcd.Enabled, ptr.To(true)) {
+		t.Errorf("etcd.enabled: got %v want true (live suspend=false)", got.Etcd.Enabled)
+	}
+	if !stringPtrEqual(got.Etcd.Schedule, ptr.To("0 3 * * *")) {
+		t.Errorf("etcd.schedule: got %v", got.Etcd.Schedule)
+	}
+	if !stringPtrEqual(got.Etcd.Location, ptr.To("s3://backups/etcd")) {
+		t.Errorf("etcd.location: got %v", got.Etcd.Location)
+	}
+}
+
+func TestReadLiveObserved_ResourcesAbsent(t *testing.T) {
+	// Spec asks for velero + etcd but neither live resource exists. Observed
+	// reports both as nil — the "honest" answer instead of copying spec.
+	r, _ := newReconciler(t)
+	bc := sampleBackupConfig()
+
+	got := r.readLiveObserved(context.Background(), bc, testLogger())
+
+	if got.Velero != nil {
+		t.Errorf("velero: expected nil when live Schedule absent, got %+v", got.Velero)
+	}
+	if got.Etcd != nil {
+		t.Errorf("etcd: expected nil when live CronJob absent, got %+v", got.Etcd)
+	}
+}
+
+func TestReadLiveObserved_LiveDriftedFromSpec(t *testing.T) {
+	// Live Schedule has paused=true even though spec says enabled=true.
+	// Observed must report the LIVE value (enabled=false), surfacing the
+	// drift in status. This is the core payoff of live-read observed.
+	sched := &unstructured.Unstructured{}
+	sched.SetGroupVersionKind(veleroScheduleGVK)
+	sched.SetNamespace(testVeleroNs)
+	sched.SetName("colo-cluster-001-velero")
+	_ = unstructured.SetNestedField(sched.Object, "0 2 * * *", "spec", "schedule")
+	_ = unstructured.SetNestedField(sched.Object, true, "spec", "paused") // ← drifted
+	r, _ := newReconciler(t, sched)
+	bc := sampleBackupConfig()
+
+	got := r.readLiveObserved(context.Background(), bc, testLogger())
+
+	if got.Velero == nil {
+		t.Fatal("velero: expected non-nil (live Schedule present)")
+	}
+	if !boolPtrEqual(got.Velero.Enabled, ptr.To(false)) {
+		t.Errorf("velero.enabled: expected false (live paused=true drifted from spec enabled=true), got %v", got.Velero.Enabled)
+	}
+}
+
+func TestReadLiveObserved_UnmanagedMechanismStayNil(t *testing.T) {
+	// Spec only manages Velero. Live CronJob happens to exist under our
+	// deterministic name (stray from a prior deploy). readLiveObserved must
+	// still report etcd as nil — we don't observe mechanisms the CR does
+	// not ask us to manage.
+	strayCj := &batchv1.CronJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "colo-cluster-001-etcd-backup", Namespace: testEtcdNs},
+		Spec:       batchv1.CronJobSpec{Schedule: "0 3 * * *"},
+	}
+	r, _ := newReconciler(t, strayCj)
+	bc := &armadav1.BackupConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "colo-cluster-001"},
+		Spec: armadav1.BackupConfigSpec{
+			OrbID:  "colo:cluster-001",
+			Velero: &armadav1.VeleroBackupSpec{OrbID: "colo:cluster-001-velero"},
+			// Etcd intentionally nil — spec does not manage etcd.
+		},
+	}
+
+	got := r.readLiveObserved(context.Background(), bc, testLogger())
+
+	if got.Etcd != nil {
+		t.Errorf("etcd: expected nil for unmanaged mechanism, got %+v", got.Etcd)
 	}
 }
 
 func TestObservedEqual_DetectsAnyFieldChange(t *testing.T) {
 	a := armadav1.ObservedBackup{
-		Velero: armadav1.ObservedBackupBlock{Enabled: ptr.To(true), Schedule: ptr.To("a")},
+		Velero: &armadav1.ObservedVeleroStatus{Enabled: ptr.To(true), Schedule: ptr.To("a")},
 	}
 	b := armadav1.ObservedBackup{
-		Velero: armadav1.ObservedBackupBlock{Enabled: ptr.To(true), Schedule: ptr.To("b")},
+		Velero: &armadav1.ObservedVeleroStatus{Enabled: ptr.To(true), Schedule: ptr.To("b")},
 	}
 	if observedEqual(a, b) {
 		t.Errorf("expected schedule diff to surface as not-equal")

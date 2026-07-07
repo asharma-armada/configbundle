@@ -22,12 +22,12 @@ import (
 // per Galleon. Adding new fields requires extending fieldAttrKey below.
 var (
 	idracFieldIntent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "armada_idrac_field_intent",
+		Name: "configbundle_idrac_field_intent",
 		Help: "Intended value of an allowlisted iDRAC field from the ServerConfig CR (0=disabled, 1=enabled). Absent series mean no intent set on the CR.",
 	}, []string{"server", "oobIP", "field"})
 
 	idracFieldObserved = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "armada_idrac_field_observed",
+		Name: "configbundle_idrac_field_observed",
 		Help: "Live value of an allowlisted iDRAC field read via Redfish (0=disabled, 1=enabled). Updated every reconcile (event-driven + periodic poll).",
 	}, []string{"server", "oobIP", "field"})
 
@@ -35,16 +35,49 @@ var (
 	// for {serverOrbID, field}, else the series is absent. Lets alerting
 	// suppress drift alerts on fields the cloud admin has resolved as Ignored:
 	//
-	//   armada_idrac_field_intent != on(server, field) armada_idrac_field_observed
-	//     unless armada_idrac_field_ignored == 1
+	//   configbundle_idrac_field_intent != on(server, field) configbundle_idrac_field_observed
+	//     unless configbundle_idrac_field_ignored == 1
 	idracFieldIgnored = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "armada_idrac_field_ignored",
+		Name: "configbundle_idrac_field_ignored",
 		Help: "1 when the parent ConfigBundle's spec.ignored[] lists this {server, field}; absent otherwise. Used by alert rules to suppress drift alerts on admin-overridden fields.",
 	}, []string{"server", "oobIP", "field"})
+
+	// serverConfigReconcileTimestamp mirrors the bc-controller pattern:
+	// updated on every successful reconcile; alerts fire when the
+	// (time() - <this>) gap exceeds an expected cadence, catching a stuck /
+	// dead sc-controller even when spec has not changed.
+	serverConfigReconcileTimestamp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "configbundle_serverconfig_reconcile_timestamp_seconds",
+		Help: "Unix timestamp of the last successful reconcile of this ServerConfig CR. Absent series = never reconciled.",
+	}, []string{"server"})
+
+	// serverConfigReconcileErrors counts reconcile failures per CR, labelled
+	// by a bounded set of reason strings (MissingCredentials, CredentialsLoadFailed,
+	// RedfishReadFailed, RedfishPatchFailed). Cloud rate() queries surface which
+	// failure mode is dominant across the fleet.
+	serverConfigReconcileErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "configbundle_serverconfig_reconciliation_errors_total",
+		Help: "Cumulative reconcile failures per ServerConfig CR, labelled by failure reason.",
+	}, []string{"server", "reason"})
 )
 
 func init() {
-	metrics.Registry.MustRegister(idracFieldIntent, idracFieldObserved, idracFieldIgnored)
+	metrics.Registry.MustRegister(
+		idracFieldIntent, idracFieldObserved, idracFieldIgnored,
+		serverConfigReconcileTimestamp, serverConfigReconcileErrors,
+	)
+}
+
+// recordReconcileSuccess marks a successful reconcile timestamp for this CR.
+func recordReconcileSuccess(server string, now int64) {
+	serverConfigReconcileTimestamp.With(prometheus.Labels{"server": server}).Set(float64(now))
+}
+
+// recordReconcileError increments the failure counter for the given reason.
+// Reason strings should stay bounded — pick from a fixed enum, do not
+// interpolate error messages.
+func recordReconcileError(server, reason string) {
+	serverConfigReconcileErrors.With(prometheus.Labels{"server": server, "reason": reason}).Inc()
 }
 
 // fieldAttrKey maps a CRD JSON field name to the Dell Redfish attribute key
@@ -57,7 +90,7 @@ var fieldAttrKey = map[string]string{
 
 // fieldIntentPtr returns the pointer to the spec field for the given JSON name.
 // Returns nil when the field name isn't recognized — caller skips.
-func fieldIntentPtr(spec armadav1.IdracSpec, field string) *bool {
+func fieldIntentPtr(spec armadav1.IdracSettingsSpec, field string) *bool {
 	switch field {
 	case "sshEnabled":
 		return spec.SSHEnabled
@@ -79,7 +112,7 @@ func boolGauge(b bool) float64 {
 // recordIntent updates the intent gauge for every allowlisted field. Fields
 // with no intent on the CR (nil pointer) have their series deleted so
 // PromQL queries don't see stale values after an admin release.
-func recordIntent(server, oobIP string, spec armadav1.IdracSpec, allowed map[string]bool) {
+func recordIntent(server, oobIP string, spec armadav1.IdracSettingsSpec, allowed map[string]bool) {
 	for _, field := range KnownIdracFields {
 		if !allowed[field] {
 			continue

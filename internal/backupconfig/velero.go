@@ -84,12 +84,48 @@ func (r *BackupConfigReconciler) reconcileVelero(ctx context.Context, bc *armada
 	return formatBlockDeltas(fmt.Sprintf("velero/%s", name), deltas), nil
 }
 
+// observeVelero reads the live Velero Schedule and projects the fields
+// bc-controller manages into an ObservedVeleroStatus. Returns nil when the
+// Schedule does not exist (unmanaged / deleted / not-yet-created) so that
+// status.observed.velero == nil means "no live resource present" — distinct
+// from "present but all fields empty." Get errors other than NotFound are
+// returned to the caller which logs and treats as unobserved for this pass.
+//
+// Field mapping mirrors the intent-writer in reconcileVelero:
+//   - live.spec.paused (bool)                  → observed.Enabled  (inverted)
+//   - live.spec.schedule (string)              → observed.Schedule
+//   - live.spec.template.storageLocation (str) → observed.Location
+func observeVelero(ctx context.Context, c client.Client, namespace, name string) (*armadav1.ObservedVeleroStatus, error) {
+	live := &unstructured.Unstructured{}
+	live.SetGroupVersionKind(veleroScheduleGVK)
+	if err := c.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, live); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get velero schedule for observe: %w", err)
+	}
+	out := &armadav1.ObservedVeleroStatus{}
+	if sched, ok, _ := unstructured.NestedString(live.Object, "spec", "schedule"); ok {
+		s := sched
+		out.Schedule = &s
+	}
+	if loc, ok, _ := unstructured.NestedString(live.Object, "spec", "template", "storageLocation"); ok {
+		l := loc
+		out.Location = &l
+	}
+	if paused, ok, _ := unstructured.NestedBool(live.Object, "spec", "paused"); ok {
+		enabled := !paused
+		out.Enabled = &enabled
+	}
+	return out, nil
+}
+
 // veleroDeltas returns the set of fields that differ between the live Velero
 // Schedule and the intent. A NotFound Schedule means all intent fields are
 // deltas (we need to create the Schedule).
 //
 // Returns an empty map when intent and live agree — caller skips the PATCH.
-func veleroDeltas(ctx context.Context, c client.Client, namespace, name string, block *armadav1.BackupBlock) (map[string]string, error) {
+func veleroDeltas(ctx context.Context, c client.Client, namespace, name string, block *armadav1.VeleroBackupSpec) (map[string]string, error) {
 	out := map[string]string{}
 
 	live := &unstructured.Unstructured{}

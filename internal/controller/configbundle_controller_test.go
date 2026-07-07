@@ -96,7 +96,7 @@ var _ = Describe("ConfigBundle Controller", func() {
 
 		It("propagates all idrac fields to the child CR", func() {
 			cb := singleServerBundle("test-bundle", "colo-r740-01", "3RK3V64", "10.10.1.45")
-			cb.Spec.Servers[0].Idrac = armadav1.IdracSpec{
+			cb.Spec.Servers[0].IdracSettings = armadav1.IdracSettingsSpec{
 				OrbID:                       "colo:srv-3rk3v64-idrac",
 				FirmwareVersion:             ptr.To("7.20.10.05"),
 				SSHEnabled:                  ptr.To(false),
@@ -114,14 +114,14 @@ var _ = Describe("ConfigBundle Controller", func() {
 				return k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01"}, sc)
 			}, timeout, interval).Should(Succeed())
 
-			Expect(sc.Spec.Idrac.FirmwareVersion).To(Equal(ptr.To("7.20.10.05")))
-			Expect(sc.Spec.Idrac.UsbManagementPortEnabled).To(Equal(ptr.To(true)))
-			Expect(sc.Spec.Idrac.RacadmEnabled).To(Equal(ptr.To(true)))
-			Expect(sc.Spec.Idrac.SSHEnabled).To(Equal(ptr.To(false)))
-			Expect(sc.Spec.Idrac.IPMIEnabled).To(Equal(ptr.To(false)))
-			Expect(sc.Spec.Idrac.DHCPEnabled).To(Equal(ptr.To(false)))
-			Expect(sc.Spec.Idrac.LockdownModeEnabled).To(Equal(ptr.To(false)))
-			Expect(sc.Spec.Idrac.OsToIdracPassThroughEnabled).To(Equal(ptr.To(false)))
+			Expect(sc.Spec.IdracSettings.FirmwareVersion).To(Equal(ptr.To("7.20.10.05")))
+			Expect(sc.Spec.IdracSettings.UsbManagementPortEnabled).To(Equal(ptr.To(true)))
+			Expect(sc.Spec.IdracSettings.RacadmEnabled).To(Equal(ptr.To(true)))
+			Expect(sc.Spec.IdracSettings.SSHEnabled).To(Equal(ptr.To(false)))
+			Expect(sc.Spec.IdracSettings.IPMIEnabled).To(Equal(ptr.To(false)))
+			Expect(sc.Spec.IdracSettings.DHCPEnabled).To(Equal(ptr.To(false)))
+			Expect(sc.Spec.IdracSettings.LockdownModeEnabled).To(Equal(ptr.To(false)))
+			Expect(sc.Spec.IdracSettings.OsToIdracPassThroughEnabled).To(Equal(ptr.To(false)))
 		})
 
 		It("creates one ServerConfig per server in a multi-server bundle", func() {
@@ -150,7 +150,7 @@ var _ = Describe("ConfigBundle Controller", func() {
 	Describe("desired state enforcement", func() {
 		It("restores a child CR field mutated out-of-band", func() {
 			cb := singleServerBundle("test-bundle", "colo-r740-01", "3RK3V64", "10.10.1.45")
-			cb.Spec.Servers[0].Idrac.SSHEnabled = ptr.To(false)
+			cb.Spec.Servers[0].IdracSettings.SSHEnabled = ptr.To(false)
 			Expect(k8sClient.Create(ctx, cb)).To(Succeed())
 
 			// Wait for the child CR to be created.
@@ -161,19 +161,19 @@ var _ = Describe("ConfigBundle Controller", func() {
 
 			// Simulate unauthorized drift: patch sshEnabled to true directly on the child.
 			scPatched := sc.DeepCopy()
-			scPatched.Spec.Idrac.SSHEnabled = ptr.To(true)
+			scPatched.Spec.IdracSettings.SSHEnabled = ptr.To(true)
 			Expect(k8sClient.Patch(ctx, scPatched, client.MergeFrom(sc))).To(Succeed())
 
 			// The controller (triggered by Owns watch) should restore sshEnabled to false.
 			Eventually(func(g Gomega) {
 				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01"}, sc)).To(Succeed())
-				g.Expect(sc.Spec.Idrac.SSHEnabled).To(Equal(ptr.To(false)))
+				g.Expect(sc.Spec.IdracSettings.SSHEnabled).To(Equal(ptr.To(false)))
 			}, timeout, interval).Should(Succeed())
 		})
 
 		It("propagates a ConfigBundle spec update to the child CR", func() {
 			cb := singleServerBundle("test-bundle", "colo-r740-01", "3RK3V64", "10.10.1.45")
-			cb.Spec.Servers[0].Idrac.SSHEnabled = ptr.To(false)
+			cb.Spec.Servers[0].IdracSettings.SSHEnabled = ptr.To(false)
 			Expect(k8sClient.Create(ctx, cb)).To(Succeed())
 
 			// Wait for child CR.
@@ -184,13 +184,13 @@ var _ = Describe("ConfigBundle Controller", func() {
 
 			// Update the ConfigBundle spec — desired state changes.
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "test-bundle"}, cb)).To(Succeed())
-			cb.Spec.Servers[0].Idrac.SSHEnabled = ptr.To(true)
+			cb.Spec.Servers[0].IdracSettings.SSHEnabled = ptr.To(true)
 			Expect(k8sClient.Update(ctx, cb)).To(Succeed())
 
 			// Child CR must reflect the updated desired state.
 			Eventually(func(g Gomega) {
 				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "colo-r740-01"}, sc)).To(Succeed())
-				g.Expect(sc.Spec.Idrac.SSHEnabled).To(Equal(ptr.To(true)))
+				g.Expect(sc.Spec.IdracSettings.SSHEnabled).To(Equal(ptr.To(true)))
 			}, timeout, interval).Should(Succeed())
 		})
 	})
@@ -309,7 +309,7 @@ var _ = Describe("ConsumeServer", func() {
 		// Step 1: controller seeds the CR with server A's full state.
 		seed := testManifest(datacenter,
 			armadav1.ServerSpec{OrbID: "colo:srv-aaa0001", ServiceTag: "AAA0001", Hostname: ptr.To("colo-r740-01"), OobIP: ptr.To("10.10.1.45"),
-				Idrac: armadav1.IdracSpec{OrbID: "colo:srv-aaa0001-idrac", SSHEnabled: ptr.To(false), FirmwareVersion: ptr.To("7.0.0"), RacadmEnabled: ptr.To(false)}},
+				IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-aaa0001-idrac", SSHEnabled: ptr.To(false), FirmwareVersion: ptr.To("7.0.0"), RacadmEnabled: ptr.To(false)}},
 		)
 		Expect(server.applyManifest(ctx, seed, "sha256:seed", "import-0")).To(Succeed())
 
@@ -323,8 +323,8 @@ var _ = Describe("ConsumeServer", func() {
 			"spec": map[string]any{
 				"servers": []any{
 					map[string]any{
-						"orbId": "colo:srv-aaa0001",
-						"idrac": map[string]any{"sshEnabled": true},
+						"orbId":         "colo:srv-aaa0001",
+						"idracSettings": map[string]any{"sshEnabled": true},
 					},
 				},
 			},
@@ -339,7 +339,7 @@ var _ = Describe("ConsumeServer", func() {
 		// but the other fields on A must take the controller's new values.
 		body := testManifest(datacenter,
 			armadav1.ServerSpec{OrbID: "colo:srv-aaa0001", ServiceTag: "AAA0001", Hostname: ptr.To("colo-r740-01"), OobIP: ptr.To("10.10.1.99"),
-				Idrac: armadav1.IdracSpec{OrbID: "colo:srv-aaa0001-idrac", SSHEnabled: ptr.To(false), FirmwareVersion: ptr.To("7.20.10.05"), RacadmEnabled: ptr.To(true)}},
+				IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-aaa0001-idrac", SSHEnabled: ptr.To(false), FirmwareVersion: ptr.To("7.20.10.05"), RacadmEnabled: ptr.To(true)}},
 			armadav1.ServerSpec{OrbID: "colo:srv-bbb0002", ServiceTag: "BBB0002", Hostname: ptr.To("colo-r740-02"), OobIP: ptr.To("10.10.1.46")},
 		)
 		Expect(server.applyManifest(ctx, body, "sha256:newdigest", "import-1")).To(Succeed())
@@ -354,12 +354,12 @@ var _ = Describe("ConsumeServer", func() {
 		Expect(serverA).NotTo(BeNil(), "server A must still be present")
 
 		// Admin-owned leaf preserved:
-		Expect(serverA.Idrac.SSHEnabled).To(Equal(ptr.To(true)), "admin's sshEnabled override must be preserved")
+		Expect(serverA.IdracSettings.SSHEnabled).To(Equal(ptr.To(true)), "admin's sshEnabled override must be preserved")
 
 		// Controller-updatable leaves propagated:
 		Expect(serverA.OobIP).To(Equal(ptr.To("10.10.1.99")), "controller's oobIP update must take effect")
-		Expect(serverA.Idrac.FirmwareVersion).To(Equal(ptr.To("7.20.10.05")), "controller's firmwareVersion update must take effect")
-		Expect(serverA.Idrac.RacadmEnabled).To(Equal(ptr.To(true)), "controller's racadmEnabled update must take effect")
+		Expect(serverA.IdracSettings.FirmwareVersion).To(Equal(ptr.To("7.20.10.05")), "controller's firmwareVersion update must take effect")
+		Expect(serverA.IdracSettings.RacadmEnabled).To(Equal(ptr.To(true)), "controller's racadmEnabled update must take effect")
 	})
 
 	It("returns error when manifest has empty datacenter", func() {
@@ -485,11 +485,11 @@ var _ = Describe("SSA list merge-key isolation on servers[]", func() {
 				Datacenter: "colo",
 				Servers: []armadav1.ServerSpec{
 					{
-						OrbID:      "colo:srv-aaa0001",
-						ServiceTag: "AAA0001",
-						Hostname:   ptr.To("colo-r740-01"),
-						OobIP:      ptr.To("10.10.1.45"),
-						Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-aaa0001-idrac", SSHEnabled: ptr.To(true)},
+						OrbID:         "colo:srv-aaa0001",
+						ServiceTag:    "AAA0001",
+						Hostname:      ptr.To("colo-r740-01"),
+						OobIP:         ptr.To("10.10.1.45"),
+						IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-aaa0001-idrac", SSHEnabled: ptr.To(true)},
 					},
 				},
 			},
@@ -513,11 +513,11 @@ var _ = Describe("SSA list merge-key isolation on servers[]", func() {
 				Datacenter: "colo",
 				Servers: []armadav1.ServerSpec{
 					{
-						OrbID:      "colo:srv-bbb0002",
-						ServiceTag: "BBB0002",
-						Hostname:   ptr.To("colo-r740-02"),
-						OobIP:      ptr.To("10.10.1.46"),
-						Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-bbb0002-idrac", SSHEnabled: ptr.To(false)},
+						OrbID:         "colo:srv-bbb0002",
+						ServiceTag:    "BBB0002",
+						Hostname:      ptr.To("colo-r740-02"),
+						OobIP:         ptr.To("10.10.1.46"),
+						IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-bbb0002-idrac", SSHEnabled: ptr.To(false)},
 					},
 				},
 			},
@@ -531,11 +531,11 @@ var _ = Describe("SSA list merge-key isolation on servers[]", func() {
 
 		serverA := findServerByTag(result.Spec.Servers, "AAA0001")
 		Expect(serverA).NotTo(BeNil(), "server A (admin-owned) must still be present")
-		Expect(serverA.Idrac.SSHEnabled).To(Equal(ptr.To(true)), "admin override on server A must be preserved")
+		Expect(serverA.IdracSettings.SSHEnabled).To(Equal(ptr.To(true)), "admin override on server A must be preserved")
 
 		serverB := findServerByTag(result.Spec.Servers, "BBB0002")
 		Expect(serverB).NotTo(BeNil(), "server B (Puller-owned) must be present")
-		Expect(serverB.Idrac.SSHEnabled).To(Equal(ptr.To(false)), "Puller's desired state for server B must land")
+		Expect(serverB.IdracSettings.SSHEnabled).To(Equal(ptr.To(false)), "Puller's desired state for server B must land")
 	})
 })
 
@@ -593,11 +593,11 @@ var _ = Describe("DivergenceReporter", func() {
 				Datacenter: datacenter,
 				Servers: []armadav1.ServerSpec{
 					{
-						OrbID:      "colo:srv-3rk3v64",
-						ServiceTag: "3RK3V64",
-						Hostname:   ptr.To("colo-r740-01"),
-						OobIP:      ptr.To("10.10.1.45"),
-						Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(false), RacadmEnabled: ptr.To(true)},
+						OrbID:         "colo:srv-3rk3v64",
+						ServiceTag:    "3RK3V64",
+						Hostname:      ptr.To("colo-r740-01"),
+						OobIP:         ptr.To("10.10.1.45"),
+						IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(false), RacadmEnabled: ptr.To(true)},
 					},
 				},
 			},
@@ -615,8 +615,8 @@ var _ = Describe("DivergenceReporter", func() {
 			"spec": map[string]any{
 				"servers": []any{
 					map[string]any{
-						"orbId": "colo:srv-3rk3v64",
-						"idrac": map[string]any{"sshEnabled": true},
+						"orbId":         "colo:srv-3rk3v64",
+						"idracSettings": map[string]any{"sshEnabled": true},
 					},
 				},
 			},
@@ -708,11 +708,11 @@ var _ = Describe("DivergenceReporter", func() {
 				Datacenter: datacenter,
 				Servers: []armadav1.ServerSpec{
 					{
-						OrbID:      "colo:srv-3rk3v64",
-						ServiceTag: "3RK3V64",
-						Hostname:   ptr.To("colo-r740-01"),
-						OobIP:      ptr.To("10.10.1.45"),
-						Idrac:      armadav1.IdracSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(false)},
+						OrbID:         "colo:srv-3rk3v64",
+						ServiceTag:    "3RK3V64",
+						Hostname:      ptr.To("colo-r740-01"),
+						OobIP:         ptr.To("10.10.1.45"),
+						IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-3rk3v64-idrac", SSHEnabled: ptr.To(false)},
 					},
 				},
 			},
@@ -731,8 +731,8 @@ var _ = Describe("DivergenceReporter", func() {
 			"spec": map[string]any{
 				"servers": []any{
 					map[string]any{
-						"orbId": "colo:srv-3rk3v64",
-						"idrac": map[string]any{"sshEnabled": true},
+						"orbId":         "colo:srv-3rk3v64",
+						"idracSettings": map[string]any{"sshEnabled": true},
 					},
 				},
 			},
@@ -848,7 +848,7 @@ var _ = Describe("Takeover", func() {
 						ServiceTag: "3RK3V64",
 						Hostname:   ptr.To("colo-r740-01"),
 						OobIP:      ptr.To("10.10.1.45"),
-						Idrac: armadav1.IdracSpec{
+						IdracSettings: armadav1.IdracSettingsSpec{
 							SSHEnabled:    ptr.To(false),
 							RacadmEnabled: ptr.To(true),
 						},
@@ -871,7 +871,7 @@ var _ = Describe("Takeover", func() {
 				"servers": []any{
 					map[string]any{
 						"orbId": "colo:srv-3rk3v64",
-						"idrac": map[string]any{
+						"idracSettings": map[string]any{
 							"sshEnabled":    true,
 							"racadmEnabled": false,
 						},
@@ -900,7 +900,7 @@ var _ = Describe("Takeover", func() {
 					ServiceTag: "3RK3V64",
 					Hostname:   ptr.To("colo-r740-01"),
 					OobIP:      ptr.To("10.10.1.45"),
-					Idrac: armadav1.IdracSpec{
+					IdracSettings: armadav1.IdracSettingsSpec{
 						SSHEnabled:    ptr.To(false),
 						RacadmEnabled: ptr.To(true),
 					},
@@ -926,20 +926,20 @@ var _ = Describe("Takeover", func() {
 		Expect(srv).NotTo(BeNil())
 
 		// sshEnabled should be reclaimed to controller's value (false).
-		Expect(srv.Idrac.SSHEnabled).To(Equal(ptr.To(false)), "sshEnabled should be reclaimed to controller intent (false)")
+		Expect(srv.IdracSettings.SSHEnabled).To(Equal(ptr.To(false)), "sshEnabled should be reclaimed to controller intent (false)")
 
 		// racadmEnabled should still be the admin's override value (false).
-		Expect(srv.Idrac.RacadmEnabled).To(Equal(ptr.To(false)), "racadmEnabled should still be admin's override value")
+		Expect(srv.IdracSettings.RacadmEnabled).To(Equal(ptr.To(false)), "racadmEnabled should still be admin's override value")
 
 		// Verify managedFields: sshEnabled should now be owned by configbundle-controller.
 		// local:admin should still own racadmEnabled but NOT sshEnabled.
 		adminPaths := extractAdminPaths(cbAfter.ManagedFields)
 		var adminOwnsSSH, adminOwnsRacadm bool
 		for _, ap := range adminPaths {
-			if ap.path == "spec.servers[orbId=colo:srv-3rk3v64].idrac.sshEnabled" {
+			if ap.path == "spec.servers[orbId=colo:srv-3rk3v64].idracSettings.sshEnabled" {
 				adminOwnsSSH = true
 			}
-			if ap.path == "spec.servers[orbId=colo:srv-3rk3v64].idrac.racadmEnabled" {
+			if ap.path == "spec.servers[orbId=colo:srv-3rk3v64].idracSettings.racadmEnabled" {
 				adminOwnsRacadm = true
 			}
 		}

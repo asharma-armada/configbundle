@@ -76,8 +76,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// the divergence-reporter can compare it against the local override and
 	// continue surfacing the divergence.
 	//
-	// After ADR-011: orbId lookups walk spec.servers[].idrac.orbId directly
-	// instead of consulting a mapping payload. The spec IS the identity manifest.
+	// After ADR-011: orbId lookups walk spec.servers[].idracSettings.orbId
+	// directly instead of consulting a mapping payload. The spec IS the
+	// identity manifest.
 	if h.Resolutions != nil {
 		omissions, err := h.Resolutions.QueryOmissions(r.Context())
 		if err != nil {
@@ -113,9 +114,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// findServerByNestedOrbID returns the ServerSpec whose nested-entity orbId matches
-// the given resolution orbId (e.g. resolution orbId "colo:GQK3V64-idrac" matches
-// the server whose Idrac.OrbID == "colo:GQK3V64-idrac"). Returns nil if no match.
+// findServerByNestedOrbID returns the ServerSpec whose nested-entity orbId
+// matches the given resolution orbId (e.g. resolution orbId
+// "colo:GQK3V64-idrac" matches the server whose IdracSettings.OrbID ==
+// "colo:GQK3V64-idrac"). Returns nil if no match.
 //
 // Replaces bundle.MappingPayload.ResolveByOrbID (deleted in ADR-011). The
 // suffix convention ("<server>-idrac") is no longer encoded anywhere — instead
@@ -123,7 +125,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // is a direct walk.
 func findServerByNestedOrbID(orbID string, servers []armadav1.ServerSpec) *armadav1.ServerSpec {
 	for i := range servers {
-		if servers[i].Idrac.OrbID == orbID {
+		if servers[i].IdracSettings.OrbID == orbID {
 			return &servers[i]
 		}
 		// Future: extend with other nested types here as they're added.
@@ -133,7 +135,7 @@ func findServerByNestedOrbID(orbID string, servers []armadav1.ServerSpec) *armad
 
 // buildTakeover translates pending accept/reject-resolutions into TakeoverEntry values.
 // For each resolution, looks up the owning server by matching the resolution's orbId
-// against each server's nested-entity orbIds (e.g. Idrac.OrbID).
+// against each server's nested-entity orbIds (e.g. IdracSettings.OrbID).
 // Resolutions whose orbId doesn't match any server are silently skipped —
 // the resolution may belong to a different bundle or a stale entry.
 func buildTakeover(resolutions []PendingForceResolution, servers []armadav1.ServerSpec) []armadav1.TakeoverEntry {
@@ -185,10 +187,10 @@ func buildIgnored(omissions []Omission, servers []armadav1.ServerSpec) []armadav
 // mapToSpec maps a GraphQL DataCenterResult to a ConfigBundleSpec.
 // Servers without a hostname or orbId are skipped — hostname is required by the
 // CRD and orbId is the SSA listMapKey.
-// IdracSettings fields are transferred via JSON round-trip: both IdracSettingsResult
-// and IdracSpec use identical json tags (including the OrbID added in ADR-011),
-// so adding a field to both structs is sufficient — no field-by-field copy code
-// to update.
+// IdracSettings fields are transferred via JSON round-trip: both
+// IdracSettingsResult and armadav1.IdracSettingsSpec use identical json tags
+// (including the OrbID added in ADR-011), so adding a field to both structs
+// is sufficient — no field-by-field copy code to update.
 func mapToSpec(dc DataCenterResult) armadav1.ConfigBundleSpec {
 	spec := armadav1.ConfigBundleSpec{
 		OrbID:      dc.OrbID,
@@ -210,18 +212,18 @@ func mapToSpec(dc DataCenterResult) armadav1.ConfigBundleSpec {
 			OobIP:      &oobIP,
 		}
 		if s.IdracSettings != nil {
-			srv.Idrac = mapIdrac(s.IdracSettings)
+			srv.IdracSettings = mapIdrac(s.IdracSettings)
 		}
 		spec.Servers = append(spec.Servers, srv)
 	}
 	return spec
 }
 
-// mapIdrac transfers IdracSettings fields via JSON round-trip.
-// Works because IdracSettingsResult and IdracSpec share identical json tag names,
-// including the OrbID added in ADR-011.
-func mapIdrac(src *IdracSettingsResult) armadav1.IdracSpec {
-	var dst armadav1.IdracSpec
+// mapIdrac transfers IdracSettings fields via JSON round-trip. Works because
+// IdracSettingsResult and armadav1.IdracSettingsSpec share identical json tag
+// names, including the OrbID added in ADR-011.
+func mapIdrac(src *IdracSettingsResult) armadav1.IdracSettingsSpec {
+	var dst armadav1.IdracSettingsSpec
 	b, err := json.Marshal(src)
 	if err != nil {
 		return dst

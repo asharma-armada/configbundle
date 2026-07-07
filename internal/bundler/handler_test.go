@@ -140,13 +140,13 @@ func TestHandleBundle_Success(t *testing.T) {
 	if got := derefString(srv.OobIP); got != "10.10.1.45" {
 		t.Errorf("oobIP: got %q", got)
 	}
-	if got := derefString(srv.Idrac.FirmwareVersion); got != "7.20.10.05" {
+	if got := derefString(srv.IdracSettings.FirmwareVersion); got != "7.20.10.05" {
 		t.Errorf("firmwareVersion: got %q", got)
 	}
-	if !derefBool(srv.Idrac.SSHEnabled) {
+	if !derefBool(srv.IdracSettings.SSHEnabled) {
 		t.Error("sshEnabled: want true")
 	}
-	if !derefBool(srv.Idrac.RacadmEnabled) {
+	if !derefBool(srv.IdracSettings.RacadmEnabled) {
 		t.Error("racadmEnabled: want true")
 	}
 }
@@ -212,7 +212,7 @@ func TestMapToSpec_NilIdracSettings(t *testing.T) {
 		}},
 	}
 	spec := mapToSpec(dc)
-	idrac := spec.Servers[0].Idrac
+	idrac := spec.Servers[0].IdracSettings
 	if derefBool(idrac.SSHEnabled) || derefBool(idrac.IPMIEnabled) || derefString(idrac.FirmwareVersion) != "" {
 		t.Error("expected zero-value IdracSpec for nil idracSettings")
 	}
@@ -263,8 +263,8 @@ func TestBuildTakeover_Empty(t *testing.T) {
 
 func TestBuildTakeover_ResolvesServerOrbIDViaNestedOrbID(t *testing.T) {
 	servers := []armadav1.ServerSpec{
-		{OrbID: "colo:srv-001", Idrac: armadav1.IdracSpec{OrbID: "colo:srv-001-idrac"}},
-		{OrbID: "colo:srv-002", Idrac: armadav1.IdracSpec{OrbID: "colo:srv-002-idrac"}},
+		{OrbID: "colo:srv-001", IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-001-idrac"}},
+		{OrbID: "colo:srv-002", IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-002-idrac"}},
 	}
 
 	resolutions := []PendingForceResolution{
@@ -297,7 +297,7 @@ func TestBuildTakeover_ResolvesServerOrbIDViaNestedOrbID(t *testing.T) {
 
 func TestBuildTakeover_SkipsOrbIdNotMatchingAnyServer(t *testing.T) {
 	servers := []armadav1.ServerSpec{
-		{OrbID: "colo:srv-001", Idrac: armadav1.IdracSpec{OrbID: "colo:srv-001-idrac"}},
+		{OrbID: "colo:srv-001", IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-001-idrac"}},
 	}
 
 	resolutions := []PendingForceResolution{
@@ -415,7 +415,7 @@ func TestBuildIgnored_NilInput(t *testing.T) {
 
 func TestBuildIgnored_ResolvesServerOrbIDViaNestedOrbID(t *testing.T) {
 	servers := []armadav1.ServerSpec{
-		{OrbID: "colo:srv-001", Idrac: armadav1.IdracSpec{OrbID: "colo:srv-001-idrac"}},
+		{OrbID: "colo:srv-001", IdracSettings: armadav1.IdracSettingsSpec{OrbID: "colo:srv-001-idrac"}},
 	}
 	omissions := []Omission{
 		{OrbID: "colo:srv-001-idrac", Field: "sshEnabled"},
@@ -449,7 +449,7 @@ func TestBuildIgnored_IntentValuesStayInSpec(t *testing.T) {
 		Servers: []armadav1.ServerSpec{{
 			OrbID:    "colo:srv-001",
 			Hostname: ptrString("host-01"),
-			Idrac: armadav1.IdracSpec{
+			IdracSettings: armadav1.IdracSettingsSpec{
 				OrbID:         "colo:srv-001-idrac",
 				SSHEnabled:    ptrBool(true),
 				RacadmEnabled: ptrBool(true),

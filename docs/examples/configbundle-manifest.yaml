@@ -3,7 +3,7 @@ servers:
   - serviceTag: 3RK3V64
     hostname: colo-r740-01
     oobIP: 10.10.1.45
-    idrac:
+    idracSettings:
       firmwareVersion: 7.20.10.05
       sshEnabled: true
       ipmiEnabled: false
@@ -15,7 +15,7 @@ servers:
   - serviceTag: 7BN2X91
     hostname: colo-r740-02
     oobIP: 10.10.1.46
-    idrac:
+    idracSettings:
       firmwareVersion: 7.20.10.05
       sshEnabled: true
       ipmiEnabled: false

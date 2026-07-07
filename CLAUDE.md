@@ -170,6 +170,9 @@ These are cross-cutting platform decisions. **Domain-specific decisions live in 
 - **Local dev defaults must point to local services** — `ORBITAL_BASE_URL`, `BUNDLER_PORT`, etc. all default to local values in config structs. Production credentials must never appear as code defaults.
 - **Single base URL for orbital — `ORBITAL_BASE_URL`** — cb-bundler derives `/graphql` and `/api/v1/...` from this one root. Must include orbital's base path (e.g. AKS: `http://localhost:8001/orbital`, local: `http://localhost:8001`). Do NOT reintroduce separate `ORBITAL_GRAPHQL_URL`/`ORBITAL_API_URL` env vars — that two-URL design caused base-path drift across local/AKS that took two rounds of debugging to surface. See `cmd/bundler/main.go` and `internal/bundler/orbital.go` for the helpers (`graphqlURL()`, `divergencesURL()`).
 - **Single `Dockerfile`, two targets** — `--target controller` and `--target bundler` produce two images from one Dockerfile with a shared builder stage
+- **`api/v1/` types mirror the orbital GraphQL schema** — Go type = `<OrbitalType>Spec`; JSON edges verbatim orbital (`idracSettings`, `kubernetesClusters`, `backup`, `velero`, `etcd`, `s3Sync`). No ad-hoc names, no `*TypeName` string constants.
+- **Prom namespace is `configbundle_*`, never `armada_*`** — taxonomy `configbundle_<subsystem>_<subject>_<measure>`. `armada_*` claimed a brand namespace no other Armada service shares.
+- **One live read per reconcile → fan out to Prom AND `.Status` independently** — metrics must NOT derive from status writes (RetryOnConflict race would silence gauges). `.Status.observed` is live-read too, never spec-copy. Downstream operational metrics come from their owners (`velero_*`, `kube_*` via KSM) — controllers publish only pipeline-domain metrics.
 
 ## Development Status
 

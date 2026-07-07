@@ -47,9 +47,10 @@ type ServerConfigSpec struct {
 	// +kubebuilder:validation:Required
 	OobIP *string `json:"oobIP,omitempty"`
 
-	// Idrac holds desired iDRAC configuration.
+	// IdracSettings holds desired iDRAC configuration, mirroring the orbital
+	// Server.idracSettings edge.
 	// +optional
-	Idrac IdracSpec `json:"idrac,omitempty"`
+	IdracSettings IdracSettingsSpec `json:"idracSettings,omitempty"`
 }
 
 // ServerConfigPhase represents the current lifecycle phase.
@@ -119,14 +120,15 @@ type RecentPatch struct {
 
 // ObservedStatus contains per-domain observed-state ledgers.
 type ObservedStatus struct {
-	// Idrac holds the controller-confirmed iDRAC field values.
+	// IdracSettings holds the controller-confirmed iDRAC field values.
 	// +optional
-	Idrac ObservedIdracStatus `json:"idrac,omitempty"`
+	IdracSettings ObservedIdracSettingsStatus `json:"idracSettings,omitempty"`
 }
 
-// ObservedIdracStatus mirrors the controller-managed subset of IdracSpec.
-// Pointer types so absence means "never confirmed" (vs. "confirmed and false").
-type ObservedIdracStatus struct {
+// ObservedIdracSettingsStatus mirrors the controller-managed subset of
+// IdracSettingsSpec. Pointer types so absence means "never confirmed" (vs.
+// "confirmed and false").
+type ObservedIdracSettingsStatus struct {
 	// +optional
 	SSHEnabled *bool `json:"sshEnabled,omitempty"`
 	// +optional

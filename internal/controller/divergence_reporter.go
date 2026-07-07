@@ -195,7 +195,7 @@ func (r *DivergenceReporter) extractOverrides(cb *armadav1.ConfigBundle, lastMan
 //
 // Supported path shape today:
 //
-//	"spec.servers[orbId=<X>].idrac.<leaf>"  →  (server.Idrac.OrbID, <leaf>, IdracTypeName)
+//	"spec.servers[orbId=<X>].idrac.<leaf>"  →  (server.IdracSettings.OrbID, <leaf>, IdracTypeName)
 //
 // When a new nested type is added (BIOS, NIC, ...), add a switch branch and a
 // corresponding {Type}TypeName constant alongside the struct in api/v1.
@@ -237,11 +237,11 @@ func resolveOrbital(spec armadav1.ConfigBundleSpec, path string) (orbID, field, 
 	}
 
 	switch nestedName {
-	case "idrac":
-		if server.Idrac.OrbID == "" {
+	case "idracSettings":
+		if server.IdracSettings.OrbID == "" {
 			return "", "", "", fmt.Errorf("server %q has empty idrac.orbId (bundler bug?)", serverOrbID)
 		}
-		return server.Idrac.OrbID, leaf, armadav1.IdracTypeName, nil
+		return server.IdracSettings.OrbID, leaf, "IdracSettings", nil
 	default:
 		return "", "", "", fmt.Errorf("unknown nested type %q in path %q", nestedName, path)
 	}
@@ -493,7 +493,7 @@ type pathPart struct {
 
 // splitPath splits a K8s field path into parts.
 // "spec.servers[orbId=Y].idrac.sshEnabled" →
-// [{field:"spec"}, {field:"servers", selector:"Y"}, {field:"idrac"}, {field:"sshEnabled"}]
+// [{field:"spec"}, {field:"servers", selector:"Y"}, {field:"idracSettings"}, {field:"sshEnabled"}]
 func splitPath(path string) []pathPart {
 	var parts []pathPart
 	remaining := path

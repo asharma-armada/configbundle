@@ -41,7 +41,7 @@ const (
 // KnownIdracFields enumerates every CRD JSON field name this controller
 // recognizes for reconciliation. Used at startup to warn about unknown
 // entries in IDRAC_FIELD_ALLOWLIST and to gate which intents the controller
-// will act on. The names match the JSON tags on armadav1.IdracSpec.
+// will act on. The names match the JSON tags on armadav1.IdracSettingsSpec.
 var KnownIdracFields = []string{"sshEnabled", "racadmEnabled", "ipmiEnabled"}
 
 // UnknownAllowlistEntries returns any entries in `allowed` that don't name
@@ -85,7 +85,7 @@ func enableStrToBool(s string) bool {
 // that need PATCHing — i.e., spec sets an intent, the field is allowed by
 // policy, AND live differs from intent. Empty result means "nothing to do."
 // Pure function: no K8s, no HTTP — straightforward to unit-test.
-func computeIdracDeltas(spec armadav1.IdracSpec, live map[string]any, allowed map[string]bool) map[string]string {
+func computeIdracDeltas(spec armadav1.IdracSettingsSpec, live map[string]any, allowed map[string]bool) map[string]string {
 	out := map[string]string{}
 	if spec.SSHEnabled != nil && allowed["sshEnabled"] {
 		intentStr := boolToEnableStr(*spec.SSHEnabled)
@@ -113,7 +113,7 @@ func computeIdracDeltas(spec armadav1.IdracSpec, live map[string]any, allowed ma
 // allowlist. Used to short-circuit before loading creds or touching the
 // network. Note: fields with intent set but blocked by policy don't count —
 // the early-return log surfaces them via policyBlockedFields().
-func hasReconcilableIntent(spec armadav1.IdracSpec, allowed map[string]bool) bool {
+func hasReconcilableIntent(spec armadav1.IdracSettingsSpec, allowed map[string]bool) bool {
 	return (spec.SSHEnabled != nil && allowed["sshEnabled"]) ||
 		(spec.RacadmEnabled != nil && allowed["racadmEnabled"]) ||
 		(spec.IPMIEnabled != nil && allowed["ipmiEnabled"])
@@ -123,7 +123,7 @@ func hasReconcilableIntent(spec armadav1.IdracSpec, allowed map[string]bool) boo
 // given spec. Order is stable (declaration order). Returned in the summary
 // log so operators can see which fields the controller deliberately ignored
 // (no intent) vs. fields it acted on.
-func unmanagedFields(spec armadav1.IdracSpec) []string {
+func unmanagedFields(spec armadav1.IdracSettingsSpec) []string {
 	var out []string
 	if spec.SSHEnabled == nil {
 		out = append(out, "sshEnabled")
@@ -140,7 +140,7 @@ func unmanagedFields(spec armadav1.IdracSpec) []string {
 // policyBlockedFields lists fields where intent IS set in the spec but the
 // field is NOT in the allow set. Logged so operators can see why a field
 // they expected to be reconciled didn't fire.
-func policyBlockedFields(spec armadav1.IdracSpec, allowed map[string]bool) []string {
+func policyBlockedFields(spec armadav1.IdracSettingsSpec, allowed map[string]bool) []string {
 	var out []string
 	if spec.SSHEnabled != nil && !allowed["sshEnabled"] {
 		out = append(out, "sshEnabled")
@@ -223,9 +223,9 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	if !r.AllowedOobIPs[oobIP] {
 		logger.Info("change detected but oobIP not on allowlist, ignoring",
 			"name", sc.Name, "oobIP", oobIP,
-			"intent.sshEnabled", boolPtr(sc.Spec.Idrac.SSHEnabled),
-			"intent.racadmEnabled", boolPtr(sc.Spec.Idrac.RacadmEnabled),
-			"intent.ipmiEnabled", boolPtr(sc.Spec.Idrac.IPMIEnabled))
+			"intent.sshEnabled", boolPtr(sc.Spec.IdracSettings.SSHEnabled),
+			"intent.racadmEnabled", boolPtr(sc.Spec.IdracSettings.RacadmEnabled),
+			"intent.ipmiEnabled", boolPtr(sc.Spec.IdracSettings.IPMIEnabled))
 		return reconcile.Result{}, nil
 	}
 
@@ -239,18 +239,18 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 
 	// Nothing reconcilable on this CR — either no intent set, or all intent
 	// fields are blocked by the field allowlist. Surface both states.
-	if !hasReconcilableIntent(sc.Spec.Idrac, r.AllowedFields) {
+	if !hasReconcilableIntent(sc.Spec.IdracSettings, r.AllowedFields) {
 		logger.Info("no reconcilable intent on serverconfig; skipping",
 			"name", sc.Name, "oobIP", oobIP,
-			"unmanaged", unmanagedFields(sc.Spec.Idrac),
-			"policyBlocked", policyBlockedFields(sc.Spec.Idrac, r.AllowedFields))
-		recordIntent(sc.Name, oobIP, sc.Spec.Idrac, r.AllowedFields)
+			"unmanaged", unmanagedFields(sc.Spec.IdracSettings),
+			"policyBlocked", policyBlockedFields(sc.Spec.IdracSettings, r.AllowedFields))
+		recordIntent(sc.Name, oobIP, sc.Spec.IdracSettings, r.AllowedFields)
 		return reconcile.Result{}, nil
 	}
 
 	// Refresh the intent gauge before the network step so it stays in sync
 	// with the CR even if the Redfish GET fails.
-	recordIntent(sc.Name, oobIP, sc.Spec.Idrac, r.AllowedFields)
+	recordIntent(sc.Name, oobIP, sc.Spec.IdracSettings, r.AllowedFields)
 
 	// Load shared credentials.
 	creds, err := loadIdracCredentials(ctx, r.Client, r.CredentialsNamespace, r.CredentialsSecretName)
@@ -264,10 +264,12 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 				"name", sc.Name,
 				"secret", r.CredentialsNamespace+"/"+r.CredentialsSecretName)
 			r.setStatusFailed(ctx, &sc, "MissingCredentials", err.Error())
+			recordReconcileError(sc.Name, "MissingCredentials")
 			return reconcile.Result{RequeueAfter: 1 * time.Minute}, nil
 		}
 		logger.Error(err, "load iDRAC credentials")
 		r.setStatusFailed(ctx, &sc, "CredentialsLoadFailed", err.Error())
+		recordReconcileError(sc.Name, "CredentialsLoadFailed")
 		return reconcile.Result{}, fmt.Errorf("load credentials: %w", err)
 	}
 
@@ -277,14 +279,15 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	if err != nil {
 		logger.Error(err, "read iDRAC Attributes", "oobIP", oobIP)
 		r.setStatusFailed(ctx, &sc, "RedfishReadFailed", err.Error())
+		recordReconcileError(sc.Name, "RedfishReadFailed")
 		return reconcile.Result{}, fmt.Errorf("read Attributes from %s: %w", oobIP, err)
 	}
 
 	recordObserved(sc.Name, oobIP, attrs, r.AllowedFields)
 
-	deltas := computeIdracDeltas(sc.Spec.Idrac, attrs, r.AllowedFields)
-	unmanaged := unmanagedFields(sc.Spec.Idrac)
-	blocked := policyBlockedFields(sc.Spec.Idrac, r.AllowedFields)
+	deltas := computeIdracDeltas(sc.Spec.IdracSettings, attrs, r.AllowedFields)
+	unmanaged := unmanagedFields(sc.Spec.IdracSettings)
+	blocked := policyBlockedFields(sc.Spec.IdracSettings, r.AllowedFields)
 
 	if len(deltas) == 0 {
 		logger.Info("reconciled (no PATCH needed)",
@@ -305,13 +308,15 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 		}
 		// Populate the per-field observed ledger: iDRAC confirmed-matches-intent
 		// for every allowlisted managed field. Skipped if already correct.
-		r.recordObserved(ctx, &sc)
+		r.recordObserved(ctx, &sc, attrs)
+		recordReconcileSuccess(sc.Name, time.Now().Unix())
 		return reconcile.Result{RequeueAfter: r.ObserveInterval}, nil
 	}
 
 	if err := rc.PatchAttributes(ctx, deltas); err != nil {
 		logger.Error(err, "PATCH iDRAC attributes", "oobIP", oobIP, "updates", deltas)
 		r.setStatusFailed(ctx, &sc, "RedfishPatchFailed", err.Error())
+		recordReconcileError(sc.Name, "RedfishPatchFailed")
 		return reconcile.Result{}, fmt.Errorf("PATCH attributes on %s: %w", oobIP, err)
 	}
 	logger.Info("reconciled (PATCH applied)",
@@ -321,14 +326,20 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 		"updates", deltas)
 	patchMsg := fmt.Sprintf("PATCHed %d attribute(s): %s", len(deltas), formatDeltas(deltas))
 	r.setStatusApplied(ctx, &sc, patchMsg)
-	// Update the per-field observed ledger after the PATCH succeeds — these
-	// fields are now confirmed at the values we just sent. Survives the
-	// status-message overwrite race that loses info across multi-step reconciles.
-	r.recordObserved(ctx, &sc)
+	// Overlay the just-PATCHed values into the attrs snapshot so observed
+	// reflects post-PATCH state without a second Redfish GET. Delta keys +
+	// values are Dell Attribute-API strings — same shape as attrs — so this
+	// is a simple map merge. Fields not in deltas retain their pre-PATCH
+	// live value.
+	for k, v := range deltas {
+		attrs[k] = v
+	}
+	r.recordObserved(ctx, &sc, attrs)
 	// Append to the bounded action-history list so operators can see all
 	// PATCHes from a multi-step reconcile (the condition message only holds
 	// the latest).
 	r.appendRecentPatch(ctx, &sc, patchMsg)
+	recordReconcileSuccess(sc.Name, time.Now().Unix())
 	return reconcile.Result{RequeueAfter: r.ObserveInterval}, nil
 }
 
@@ -455,19 +466,25 @@ func (r *ServerConfigReconciler) appendRecentPatch(ctx context.Context, sc *arma
 	}
 }
 
-// recordObserved updates status.observed.idrac for every allowlisted field
-// with intent set on the CR. Trusts the Redfish 2xx as confirmation — for
-// SSH/IPMI/Racadm boolean toggles the iDRAC's Attributes API is transactional;
-// no separate "read it back" GET needed. Called after every successful
-// reconcile (PATCH-applied AND no-PATCH-needed paths) so the ledger reflects
-// the controller's current per-field truth without the message-overwrite race
-// the single condition message has.
+// recordObserved writes status.observed.idracSettings from the live Redfish
+// Attributes map (passed in by the caller from the top-of-reconcile GET).
+// Live-read semantics: observed reflects what actually exists on the iDRAC,
+// not the intent we PATCHed. Consequences:
+//   - out-of-band change flips a value → observed shows the LIVE value,
+//     drift visible in `kubectl get sc -o yaml` on the next reconcile
+//   - field missing from Attributes response (transient firmware quirk) →
+//     that field is skipped for this pass, no series update
+//   - field not on the allowlist → not written, even if live has a value
+//     (matches the Prom metrics semantic in package-level recordObserved)
 //
-// Read-modify-write with RetryOnConflict; skipped entirely when nothing would
-// change so periodic polls in steady state are zero-cost.
-func (r *ServerConfigReconciler) recordObserved(ctx context.Context, sc *armadav1.ServerConfig) {
-	desired := buildObservedIdrac(sc.Spec.Idrac, r.AllowedFields)
-	if observedIdracEqual(sc.Status.Observed.Idrac, desired) {
+// Read-modify-write with RetryOnConflict; skipped entirely when the freshly
+// projected observed equals what's already in status, so periodic polls in
+// steady state are zero-cost. attrs is threaded through instead of re-fetched
+// inside the retry loop: a fresh Redfish GET per conflict retry would burn
+// iDRAC round-trips on unrelated status races.
+func (r *ServerConfigReconciler) recordObserved(ctx context.Context, sc *armadav1.ServerConfig, attrs map[string]any) {
+	desired := buildObservedIdrac(attrs, r.AllowedFields)
+	if observedIdracEqual(sc.Status.Observed.IdracSettings, desired) {
 		return
 	}
 	logger := log.FromContext(ctx).WithName("serverconfig.status")
@@ -476,11 +493,10 @@ func (r *ServerConfigReconciler) recordObserved(ctx context.Context, sc *armadav
 		if err := r.Get(ctx, client.ObjectKeyFromObject(sc), &fresh); err != nil {
 			return err
 		}
-		d := buildObservedIdrac(fresh.Spec.Idrac, r.AllowedFields)
-		if observedIdracEqual(fresh.Status.Observed.Idrac, d) {
+		if observedIdracEqual(fresh.Status.Observed.IdracSettings, desired) {
 			return nil
 		}
-		fresh.Status.Observed.Idrac = d
+		fresh.Status.Observed.IdracSettings = desired
 		return r.Status().Update(ctx, &fresh)
 	})
 	if err != nil {
@@ -488,25 +504,32 @@ func (r *ServerConfigReconciler) recordObserved(ctx context.Context, sc *armadav
 	}
 }
 
-// buildObservedIdrac assembles the desired observed-idrac status from the CR's
-// current intent, gated by the field allowlist. Fields with no intent (nil)
-// or not on the allowlist stay absent — the ledger only reflects values the
-// controller has been asked to manage.
-func buildObservedIdrac(spec armadav1.IdracSpec, allowed map[string]bool) armadav1.ObservedIdracStatus {
-	var out armadav1.ObservedIdracStatus
-	if spec.SSHEnabled != nil && allowed["sshEnabled"] {
-		out.SSHEnabled = spec.SSHEnabled
+// buildObservedIdrac projects the live Redfish attribute map into the
+// observed-idrac status shape, gated by the field allowlist. Fields absent
+// from attrs (missing from firmware response) or not on the allowlist stay
+// nil in the output — the ledger only reflects values the controller manages
+// AND observed live on the target. Mirror of package-level recordObserved
+// (metrics.go) — both share the same live-attr-derivation shape.
+func buildObservedIdrac(attrs map[string]any, allowed map[string]bool) armadav1.ObservedIdracSettingsStatus {
+	var out armadav1.ObservedIdracSettingsStatus
+	set := func(field, attrKey string, dst **bool) {
+		if !allowed[field] {
+			return
+		}
+		raw, ok := attrs[attrKey].(string)
+		if !ok {
+			return
+		}
+		b := enableStrToBool(raw)
+		*dst = &b
 	}
-	if spec.IPMIEnabled != nil && allowed["ipmiEnabled"] {
-		out.IPMIEnabled = spec.IPMIEnabled
-	}
-	if spec.RacadmEnabled != nil && allowed["racadmEnabled"] {
-		out.RacadmEnabled = spec.RacadmEnabled
-	}
+	set("sshEnabled", attrSSHEnable, &out.SSHEnabled)
+	set("ipmiEnabled", attrIPMIEnable, &out.IPMIEnabled)
+	set("racadmEnabled", attrRacadmEnable, &out.RacadmEnabled)
 	return out
 }
 
-func observedIdracEqual(a, b armadav1.ObservedIdracStatus) bool {
+func observedIdracEqual(a, b armadav1.ObservedIdracSettingsStatus) bool {
 	return boolPtrEqual(a.SSHEnabled, b.SSHEnabled) &&
 		boolPtrEqual(a.IPMIEnabled, b.IPMIEnabled) &&
 		boolPtrEqual(a.RacadmEnabled, b.RacadmEnabled)

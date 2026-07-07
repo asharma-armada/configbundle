@@ -20,19 +20,25 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// IdracSpec holds desired iDRAC configuration, sourced from Orbital IdracSettings.
-// All fields are desired state — not observed state. The ServerConfig controller
-// actuates these via Redfish PATCH calls to the OOB IP.
+// Naming convention across api/v1/: Go types and JSON edges mirror the orbital
+// GraphQL schema (~/armada/orbital/schema/schema.graphql). Type names carry a
+// "Spec" suffix per K8s convention; strip it to get orbital's type identity
+// (IdracSettingsSpec ↔ IdracSettings). JSON edge names match orbital exactly
+// (idracSettings, kubernetesClusters, backup, velero, etcd, s3Sync).
+
+// IdracSettingsSpec holds desired iDRAC configuration, mirroring orbital
+// IdracSettings. All fields are desired state — not observed state. The
+// ServerConfig controller actuates these via Redfish PATCH calls to the OOB IP.
 //
 // All admin-overridable leaf fields are pointers with omitempty so SSA partial
 // patches can omit admin-owned fields. See ADR-007. OrbID is identity metadata,
-// not a configurable field — it's a required string set by the bundler from
+// not a configurable field — a required string set by the bundler from
 // orbital's GraphQL and never overridden by local:admin.
-type IdracSpec struct {
+type IdracSettingsSpec struct {
 	// OrbID is the immutable Orbital identifier for this IdracSettings node
 	// (e.g. "colo:srv-001-idrac"). Set by the bundler; identity-only, never
 	// admin-overridable. Required so a malformed bundle (bundler bug — forgot
-	// to set orbId on an idrac block) fails at apply time, not later.
+	// to set orbId on an idracSettings block) fails at apply time, not later.
 	// +kubebuilder:validation:Required
 	OrbID string `json:"orbId"`
 
@@ -63,21 +69,14 @@ type IdracSpec struct {
 	RacadmEnabled *bool `json:"racadmEnabled,omitempty"`
 }
 
-// IdracTypeName is the orbital GraphQL type name for IdracSpec nodes. Used in
-// OverrideEntry.Type when the divergence reporter emits an entry for a local
-// override on an idrac field. One constant per nested struct that has its own
-// orbital identity; when adding a new nested type, add a sibling constant.
-const IdracTypeName = "IdracSettings"
-
-// ClusterSpec describes one Kubernetes cluster's desired backup configuration
-// within a ConfigBundle. The bundler populates this from the orbital
-// KubernetesCluster → ClusterBackup → {EtcdBackup, VeleroBackup} subgraph.
-// The decomposer projects each entry into a BackupConfig child CR.
-// BackupBlock and its type-name constants live in backupconfig_types.go so the
-// child-shape declaration stays adjacent to its consumer.
-type ClusterSpec struct {
+// KubernetesClusterSpec describes one Kubernetes cluster within a ConfigBundle,
+// mirroring orbital KubernetesCluster (interface). The bundler populates this
+// from the orbital KubernetesCluster subgraph; the decomposer projects the
+// Backup field into a BackupConfig child CR (one per ClusterBackup node).
+type KubernetesClusterSpec struct {
 	// OrbID is the immutable Orbital identifier for this cluster (e.g.
-	// "colo:cluster-001"). Used as the SSA listMapKey for spec.clusters[].
+	// "colo:cluster-001"). Used as the SSA listMapKey for
+	// spec.kubernetesClusters[].
 	// +kubebuilder:validation:Required
 	OrbID string `json:"orbId"`
 
@@ -86,16 +85,14 @@ type ClusterSpec struct {
 	// +optional
 	Name *string `json:"name,omitempty"`
 
-	// Velero holds desired Velero backup configuration.
+	// Backup holds this cluster's backup configuration, mirroring the orbital
+	// KubernetesCluster.backup edge. Absent = no backup config for this cluster.
 	// +optional
-	Velero *BackupBlock `json:"velero,omitempty"`
-
-	// Etcd holds desired etcd backup configuration.
-	// +optional
-	Etcd *BackupBlock `json:"etcd,omitempty"`
+	Backup *ClusterBackupSpec `json:"backup,omitempty"`
 }
 
-// ServerSpec describes one server's desired configuration within a ConfigBundle.
+// ServerSpec describes one server's desired configuration within a ConfigBundle,
+// mirroring orbital Server.
 //
 // Hostname and OobIP are pointers so SSA partial patches can omit admin-owned
 // fields (see ADR-007). OrbID is the listMapKey — Orbital's immutable identifier
@@ -122,10 +119,11 @@ type ServerSpec struct {
 	// +kubebuilder:validation:Required
 	OobIP *string `json:"oobIP,omitempty"`
 
-	// Idrac holds desired iDRAC configuration. Idrac itself is a value type;
-	// its leaf fields are pointers (see IdracSpec).
+	// IdracSettings holds desired iDRAC configuration, mirroring the orbital
+	// Server.idracSettings edge. Value type; its leaf fields are pointers
+	// (see IdracSettingsSpec).
 	// +optional
-	Idrac IdracSpec `json:"idrac,omitempty"`
+	IdracSettings IdracSettingsSpec `json:"idracSettings,omitempty"`
 }
 
 // TakeoverEntry represents a cloud admin's "force" resolution: reclaim ownership
@@ -138,12 +136,13 @@ type TakeoverEntry struct {
 	ServerOrbID string `json:"serverOrbId"`
 
 	// OrbID is the Orbital ConfigItem identifier of the node that owns the field
-	// (e.g. "colo:srv-001-idrac" for an iDRAC field). Informational — used for
-	// audit and divergence-resolution correlation.
+	// (e.g. "colo:srv-001-idrac" for an idracSettings field). Informational —
+	// used for audit and divergence-resolution correlation.
 	OrbID string `json:"orbId"`
 
 	// Field is the leaf field name to reclaim (e.g. "sshEnabled").
-	// Must match the JSON tag name on IdracSpec (or ServerSpec for top-level fields).
+	// Must match the JSON tag name on IdracSettingsSpec (or ServerSpec for
+	// top-level fields).
 	// +kubebuilder:validation:Required
 	Field string `json:"field"`
 }
@@ -162,12 +161,13 @@ type IgnoredEntry struct {
 	ServerOrbID string `json:"serverOrbId"`
 
 	// OrbID is the Orbital ConfigItem identifier of the node that owns the field
-	// (e.g. "colo:srv-001-idrac" for an iDRAC field). Informational — used for
-	// audit and divergence-resolution correlation.
+	// (e.g. "colo:srv-001-idrac" for an idracSettings field). Informational —
+	// used for audit and divergence-resolution correlation.
 	OrbID string `json:"orbId"`
 
 	// Field is the leaf field name to leave to the local manager (e.g. "racadmEnabled").
-	// Must match the JSON tag name on IdracSpec (or ServerSpec for top-level fields).
+	// Must match the JSON tag name on IdracSettingsSpec (or ServerSpec for
+	// top-level fields).
 	// +kubebuilder:validation:Required
 	Field string `json:"field"`
 }
@@ -190,12 +190,14 @@ type ConfigBundleSpec struct {
 	// +listMapKey=orbId
 	Servers []ServerSpec `json:"servers,omitempty"`
 
-	// Clusters is the list of Kubernetes cluster backup configurations for this
-	// datacenter. The decomposer projects each entry into a BackupConfig child CR.
+	// KubernetesClusters is the list of Kubernetes cluster configurations for
+	// this datacenter, mirroring the orbital DataCenter.kubernetesClusters
+	// collection. The decomposer projects each entry's Backup into a
+	// BackupConfig child CR.
 	// +optional
 	// +listType=map
 	// +listMapKey=orbId
-	Clusters []ClusterSpec `json:"clusters,omitempty"`
+	KubernetesClusters []KubernetesClusterSpec `json:"kubernetesClusters,omitempty"`
 
 	// Takeover contains force-resolution directives from the cloud admin.
 	// Each entry triggers a ForceOwnership SSA apply to reclaim the field from local:admin.
