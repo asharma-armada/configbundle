@@ -55,6 +55,12 @@ type Config struct {
 	// client-id, client-secret, tenant-id.
 	CredentialSecret string `envconfig:"ETCD_BACKUP_CRED_SECRET" default:"az-storage-creds"`
 
+	// RetainPerDay is how many etcd snapshots to keep per UTC day.
+	RetainPerDay int `envconfig:"ETCD_BACKUP_RETAIN_PER_DAY" default:"5"`
+
+	// TimeZone is the IANA tz for the etcd CronJob schedule. Empty = UTC.
+	TimeZone string `envconfig:"ETCD_BACKUP_TIMEZONE" default:""`
+
 	// ObserveInterval is how often the controller re-polls Velero Schedule and
 	// the etcd CronJob for each CR independent of CR spec changes. Drives
 	// drift-detection metrics. Zero (the default, which keeps `go run` safe
@@ -151,6 +157,8 @@ func main() {
 		EtcdctlImage:        cfg.EtcdctlImage,
 		UploadImage:         cfg.UploadImage,
 		CredentialSecret:    cfg.CredentialSecret,
+		EtcdRetainPerDay:    cfg.RetainPerDay,
+		EtcdBackupTimeZone:  cfg.TimeZone,
 		ObserveInterval:     cfg.ObserveInterval,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "backupconfig")

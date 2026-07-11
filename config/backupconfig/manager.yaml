@@ -70,6 +70,10 @@ spec:
               key: etcdBackupImage
         # Drift-detection polling: re-reads live state every interval. Empty/unset =
         # disabled (event-driven only). K8s deploy enables it explicitly.
+        - name: ETCD_BACKUP_RETAIN_PER_DAY
+          value: "5"
+        - name: ETCD_BACKUP_TIMEZONE
+          value: "America/Los_Angeles"
         - name: BACKUP_OBSERVE_INTERVAL
           value: "5m"
         ports:
@@ -106,3 +110,5 @@ spec:
             memory: 64Mi
       serviceAccountName: backupconfig-controller
       terminationGracePeriodSeconds: 10
+      imagePullSecrets:
+      - name: acr-pull
