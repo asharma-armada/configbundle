@@ -24,13 +24,13 @@ func TestBackupReconcileSuccessGauge(t *testing.T) {
 	defer removeReconcileSuccess("bc-ok")
 	defer removeReconcileSuccess("bc-fail")
 
-	recordReconcileSuccess("bc-ok", 1234567890)
-	recordReconcileError("bc-fail", "EtcdPatchFailed")
+	recordReconcileSuccess("bc-ok", "orb-bc-ok", 1234567890)
+	recordReconcileError("bc-fail", "orb-bc-fail", "EtcdPatchFailed")
 
-	if v := testutil.ToFloat64(backupConfigReconcileSuccess.WithLabelValues("bc-ok")); v != 1 {
+	if v := testutil.ToFloat64(backupConfigReconcileSuccess.WithLabelValues("bc-ok", "orb-bc-ok")); v != 1 {
 		t.Errorf("bc-ok = %v, want 1 (converged)", v)
 	}
-	if v := testutil.ToFloat64(backupConfigReconcileSuccess.WithLabelValues("bc-fail")); v != 0 {
+	if v := testutil.ToFloat64(backupConfigReconcileSuccess.WithLabelValues("bc-fail", "orb-bc-fail")); v != 0 {
 		t.Errorf("bc-fail = %v, want 0 (failed)", v)
 	}
 
@@ -50,62 +50,6 @@ func TestBackupReconcileSuccessGauge(t *testing.T) {
 				}
 			}
 		}
-	}
-}
-
-// gather renders a collector's series into "name{k=v,...}" strings for
-// substring assertions, via a private registry (isolated from the global one).
-func gather(t *testing.T, c prometheus.Collector) string {
-	t.Helper()
-	reg := prometheus.NewRegistry()
-	if err := reg.Register(c); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	mfs, err := reg.Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
-	}
-	var sb strings.Builder
-	for _, mf := range mfs {
-		for _, m := range mf.GetMetric() {
-			sb.WriteString(mf.GetName() + "{")
-			for _, l := range m.GetLabel() {
-				sb.WriteString(l.GetName() + "=" + l.GetValue() + ",")
-			}
-			sb.WriteString("}\n")
-		}
-	}
-	return sb.String()
-}
-
-// TestBackupObservedCollector pins the observed-config info metrics
-// (status_etcd_info / status_velero_info) — the surface parallel to serverconfig's
-// status_idracsettings_info: value 1, producer config in labels, one series per
-// managed mechanism, dropped on remove.
-func TestBackupObservedCollector(t *testing.T) {
-	store := newBackupObservedStore()
-	c := newBackupObservedCollector(store)
-
-	store.set("cluster-x", observedConfig{
-		etcd:   &blockLabels{schedule: "0 3 * * *", location: "az://etcd", enabled: "true"},
-		velero: &blockLabels{schedule: "0 2 * * *", location: "s3://v", enabled: "false"},
-	})
-
-	got := gather(t, c)
-	for _, want := range []string{
-		"configbundle_backupconfig_status_etcd_info{",
-		"configbundle_backupconfig_status_velero_info{",
-		"cluster=cluster-x", "schedule=0 3 * * *", "location=az://etcd", "enabled=true",
-		"schedule=0 2 * * *", "enabled=false",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("expected series to contain %q\ngot:\n%s", want, got)
-		}
-	}
-
-	store.remove("cluster-x")
-	if n := testutil.CollectAndCount(c); n != 0 {
-		t.Errorf("expected 0 series after remove, got %d", n)
 	}
 }
 
@@ -179,14 +123,14 @@ func TestEtcdArtifactCollector(t *testing.T) {
 	c := newEtcdArtifactCollector(store)
 
 	// count>0: all three series present.
-	store.set("colo-cluster-001", etcdSnapshotInventory{
+	store.set("colo-cluster-001", "orb-c1", etcdSnapshotInventory{
 		Count: 7, LatestModified: time.Unix(1720000000, 0), LatestBytes: 1048576,
 	})
 	got := gatherEtcdSeries(t, c)
 	for _, want := range []string{
-		"configbundle_backupconfig_status_etcd_snapshot_count{cluster=colo-cluster-001,}",
-		"configbundle_backupconfig_status_etcd_last_snapshot_seconds{cluster=colo-cluster-001,}",
-		"configbundle_backupconfig_status_etcd_latest_bytes{cluster=colo-cluster-001,}",
+		"configbundle_backupconfig_status_etcd_snapshot_count{cluster=colo-cluster-001,orb_id=orb-c1,}",
+		"configbundle_backupconfig_status_etcd_last_snapshot_seconds{cluster=colo-cluster-001,orb_id=orb-c1,}",
+		"configbundle_backupconfig_status_etcd_latest_bytes{cluster=colo-cluster-001,orb_id=orb-c1,}",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected series %q\ngot:\n%s", want, got)
@@ -194,12 +138,12 @@ func TestEtcdArtifactCollector(t *testing.T) {
 	}
 
 	// empty: count series present (=0), but no last_snapshot / bytes series.
-	store.set("empty-cluster", etcdSnapshotInventory{Count: 0})
+	store.set("empty-cluster", "orb-empty", etcdSnapshotInventory{Count: 0})
 	got = gatherEtcdSeries(t, c)
-	if !strings.Contains(got, "snapshot_count{cluster=empty-cluster,}") {
+	if !strings.Contains(got, "snapshot_count{cluster=empty-cluster,orb_id=orb-empty,}") {
 		t.Errorf("empty cluster should still emit snapshot_count; got:\n%s", got)
 	}
-	if strings.Contains(got, "last_snapshot_seconds{cluster=empty-cluster,}") {
+	if strings.Contains(got, "last_snapshot_seconds{cluster=empty-cluster,orb_id=orb-empty,}") {
 		t.Errorf("empty cluster must NOT emit last_snapshot_seconds; got:\n%s", got)
 	}
 

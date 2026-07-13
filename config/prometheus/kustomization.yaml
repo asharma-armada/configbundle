@@ -2,18 +2,20 @@
 # (colo-dev-main, adot-w1). Do NOT include this from config/default/ — bare
 # Galleons that don't have the Prometheus/Cilium CRDs would fail the apply.
 #
-# Deploy: kubectl apply -k config/prometheus/
+# Deploy: kubectl apply -k config/prometheus/   — enables METRICS SCRAPING only.
 #
-# Four sub-overlays, each scoped to its own namespace:
+# Two sub-overlays, each scoped to its own namespace:
 #   * service-monitors/ → configbundle-system (cb/sc/bc ServiceMonitors)
-#   * rules/            → configbundle-system (domain-controller alerting rules)
-#   * dashboards/       → monitoring          (Grafana dashboard ConfigMap)
-#   * cilium-policy/    → monitoring          (Prom→node:8443 CNP for sc)
+#   * cilium-policy/    → monitoring          (Prom→node:8443 CNP for the
+#                                              hostNetwork sc-controller)
+#
+# Alerting rules and the Grafana dashboard are deliberately NOT composed here —
+# they are opt-in, applied explicitly only when wanted:
+#   kubectl apply -k config/prometheus/rules/       # PrometheusRule alerts
+#   kubectl apply -k config/prometheus/dashboards/  # Grafana dashboard ConfigMap
 #
 # Composing at this level (no top-level `namespace:` transformer) so each
 # sub-overlay keeps its own namespace declaration without collision.
 resources:
 - service-monitors
-- rules
-- dashboards
 - cilium-policy

@@ -1,15 +1,19 @@
 package serverconfig
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	"k8s.io/utils/ptr"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
-// gather renders the collector's series into a flat "name{k=v,...}" string per
+// gather renders a collector's series into a flat "name{k=v,...}" string per
 // series so tests can assert on labels via substring. Uses a private registry
 // so tests don't touch the global controller-runtime one.
 func gather(t *testing.T, c prometheus.Collector) string {
@@ -35,84 +39,6 @@ func gather(t *testing.T, c prometheus.Collector) string {
 	return sb.String()
 }
 
-func TestIdracObservedCollector_RendersCurrentState(t *testing.T) {
-	store := newIdracObservedStore()
-	c := newIdracObservedCollector(store)
-
-	store.set(observedIdrac{
-		server:          "r09-u06",
-		oobIP:           "10.20.21.44",
-		orbID:           "colo:CFRHDX3",
-		firmwareVersion: "7.20.10.05",
-		fields: map[string]*bool{
-			"sshEnabled":    ptr.To(false),
-			"ipmiEnabled":   ptr.To(true),
-			"racadmEnabled": ptr.To(true),
-		},
-	})
-
-	got := gather(t, c)
-	for _, want := range []string{
-		"oob_ip=10.20.21.44", "server=r09-u06", "orb_id=colo:CFRHDX3",
-		"firmware_version=7.20.10.05",
-		"ssh_enabled=false", "ipmi_enabled=true", "racadm_enabled=true",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("expected series to contain %q\ngot:\n%s", want, got)
-		}
-	}
-}
-
-// The load-bearing test: when an observed value changes, the info metric must
-// REPLACE the server's row, not accumulate a stale one. This is the whole
-// reason for the Collector-over-snapshot design vs a mutated GaugeVec.
-func TestIdracObservedCollector_ValueChangeReplacesSeries(t *testing.T) {
-	store := newIdracObservedStore()
-	c := newIdracObservedCollector(store)
-
-	base := func(ssh bool) observedIdrac {
-		return observedIdrac{
-			server: "r09-u06", oobIP: "10.20.21.44", orbID: "colo:CFRHDX3",
-			firmwareVersion: "7.20.10.05",
-			fields:          map[string]*bool{"sshEnabled": ptr.To(ssh), "ipmiEnabled": ptr.To(true), "racadmEnabled": ptr.To(true)},
-		}
-	}
-
-	store.set(base(true))
-	if n := testutil.CollectAndCount(c); n != 1 {
-		t.Fatalf("expected 1 series after first set, got %d", n)
-	}
-
-	// SSH flips true→false. Same server; the row must be replaced, count stays 1.
-	store.set(base(false))
-	if n := testutil.CollectAndCount(c); n != 1 {
-		t.Fatalf("value change must REPLACE the series (no stale duplicate); got %d series", n)
-	}
-	got := gather(t, c)
-	if strings.Contains(got, "ssh_enabled=true") {
-		t.Errorf("stale ssh_enabled=true series survived a value change:\n%s", got)
-	}
-	if !strings.Contains(got, "ssh_enabled=false") {
-		t.Errorf("expected current ssh_enabled=false series:\n%s", got)
-	}
-}
-
-func TestIdracObservedCollector_RemoveDropsSeries(t *testing.T) {
-	store := newIdracObservedStore()
-	c := newIdracObservedCollector(store)
-
-	store.set(observedIdrac{server: "r09-u06", oobIP: "10.20.21.44", orbID: "colo:CFRHDX3",
-		fields: map[string]*bool{"sshEnabled": ptr.To(true)}})
-	if n := testutil.CollectAndCount(c); n != 1 {
-		t.Fatalf("expected 1 series, got %d", n)
-	}
-
-	store.remove("r09-u06")
-	if n := testutil.CollectAndCount(c); n != 0 {
-		t.Errorf("expected 0 series after remove, got %d", n)
-	}
-}
-
 // TestReconcileSuccessGauge pins the reconcile_success contract: success → 1,
 // failure → 0, and skip/delete → ABSENT (never 0 — absence is how a skipped
 // server stays out of `== 0` alerts).
@@ -120,13 +46,13 @@ func TestReconcileSuccessGauge(t *testing.T) {
 	defer removeReconcileSuccess("gauge-ok")
 	defer removeReconcileSuccess("gauge-fail")
 
-	recordReconcileSuccess("gauge-ok", 1234567890)
-	recordReconcileError("gauge-fail", "RedfishReadFailed")
+	recordReconcileSuccess("gauge-ok", "10.0.0.1", "orb-ok", 1234567890)
+	recordReconcileError("gauge-fail", "10.0.0.2", "orb-fail", "RedfishReadFailed")
 
-	if v := testutil.ToFloat64(serverConfigReconcileSuccess.WithLabelValues("gauge-ok")); v != 1 {
+	if v := testutil.ToFloat64(serverConfigReconcileSuccess.WithLabelValues("gauge-ok", "10.0.0.1", "orb-ok")); v != 1 {
 		t.Errorf("gauge-ok = %v, want 1 (converged)", v)
 	}
-	if v := testutil.ToFloat64(serverConfigReconcileSuccess.WithLabelValues("gauge-fail")); v != 0 {
+	if v := testutil.ToFloat64(serverConfigReconcileSuccess.WithLabelValues("gauge-fail", "10.0.0.2", "orb-fail")); v != 0 {
 		t.Errorf("gauge-fail = %v, want 0 (failed)", v)
 	}
 
@@ -137,66 +63,67 @@ func TestReconcileSuccessGauge(t *testing.T) {
 	}
 }
 
-// A field the controller never observed (missing from the Redfish attrs, or not
-// allowlisted) must render "unknown", not a false zero — and firmware, unset
-// until firmware read is implemented, must render "unknown" too.
-func TestIdracObservedCollector_UnknownForUnreadFields(t *testing.T) {
-	store := newIdracObservedStore()
-	c := newIdracObservedCollector(store)
+// TestSSHEnabledGauge pins the promoted-field contract (§6 Family 2): SSH
+// enabled → 1, disabled → 0, and skip/delete/unreadable → ABSENT (never a false
+// 0 — absence means "not observed", which must not read as "SSH is off").
+func TestSSHEnabledGauge(t *testing.T) {
+	defer removeSSHEnabled("ssh-on")
+	defer removeSSHEnabled("ssh-off")
 
-	store.set(observedIdrac{
-		server: "r09-u06", oobIP: "10.20.21.44", orbID: "colo:CFRHDX3",
-		// firmwareVersion "" and only sshEnabled observed
-		fields: map[string]*bool{"sshEnabled": ptr.To(true)},
-	})
+	recordSSHEnabled("ssh-on", "10.0.0.3", "orb-on", true)
+	recordSSHEnabled("ssh-off", "10.0.0.4", "orb-off", false)
 
-	got := gather(t, c)
+	if v := testutil.ToFloat64(serverConfigSSHEnabled.WithLabelValues("ssh-on", "10.0.0.3", "orb-on")); v != 1 {
+		t.Errorf("ssh-on = %v, want 1 (enabled)", v)
+	}
+	if v := testutil.ToFloat64(serverConfigSSHEnabled.WithLabelValues("ssh-off", "10.0.0.4", "orb-off")); v != 0 {
+		t.Errorf("ssh-off = %v, want 0 (disabled)", v)
+	}
+
+	// skip/delete/unreadable ⇒ series absent, not a false 0.
+	removeSSHEnabled("ssh-off")
+	if got := gather(t, serverConfigSSHEnabled); strings.Contains(got, "server=ssh-off") {
+		t.Errorf("expected ssh-off series absent after remove, got:\n%s", got)
+	}
+}
+
+// TestMetricsEndpoint_ServerConfig is the end-to-end surface check for the §6
+// reshape: after the reconciler populates the metric state, the promhttp endpoint
+// over the real controller-runtime registry renders the reconcile backbone + the
+// promoted ssh_enabled gauge, and the removed status_idracsettings_info metric is
+// GONE from the endpoint entirely. Mirrors bc's TestMetricsEndpoint_BackupConfig.
+func TestMetricsEndpoint_ServerConfig(t *testing.T) {
+	defer removeReconcileSuccess("metrics-int")
+	defer removeSSHEnabled("metrics-int")
+
+	// Populate the surface the way a converged reconcile with SSH observed on does.
+	recordReconcileSuccess("metrics-int", "10.9.9.9", "orb-mi", 1234567890)
+	recordSSHEnabled("metrics-int", "10.9.9.9", "orb-mi", true)
+
+	srv := httptest.NewServer(promhttp.HandlerFor(crmetrics.Registry, promhttp.HandlerOpts{}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	page := string(body)
+
 	for _, want := range []string{
-		"firmware_version=unknown",
-		"ipmi_enabled=unknown",
-		"racadm_enabled=unknown",
-		"ssh_enabled=true",
+		`configbundle_serverconfig_reconcile_success{oob_ip="10.9.9.9",orb_id="orb-mi",server="metrics-int"} 1`,
+		`configbundle_serverconfig_reconcile_timestamp_seconds{oob_ip="10.9.9.9",orb_id="orb-mi",server="metrics-int"}`,
+		`configbundle_serverconfig_ssh_enabled{oob_ip="10.9.9.9",orb_id="orb-mi",server="metrics-int"} 1`,
 	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("expected %q\ngot:\n%s", want, got)
+		if !strings.Contains(page, want) {
+			t.Errorf("/metrics endpoint missing %q", want)
 		}
 	}
-}
-
-func TestObservedFieldsFromAttrs(t *testing.T) {
-	attrs := map[string]any{
-		attrSSHEnable:    "Disabled",
-		attrIPMIEnable:   "Enabled",
-		attrRacadmEnable: "Enabled",
-	}
-	got := observedFieldsFromAttrs(attrs, allFields())
-
-	if got["sshEnabled"] == nil || *got["sshEnabled"] {
-		t.Errorf("sshEnabled: want false, got %v", got["sshEnabled"])
-	}
-	if got["ipmiEnabled"] == nil || !*got["ipmiEnabled"] {
-		t.Errorf("ipmiEnabled: want true, got %v", got["ipmiEnabled"])
-	}
-
-	// Field missing from attrs → absent from map → renders "unknown".
-	delete(attrs, attrSSHEnable)
-	got2 := observedFieldsFromAttrs(attrs, allFields())
-	if _, present := got2["sshEnabled"]; present {
-		t.Errorf("field missing from Redfish attrs must be absent (→unknown), got %v", got2["sshEnabled"])
-	}
-}
-
-func TestCamelToSnake(t *testing.T) {
-	cases := map[string]string{
-		"sshEnabled":                  "ssh_enabled",
-		"ipmiEnabled":                 "ipmi_enabled",
-		"racadmEnabled":               "racadm_enabled",
-		"osToIdracPassThroughEnabled": "os_to_idrac_pass_through_enabled",
-		"firmwareVersion":             "firmware_version",
-	}
-	for in, want := range cases {
-		if got := camelToSnake(in); got != want {
-			t.Errorf("camelToSnake(%q) = %q, want %q", in, got, want)
-		}
+	// The removed info metric must not appear anywhere on the endpoint.
+	if strings.Contains(page, "configbundle_serverconfig_status_idracsettings_info") {
+		t.Errorf("removed info metric configbundle_serverconfig_status_idracsettings_info still present on /metrics")
 	}
 }
