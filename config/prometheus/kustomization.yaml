@@ -1,20 +1,19 @@
-# Opt-in overlay: apply on clusters that run kube-prometheus-stack
-# (colo-dev-main, adot-w1). Skip on bare Galleons that have no Prometheus
-# operator installed — the ServiceMonitor CRD wouldn't resolve there.
+# Opt-in observability overlay for clusters that run kube-prometheus-stack
+# (colo-dev-main, adot-w1). Do NOT include this from config/default/ — bare
+# Galleons that don't have the Prometheus/Cilium CRDs would fail the apply.
 #
-# Deploy standalone: kubectl apply -k config/prometheus/
-namespace: configbundle-system
-
+# Deploy: kubectl apply -k config/prometheus/
+#
+# Four sub-overlays, each scoped to its own namespace:
+#   * service-monitors/ → configbundle-system (cb/sc/bc ServiceMonitors)
+#   * rules/            → configbundle-system (domain-controller alerting rules)
+#   * dashboards/       → monitoring          (Grafana dashboard ConfigMap)
+#   * cilium-policy/    → monitoring          (Prom→node:8443 CNP for sc)
+#
+# Composing at this level (no top-level `namespace:` transformer) so each
+# sub-overlay keeps its own namespace declaration without collision.
 resources:
-- monitor.yaml                 # cb-controller
-- monitor_serverconfig.yaml    # sc-controller
-# bc-controller intentionally omitted — add when we're ready to wire it.
-
-# [PROMETHEUS-WITH-CERTS] The following patch configures the ServiceMonitor in ../prometheus
-# to securely reference certificates created and managed by cert-manager.
-# Additionally, ensure that you uncomment the [METRICS WITH CERTMANAGER] patch under config/default/kustomization.yaml
-# to mount the "metrics-server-cert" secret in the Manager Deployment.
-#patches:
-#  - path: monitor_tls_patch.yaml
-#    target:
-#      kind: ServiceMonitor
+- service-monitors
+- rules
+- dashboards
+- cilium-policy
