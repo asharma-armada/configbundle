@@ -66,7 +66,23 @@ type Config struct {
 	// drift-detection metrics. Zero (the default, which keeps `go run` safe
 	// for local dev) = event-driven only, no periodic poll. Production deploys
 	// opt in via the K8s manifest — typical band is 1-5min.
+	// ObserveInterval is the single observe switch — the cadence at which bc
+	// re-observes non-watchable state, chiefly the etcd backup store (blob) for
+	// snapshot presence/freshness. Set it (>0) to turn artifact observation ON;
+	// unset (0, the default, `go run`-safe for local dev) leaves bc purely
+	// watch-driven: it still reconciles the CronJob/Schedule (config drift is
+	// caught instantly by the Owns watches), it just never polls the blob.
+	// Mirrors serverconfig's IDRAC_OBSERVE_INTERVAL — one interval, no separate
+	// on/off flag. Production sets a slow value (30m–1h) via overlay, alongside
+	// the AZURE_* creds mount.
 	ObserveInterval time.Duration `envconfig:"BACKUP_OBSERVE_INTERVAL" default:"0s"`
+
+	// EtcdSnapshotStaleAfter is the staleness threshold for the BackupsFresh
+	// condition — when the NEWEST snapshot is older than this, the condition
+	// flips to False (SnapshotStale). It is a health alarm only and never
+	// deletes anything (NOT retention). Only consulted when observation is on
+	// (ObserveInterval>0).
+	EtcdSnapshotStaleAfter time.Duration `envconfig:"ETCD_SNAPSHOT_STALE_AFTER" default:"26h"`
 }
 
 var (
@@ -143,13 +159,7 @@ func main() {
 		"uploadImage", cfg.UploadImage,
 		"credentialSecret", cfg.CredentialSecret)
 
-	if cfg.ObserveInterval > 0 {
-		setupLog.Info("drift-detection polling enabled", "interval", cfg.ObserveInterval)
-	} else {
-		setupLog.Info("drift-detection polling disabled (event-driven only); set BACKUP_OBSERVE_INTERVAL to enable")
-	}
-
-	if err := (&backupconfig.BackupConfigReconciler{
+	reconciler := &backupconfig.BackupConfigReconciler{
 		Client:              mgr.GetClient(),
 		Scheme:              mgr.GetScheme(),
 		VeleroNamespace:     cfg.VeleroNamespace,
@@ -160,7 +170,27 @@ func main() {
 		EtcdRetainPerDay:    cfg.RetainPerDay,
 		EtcdBackupTimeZone:  cfg.TimeZone,
 		ObserveInterval:     cfg.ObserveInterval,
-	}).SetupWithManager(mgr); err != nil {
+		Recorder:            mgr.GetEventRecorderFor("backupconfig-controller"),
+	}
+
+	// etcd artifact-observation follows the observe interval — setting it (>0)
+	// turns blob observation on. It degrades gracefully: if the storage
+	// credential is missing/invalid we log and run WITHOUT it rather than crash;
+	// bc still manages the CronJob and reconciles config via watches.
+	if cfg.ObserveInterval > 0 {
+		store, err := backupconfig.NewAzureEtcdStore()
+		if err != nil {
+			setupLog.Error(err, "artifact-observation requested (BACKUP_OBSERVE_INTERVAL set) but storage credential unavailable; running WITHOUT it")
+		} else {
+			reconciler.EtcdStore = store
+			reconciler.EtcdSnapshotStaleAfter = cfg.EtcdSnapshotStaleAfter
+			setupLog.Info("etcd artifact-observation enabled", "interval", cfg.ObserveInterval, "staleAfter", cfg.EtcdSnapshotStaleAfter)
+		}
+	} else {
+		setupLog.Info("etcd artifact-observation disabled (watch-only); set BACKUP_OBSERVE_INTERVAL>0 with AZURE_* creds to enable")
+	}
+
+	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "backupconfig")
 		os.Exit(1)
 	}
