@@ -175,8 +175,11 @@ right but snapshots are stale → a **runtime** failure bc surfaces (reason
 
 ## Metrics shape
 
-Same info/gauge + Collector-over-snapshot pattern as serverconfig
-(`configbundle_serverconfig_status_idracsettings_info`), refreshed each reconcile.
+bc promotes only its **numeric etcd truth** — snapshot freshness, count, size — as
+plain per-cluster gauges (Collector-over-snapshot, refreshed each reconcile): the
+reads-only artifact layer bc alone observes. The observed producer *config*
+(schedule/location/enabled) is NOT a metric — it lives on the CR `.status`. Per
+DOMAIN-CONTROLLER.md §6, a field becomes a metric only when a real alert needs it.
 
 ```
 # etcd — bc is the sole source

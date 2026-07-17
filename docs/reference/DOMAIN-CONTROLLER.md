@@ -22,10 +22,11 @@ Two-sentence version, for a slide:
 
 > A domain controller is a two-way bridge for one class of out-of-cluster
 > resource: it reconciles the resource toward the intent in `.spec`, and from a
-> single continuous observation it reports the resource's actual state into both
-> `.status` (the Kubernetes-native view) and the metrics pipeline (the cloud
-> view). Intent flows down, observed truth flows up — the cloud sees edge reality
-> without ever reaching into the cluster.
+> single continuous observation it records the resource's actual state on
+> `.status` — the one observed surface, readable on-cluster and from the cloud —
+> while projecting reconcile health and any alertable fields into the metrics
+> pipeline. Intent flows down, observed truth flows up — the cloud sees edge
+> reality without ever reaching into the cluster.
 
 Everything below is the mechanics of that one idea.
 
@@ -167,91 +168,118 @@ Namespace `configbundle_*`, taxonomy `configbundle_<kind>_<subject>_<measure>`.
 Never `armada_*`. One live read fans out to status AND metrics (§2) — metrics are
 never derived from status.
 
-### Emit only what the cloud can't already know
+### Metrics are the alertable projection — not the observed twin
 
-**Intent (`.spec`) is NOT a metric.** It is declarative input the cloud authored
-and pushed down (for us, the orbital artifact) — echoing it back as an edge metric
-is redundant, since the metric's consumer already has it. There is no
-`configbundle_<kind>_spec_*` and no PromQL "`spec != status`" drift query; the
-controller already computes drift (that's reconciliation). Emit only the two
-things the cloud can't know unless the edge reports them:
+The full observed state already has a home: `.status` (§1–3), read with `kubectl`
+on-cluster and remotely by the cloud. **Metrics are not a second copy of that
+twin.** A controller emits only:
 
-1. **Reconcile outcome** — did reconciliation occur, and did it succeed?
-2. **Observed state** — the current live `.status` values.
+1. **Reconcile outcome** — is the loop healthy, and did *this object* converge?
+2. **The specific observed fields you actually alert or graph on** — promoted one
+   at a time, only when a real alert/dashboard needs them.
 
-(This is exactly Crossplane's first-party choice: reconcile/latency *outcome*
-metrics, no spec mirror.)
+**Intent (`.spec`) is NOT a metric** — it's declarative input the cloud authored
+and pushed down (the orbital artifact); echoing it back is redundant. No
+`configbundle_<kind>_spec_*`, no PromQL `spec != status` (the controller already
+computes drift — that *is* reconciliation).
 
-### Family 1 — reconcile outcome
+This is how the mature external-resource operators do it: **cert-manager**
+promotes exactly two of a Certificate's fields to metrics (the expiry + renewal
+timestamps) and leaves everything else on `.status`; **Crossplane** — whose entire
+job is managing external resources — keeps per-object state off `/metrics`
+altogether, emitting only aggregate pipeline metrics. Do not dump the whole
+observed config into an info metric; that is what `.status` is for.
 
-- **Loop liveness (per-controller, free):** the controller-runtime metrics
-  (`controller_runtime_reconcile_total`, `_reconcile_errors_total`,
-  `_reconcile_time_seconds`) answer "is the loop running / erroring."
-- **Per-object success:** `configbundle_<kind>_reconcile_success{name} 0/1` —
-  `1` = converged, `0` = failed, **absent = deliberately skipped** (so skips
-  never page — no `Unknown` state needed in the metric). This is the load-bearing
-  new signal: it tells the cloud *which* resource is broken.
-- **Failure reason is NOT in the metric.** A boolean has no room for it — reason
-  lives in the CR's `Reconciled` condition + Events (`kubectl describe`). The
-  metric says "this one's wrong"; the CR says why. **Do NOT emit conditions as
-  state-set metrics** — the rich tri-state condition stays on the CR.
+### Family 1 — reconcile outcome (the backbone)
 
-### Family 2 — observed state
+This is the load-bearing surface — invest here first.
 
-Surface the current observed values for fleet inventory/dashboards, in one of two
-shapes depending on what the value *is*:
+**Fleet health is free.** controller-runtime registers, per *controller*, with
+zero code:
+- `controller_runtime_reconcile_total{controller,result}` — `result` ∈
+  `success`/`error`/`requeue`/`requeue_after` (the RED workhorse);
+- `controller_runtime_reconcile_errors_total{controller}`, the
+  `_reconcile_time_seconds` histogram, and the `workqueue_*` family (depth,
+  latency, retries).
 
-- **Observed managed *config*** — the fields you set and read back (booleans and
-  strings: iDRAC settings, a backup schedule/location/enabled) → **one info
-  metric per domain**, `configbundle_<kind>_status_<domain>_info`, value always `1`,
-  the fields carried in labels. This is the inventory/display surface — you
-  filter it and `count by (…)`, you don't threshold it. Bundle bools *and*
-  strings into the one info series (do not split bools into separate gauges —
-  convergence alerting is Family 1's job, not this metric's).
-  Examples: serverconfig's `status_idracsettings_info`; backupconfig's `status_etcd_info`
-  and `status_velero_info`.
-- **Observed *numeric truth*** you alert or graph on (counts, timestamps, sizes —
-  an etcd snapshot's age, count, bytes) → **per-field gauges**,
-  `configbundle_<kind>_status_<domain>_<measure>`, the number in the value. A
-  number MUST be a gauge value, never an info label — you cannot do
-  `time() - <label>` or `<label> == 0` in PromQL. Examples: backupconfig's
-  `status_etcd_last_snapshot_seconds` / `_snapshot_count` / `_latest_bytes`.
+Use these for rate/errors/duration and saturation — **do not reinvent them.**
 
-Emit info metrics via a Collector-over-snapshot so a changed field replaces the
-series rather than leaving a stale label combination. Observed state overlaps
-intent when converged; it earns its keep for dashboards and for the **diverged**
-case, where it shows what reality actually is.
+**What isn't free is per-object identity** — controller-runtime deliberately puts
+no `{name}` on anything (unbounded-cardinality guard). That gap is exactly what a
+domain controller fills, with three per-object series keyed by identity only:
 
-> The common core holds across controllers: **every domain controller exposes its
-> observed config as `configbundle_<kind>_status_<domain>_info` and its numeric truth
-> as `_<measure>` gauges.** A controller only *skips* a surface it genuinely has
-> no data for (e.g. serverconfig has no numeric truth) — never because a field is
-> "low value"; uniformity of the surface is the template's whole point.
+- `configbundle_<kind>_reconcile_success{name}` — `1` converged, `0` failed,
+  **absent = deliberately skipped** (not allow-listed / prerequisite missing) or
+  never reconciled. Alert `== 0`; skips are absent so they never page. This is the
+  "*which* object is broken" signal.
+- `configbundle_<kind>_reconcile_timestamp_seconds{name}` — Unix time of the last
+  *success*; `time() - <this>` = how long it's been broken or stuck.
+- `configbundle_<kind>_reconciliation_errors_total{name,reason}` — `reason` a
+  bounded enum; `increase()` surfaces the dominant failure mode.
 
-### Cardinality: per-object is safe at edge scale — keep it bounded
+**Boolean + absent, not a condition state-set.** The ecosystem convention
+(kube-state-metrics, Flux, cert-manager) is a state-set gauge —
+`{condition="Ready",status="True|False|Unknown"}`, one series per status value,
+`1` on the active one. We deliberately don't: `absent = skip` already delivers
+"skips never page" at a third of the series, and the distinction the state-set's
+`Unknown` buys (failed vs unreachable) doesn't change alerting — both page — while
+the detail lives on the CR anyway (next point). **Do NOT emit conditions as
+state-set metrics.**
+
+**Failure reason is NOT in the metric.** A boolean has no room; the reason lives
+in the CR's `Reconciled` condition + Events (`kubectl describe`). The metric says
+"this one's wrong"; the CR says why.
+
+### Family 2 — observed fields, promoted one at a time
+
+A field graduates from `.status` to a metric **only when there is a real alert or
+dashboard behind it** — never "surface everything just in case." The author picks
+*which* fields; the template fixes the *shape*:
+
+- **Boolean field** → `configbundle_<kind>_<field>{name}`, a plain `0/1` gauge —
+  the value *is* the boolean, identity in labels. Alert `== 1` / `== 0`. Example:
+  `configbundle_serverconfig_ssh_enabled{server}` (SSH is a security-relevant
+  toggle worth alerting on; the *rest* of idracSettings stays on `.status`,
+  un-metricked).
+- **Numeric field** (count, size, timestamp) →
+  `configbundle_<kind>_<subject>_<measure>{name}`, the number in the *value*.
+  Timestamps as absolute Unix seconds — alert `time() - <metric> > threshold`, so
+  the threshold is tunable in the rule, not baked into the exporter
+  (cert-manager's expiry pattern). Examples: backupconfig's
+  `status_etcd_last_snapshot_seconds`, `_snapshot_count`, `_latest_bytes`.
+
+**Never put a value in a label** — you can't `time() - <label>` or `<label> == 0`.
+**Never an info metric** enumerating all observed fields as labels — that was the
+old shape; it duplicated the `.status` twin and metricked fields nobody alerts on.
+
+### Cardinality
 
 Per-object metrics (a `name` label) are what tell the cloud *which* resource is
-affected — worth the cost, and safe because:
-- **Labels are identity only** (`name`, `namespace`, `cluster`). NEVER a value,
-  timestamp, or unbounded id in a label — that is the one true cardinality lever.
-- **Don't multiply dimensions.** One series per object per metric is *linear* in
-  object count. (Dropping `_spec_` and not fanning out per-field already keeps it
-  linear, not multiplicative.)
-- Objects are **bounded by physical inventory** (servers per cluster; ~1
-  BackupConfig per cluster) — tens to low thousands even federated, orders of
-  magnitude below a single Prometheus's comfort zone. Crossplane defers per-object
-  to KSM only because it manages *tens of thousands of unbounded* objects; that
-  scale doesn't bind us.
-- **Escape hatch:** if an object type ever gets huge, that is exactly when to
-  offload to KSM-CRS (moving cardinality out of the controller's scrape/memory) or
-  drop to aggregate-only. We are nowhere near it.
+affected — worth the cost, and safe here because:
+- **Labels are identity only** (`name`/`cluster`) — never a value, timestamp, or
+  unbounded id. That is the one true cardinality lever.
+- **Identity labels can go beyond the CR name — but only stable identity keys.**
+  Two legitimate additions: an **operational address** the responder acts on
+  (serverconfig's `oob_ip`, the iDRAC address — lets an alert name the box), and the
+  **uniform `orb_id`** (`spec.orbId`, the immutable orbital node id — the join key
+  to the CMDB and divergence reports, and the one label that lets queries span
+  controllers). Both are 1:1 with the object → zero added series. `orb_id` SHOULD be
+  on every domain controller's metrics; `oob_ip`-style addresses are per-controller.
+  The guard: these are stable **identity** keys, not descriptive/observed attributes
+  — firmware, status, schedules stay on `.status` (and an `_info` join if ever
+  needed), never as labels. Delete on the stable CR-name key so a rare address
+  change can't strand a series.
+- **One series per object per metric** — linear in a physically-bounded inventory
+  (servers per cluster; ~1 BackupConfig per cluster): tens to low thousands even
+  federated, orders below a single Prometheus's comfort zone.
+- Dropping the info metric and promoting fields one at a time keeps it *linear*,
+  not multiplicative. (Crossplane defers per-object to KSM only because it manages
+  tens of thousands of *unbounded* objects — that scale doesn't bind us. If an
+  object type ever does explode, offload to KSM-CRS or drop to aggregate-only.)
 
 ### Self-emit vs kube-state-metrics: a genuine tradeoff
 
-Once reconcile-success is a plain `0/1` (absent = skip) and observed values are
-gauges/info, there is no tri-state left for KSM Custom-Resource-State (CRS) to
-flatten — so both are viable, and a shared template should present both rather
-than mandate one:
+Both are viable; a shared template presents both rather than mandate one:
 - **Self-emit** (configbundle's default): the metric surface lives in-repo with
   the CRD, fed by the same live read (§2); full control of taxonomy.
 - **KSM-CRS:** zero code — declarative YAML in the monitoring stack reads the CRD
@@ -289,30 +317,32 @@ on which they legitimately differ — name them, don't hide them:
   second, reads-only layer is why it carries an outcome signal beyond config
   fidelity. See [`BACKUP.md`](BACKUP.md).
 
-> **Conformance note:** sc and bc currently still nest observed fields under
-> `.status.observed.<domain>`; they are being reshaped to the flat
-> `.status.<domain>` form prescribed in §1. Until that lands, read
-> `status.observed.etcd` for `status.etcd`, etc.
-
 ## 9. Worked example — serverconfig metrics
 
 Illustrates §6 on the serverconfig reference implementation. Three servers:
 `node-a` healthy, `node-b` broken (iDRAC unreachable), `node-c` skipped (not on
-the allowlist). (`reconcile_success` lands with the metrics reshape; the rest is
-emitted today.)
+the allowlist).
 
 Exposition (`/metrics`):
 
 ```
-# reconcile outcome
-configbundle_serverconfig_reconcile_success{server="node-a"} 1
-configbundle_serverconfig_reconcile_success{server="node-b"} 0
+# Family 1 — reconcile outcome (per-object; the backbone). Identity labels: server
+# (kubectl), oob_ip (the address on-call reaches), orb_id (spec.orbId — the
+# immutable cross-controller join key to orbital / divergence).
+configbundle_serverconfig_reconcile_success{oob_ip="10.0.0.11",orb_id="orb-aaa",server="node-a"} 1
+configbundle_serverconfig_reconcile_success{oob_ip="10.0.0.12",orb_id="orb-bbb",server="node-b"} 0
 # node-c skipped → no series emitted
-configbundle_serverconfig_reconcile_timestamp_seconds{server="node-a"} 1783900800
-configbundle_serverconfig_reconciliation_errors_total{server="node-b",reason="RedfishReadFailed"} 7
-# observed state — info metric, value always 1
-configbundle_serverconfig_status_idracsettings_info{server="node-a",oob_ip="10.0.0.11",orb_id="orb-aaa",firmware_version="7.10.30.00",ssh_enabled="false",ipmi_enabled="true",racadm_enabled="true"} 1
-configbundle_serverconfig_status_idracsettings_info{server="node-b",oob_ip="10.0.0.12",orb_id="orb-bbb",firmware_version="7.00.00.00",ssh_enabled="true",ipmi_enabled="true",racadm_enabled="true"} 1
+configbundle_serverconfig_reconcile_timestamp_seconds{oob_ip="10.0.0.11",orb_id="orb-aaa",server="node-a"} 1783900800
+configbundle_serverconfig_reconciliation_errors_total{oob_ip="10.0.0.12",orb_id="orb-bbb",reason="RedfishReadFailed",server="node-b"} 7
+
+# Family 2 — one promoted field (SSH), a plain 0/1 gauge; the rest of
+# idracSettings stays on .status, not here
+configbundle_serverconfig_ssh_enabled{oob_ip="10.0.0.11",orb_id="orb-aaa",server="node-a"} 0
+configbundle_serverconfig_ssh_enabled{oob_ip="10.0.0.12",orb_id="orb-bbb",server="node-b"} 1
+# node-c skipped → no series
+
+# Plus, free from controller-runtime (per-controller, NOT per-object):
+#   controller_runtime_reconcile_total{controller="serverconfig",result="error"} …
 ```
 
 Queries (paste into Grafana):
@@ -323,11 +353,10 @@ Queries (paste into Grafana):
 | Alert on *sustained* failure | `configbundle_serverconfig_reconcile_success == 0`, `for: 10m` | one alert per broken server; a transient clears before 10m; skips can't fire |
 | How long has it been broken? | `time() - configbundle_serverconfig_reconcile_timestamp_seconds` | seconds since last success (the timestamp only bumps on success) |
 | How flaky is it? | `increase(configbundle_serverconfig_reconciliation_errors_total[1h])` | failure count — catches flapping even after `success` flips back to `1` |
-| Observed iDRAC inventory | `configbundle_serverconfig_status_idracsettings_info` | one row/server; Grafana Table + *Labels to fields*, hide the Value column |
-| Who has SSH on? | `count(configbundle_serverconfig_status_idracsettings_info{ssh_enabled="true"})` | count (filter/count *by* label — never threshold a label) |
-| Firmware spread | `count by (firmware_version) (configbundle_serverconfig_status_idracsettings_info)` | count per version |
+| Which servers have SSH on? | `configbundle_serverconfig_ssh_enabled == 1` | `node-b` — a value gauge, alertable directly (`== 1`) |
+| Fleet error rate (free) | `sum by (controller) (rate(controller_runtime_reconcile_total{result="error"}[5m]))` | per-controller error rate, no custom metric |
 
-**Where's "drift"?** There is no `spec != status` query. *Converged?* → `reconcile_success`. *Actual value?* → the observed info metric. *Desired?* → the CR `.spec` / orbital, which already has it. Drift is reported (a boolean the controller computed), never re-derived in PromQL.
+**Where's the full iDRAC state?** On the CR — `.status.idracSettings` (`kubectl get serverconfig node-a -o yaml`), read remotely by the cloud. Only `sshEnabled` is a metric, because only it has an alert behind it. **Where's "drift"?** There is no `spec != status` query. *Converged?* → `reconcile_success`. *Desired?* → the CR `.spec` / orbital, which already has it. Drift is reported (a boolean the controller computed), never re-derived in PromQL.
 
 ---
 
@@ -351,17 +380,33 @@ Queries (paste into Grafana):
   what the cloud can't otherwise know: reconcile outcome + observed state. No
   `_spec_` metrics, no PromQL `spec != status` drift (the controller already
   computes drift — that's reconciliation).
-- **Reconcile outcome = per-object `reconcile_success{name} 0/1` (absent = skip)
-  + the free controller-runtime loop metrics.** Failure *reason* stays on the
-  CR's condition + Events, never in the metric; do NOT emit conditions as
-  state-set metrics.
-- **Observed managed config (bools + strings) → ONE `status_<domain>_info` info
-  metric (value 1, config in labels); numeric truth → per-field `_<measure>`
-  gauges.** Never a number in a label (you can't `time() - <label>` or
-  `<label> == 0`). The info-metric surface holds across controllers for
-  uniformity — skip it only when there's genuinely no config to show, never for
-  "low value." Labels are identity only otherwise (name/cluster) — the one
-  cardinality lever; with it, per-object is safe at bounded edge scale.
+- **Reconcile outcome is the backbone — invest there first.** Fleet RED is free
+  from controller-runtime (`controller_runtime_reconcile_total{controller,result}`
+  + duration histogram + `workqueue_*`); don't reinvent it. Fill the per-object
+  gap it deliberately leaves with `reconcile_success{name} 0/1` (**absent =
+  skip**), `reconcile_timestamp_seconds{name}`, and
+  `reconciliation_errors_total{name,reason}`. **Boolean + absent, NOT a condition
+  state-set** (the KSM/Flux/cert-manager shape): absent=skip already gives
+  "skips never page" at a third of the series, and failed-vs-unreachable doesn't
+  change alerting. Failure *reason* stays on the CR condition + Events, never in a
+  metric; do NOT emit conditions as state-set metrics.
+- **Metrics are the alertable projection, not the observed twin.** The full
+  observed state lives on `.status` (read on-cluster and from the cloud); do NOT
+  duplicate it into metrics. A field graduates from `.status` to a metric ONLY
+  when a real alert/dashboard needs it (author's discretion) — cert-manager
+  promotes ~2 Certificate fields; Crossplane keeps per-object state off `/metrics`
+  entirely. Shape: boolean field → plain `0/1` gauge
+  `configbundle_<kind>_<field>{name}` (value is the bool); numeric/timestamp →
+  value gauge, alert `time() - <metric>`. NEVER an info metric enumerating all
+  fields as labels (the old shape — it duplicated `.status` and metricked fields
+  nobody alerts on); never a number in a label. Labels are identity only
+  (name/cluster) — the one cardinality lever.
+- **`orb_id` (`spec.orbId`) is the uniform cross-controller identity label** —
+  immutable, 1:1, present on every domain controller's metrics; the join key to the
+  CMDB and divergence reports, and the one dimension queries can share across
+  controllers. Extra identity labels are per-controller (a CR name for kubectl; an
+  operational address like serverconfig's `oob_ip`). Identity keys only — never
+  descriptive/observed values (those live on `.status`).
 - **Self-emit vs KSM-CRS is a genuine tradeoff** (no tri-state to lose once
   success is a boolean). A shared template presents both; configbundle's default
   is self-emit (in-repo, fed by the one live read).

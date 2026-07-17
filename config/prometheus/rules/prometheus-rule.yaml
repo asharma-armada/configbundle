@@ -17,6 +17,28 @@ metadata:
     release: kube-prometheus-stack
 spec:
   groups:
+    # "Is the controller running?" — fires when Prometheus has no healthy scrape
+    # target (up==0, or the target vanished). `up` is Prometheus's built-in
+    # per-scrape health metric, NOT one of ours. This is the only alert that still
+    # works when a controller is dead (its configbundle_* series die with it).
+    - name: configbundle.availability
+      rules:
+        - alert: ServerConfigControllerDown
+          expr: absent(up{job="configbundle-serverconfig-controller-metrics"} == 1)
+          for: 5m
+          labels:
+            severity: critical
+        - alert: BackupConfigControllerDown
+          expr: absent(up{job="configbundle-backupconfig-controller-metrics"} == 1)
+          for: 5m
+          labels:
+            severity: critical
+        - alert: ConfigBundleControllerDown
+          expr: absent(up{job="configbundle-controller-metrics"} == 1)
+          for: 5m
+          labels:
+            severity: critical
+
     - name: configbundle.serverconfig
       rules:
         - alert: ServerConfigReconcileFailing
@@ -28,11 +50,12 @@ spec:
             severity: warning
             domain: serverconfig
           annotations:
-            summary: "ServerConfig {{ $labels.server }} failing to reconcile"
+            summary: "ServerConfig {{ $labels.server }} ({{ $labels.oob_ip }}) failing to reconcile"
             description: >-
               sc-controller's last reconcile of ServerConfig {{ $labels.server }}
-              did not converge (reconcile_success=0) for 10m. The reason is on the
-              CR: `kubectl describe serverconfig {{ $labels.server }}`
+              (iDRAC {{ $labels.oob_ip }}) did not converge (reconcile_success=0)
+              for 10m. The reason is on the CR:
+              `kubectl describe serverconfig {{ $labels.server }}`
               (Reconciled condition + Warning events).
 
     - name: configbundle.backupconfig

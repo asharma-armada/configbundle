@@ -20,8 +20,11 @@ import (
 //     (snapshot freshness/count/size — the reads-only outcome layer).
 //
 // One live read fans out to these gauges AND to CR status independently; metrics
-// never block on a status write. Labels are identity only ({cluster}); never a
-// value, timestamp, or unbounded id.
+// never block on a status write. Labels are identity only, both 1:1 with the
+// object (zero added cardinality): {cluster} (the CR name, for kubectl) and
+// {orb_id} (spec.orbId, the immutable orbital node identity — the uniform
+// cross-controller join key to the CMDB and divergence reports). Never a value,
+// timestamp, or unbounded id.
 var (
 	// backupConfigReconcileTimestamp is set to time.Now().Unix() after every
 	// successful reconcile. Alerts on "bc-controller has stopped reconciling
@@ -31,7 +34,7 @@ var (
 	backupConfigReconcileTimestamp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "configbundle_backupconfig_reconcile_timestamp_seconds",
 		Help: "Unix timestamp of the last successful reconcile of this BackupConfig CR. Absent series = never reconciled.",
-	}, []string{"cluster"})
+	}, []string{"cluster", "orb_id"})
 
 	// backupConfigReconcileErrors counts reconcile failures by cause. Labels
 	// stay bounded (fixed set of reason strings: VeleroPatchFailed,
@@ -40,7 +43,7 @@ var (
 	backupConfigReconcileErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "configbundle_backupconfig_reconciliation_errors_total",
 		Help: "Cumulative reconcile failures per BackupConfig CR, labelled by failure reason (VeleroPatchFailed | EtcdPatchFailed).",
-	}, []string{"cluster", "reason"})
+	}, []string{"cluster", "orb_id", "reason"})
 
 	// backupConfigReconcileSuccess is the per-object "did the last reconcile
 	// converge?" level: 1 = converged, 0 = failed. ABSENT for a deliberately
@@ -51,7 +54,7 @@ var (
 	backupConfigReconcileSuccess = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "configbundle_backupconfig_reconcile_success",
 		Help: "1 if this BackupConfig's last reconcile converged, 0 if it failed. Absent = deliberately skipped or never reconciled.",
-	}, []string{"cluster"})
+	}, []string{"cluster", "orb_id"})
 
 	// veleroSchedulePresent = 1 when the underlying Velero Schedule CR that
 	// bc-controller manages for this cluster exists on-cluster, 0 when spec
@@ -62,28 +65,23 @@ var (
 	veleroSchedulePresent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "configbundle_backup_velero_schedule_present",
 		Help: "1 when the live Velero Schedule for this BackupConfig exists on-cluster; 0 when spec.velero is set but the live resource is missing.",
-	}, []string{"cluster"})
+	}, []string{"cluster", "orb_id"})
 
 	etcdCronJobPresent = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "configbundle_backup_etcd_cronjob_present",
 		Help: "1 when the live etcd CronJob for this BackupConfig exists on-cluster; 0 when spec.etcd is set but the live resource is missing.",
-	}, []string{"cluster"})
+	}, []string{"cluster", "orb_id"})
 )
 
 // etcdArtifacts is the snapshot store the etcd artifact Collector renders each
 // scrape. Fed by the reconciler from its live read of the backup store.
 var etcdArtifacts = newEtcdArtifactStore()
 
-// backupObservedCfg backs the observed-config info metrics (status_etcd_info /
-// status_velero_info) — the producer config read live each reconcile.
-var backupObservedCfg = newBackupObservedStore()
-
 func init() {
 	metrics.Registry.MustRegister(
 		backupConfigReconcileTimestamp, backupConfigReconcileErrors, backupConfigReconcileSuccess,
 		veleroSchedulePresent, etcdCronJobPresent,
 		newEtcdArtifactCollector(etcdArtifacts),
-		newBackupObservedCollector(backupObservedCfg),
 	)
 }
 
@@ -93,7 +91,7 @@ func init() {
 // not managed, absence is not "missing"). Called from the same live-read
 // snapshot as the other observed metrics so all surfaces stay coherent.
 func recordPresence(cluster string, bc *armadav1.BackupConfig, live armadav1.ObservedBackup) {
-	labels := prometheus.Labels{"cluster": cluster}
+	labels := prometheus.Labels{"cluster": cluster, "orb_id": bc.Spec.OrbID}
 	if bc.Spec.Velero != nil {
 		if live.Velero != nil {
 			veleroSchedulePresent.With(labels).Set(1)
@@ -116,23 +114,25 @@ func recordPresence(cluster string, bc *armadav1.BackupConfig, live armadav1.Obs
 
 // recordReconcileSuccess marks a successful reconcile: bumps the last-success
 // timestamp and sets the reconcile_success level to 1.
-func recordReconcileSuccess(cluster string, now int64) {
-	backupConfigReconcileTimestamp.With(prometheus.Labels{"cluster": cluster}).Set(float64(now))
-	backupConfigReconcileSuccess.With(prometheus.Labels{"cluster": cluster}).Set(1)
+func recordReconcileSuccess(cluster, orbID string, now int64) {
+	labels := prometheus.Labels{"cluster": cluster, "orb_id": orbID}
+	backupConfigReconcileTimestamp.With(labels).Set(float64(now))
+	backupConfigReconcileSuccess.With(labels).Set(1)
 }
 
 // recordReconcileError increments the failure counter for the given reason and
 // drops the reconcile_success level to 0. Reason strings should stay bounded —
 // pick from a fixed enum, do not interpolate error messages.
-func recordReconcileError(cluster, reason string) {
-	backupConfigReconcileErrors.With(prometheus.Labels{"cluster": cluster, "reason": reason}).Inc()
-	backupConfigReconcileSuccess.With(prometheus.Labels{"cluster": cluster}).Set(0)
+func recordReconcileError(cluster, orbID, reason string) {
+	backupConfigReconcileErrors.With(prometheus.Labels{"cluster": cluster, "orb_id": orbID, "reason": reason}).Inc()
+	backupConfigReconcileSuccess.With(prometheus.Labels{"cluster": cluster, "orb_id": orbID}).Set(0)
 }
 
 // removeReconcileSuccess deletes a cluster's reconcile_success series so it
-// becomes absent — on skip (absent = skip, never 0) or CR delete.
+// becomes absent — on skip (absent = skip, never 0) or CR delete. Partial match
+// on the stable {cluster} key, so removal needs no orbID.
 func removeReconcileSuccess(cluster string) {
-	backupConfigReconcileSuccess.DeleteLabelValues(cluster)
+	backupConfigReconcileSuccess.DeletePartialMatch(prometheus.Labels{"cluster": cluster})
 }
 
 // -----------------------------------------------------------------------------
@@ -156,19 +156,26 @@ func removeReconcileSuccess(cluster string) {
 // the last entry in place (stale), so metrics show last-known while the
 // reconcile-timestamp gap signals the staleness — same discipline as
 // serverconfig.
+// etcdArtifactEntry pairs a cluster's observed snapshot inventory with its orbId
+// (spec.orbId) so the artifact metrics can carry the orb_id identity label.
+type etcdArtifactEntry struct {
+	orbID string
+	inv   etcdSnapshotInventory
+}
+
 type etcdArtifactStore struct {
 	mu        sync.RWMutex
-	byCluster map[string]etcdSnapshotInventory
+	byCluster map[string]etcdArtifactEntry
 }
 
 func newEtcdArtifactStore() *etcdArtifactStore {
-	return &etcdArtifactStore{byCluster: map[string]etcdSnapshotInventory{}}
+	return &etcdArtifactStore{byCluster: map[string]etcdArtifactEntry{}}
 }
 
-func (s *etcdArtifactStore) set(cluster string, inv etcdSnapshotInventory) {
+func (s *etcdArtifactStore) set(cluster, orbID string, inv etcdSnapshotInventory) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byCluster[cluster] = inv
+	s.byCluster[cluster] = etcdArtifactEntry{orbID: orbID, inv: inv}
 }
 
 func (s *etcdArtifactStore) remove(cluster string) {
@@ -177,10 +184,10 @@ func (s *etcdArtifactStore) remove(cluster string) {
 	delete(s.byCluster, cluster)
 }
 
-func (s *etcdArtifactStore) snapshot() map[string]etcdSnapshotInventory {
+func (s *etcdArtifactStore) snapshot() map[string]etcdArtifactEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make(map[string]etcdSnapshotInventory, len(s.byCluster))
+	out := make(map[string]etcdArtifactEntry, len(s.byCluster))
 	for k, v := range s.byCluster {
 		out[k] = v
 	}
@@ -200,15 +207,15 @@ func newEtcdArtifactCollector(store *etcdArtifactStore) *etcdArtifactCollector {
 		lastSnapDesc: prometheus.NewDesc(
 			"configbundle_backupconfig_status_etcd_last_snapshot_seconds",
 			"Unix time of the newest etcd snapshot in the backup store (bc is the sole source). Absent when no snapshot has been observed.",
-			[]string{"cluster"}, nil),
+			[]string{"cluster", "orb_id"}, nil),
 		countDesc: prometheus.NewDesc(
 			"configbundle_backupconfig_status_etcd_snapshot_count",
 			"Number of etcd snapshot objects observed under the cluster's prefix (0 when the store is empty).",
-			[]string{"cluster"}, nil),
+			[]string{"cluster", "orb_id"}, nil),
 		bytesDesc: prometheus.NewDesc(
 			"configbundle_backupconfig_status_etcd_latest_bytes",
 			"Size in bytes of the newest etcd snapshot object. Absent when no snapshot has been observed.",
-			[]string{"cluster"}, nil),
+			[]string{"cluster", "orb_id"}, nil),
 	}
 }
 
@@ -219,11 +226,12 @@ func (c *etcdArtifactCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *etcdArtifactCollector) Collect(ch chan<- prometheus.Metric) {
-	for cluster, inv := range c.store.snapshot() {
-		ch <- prometheus.MustNewConstMetric(c.countDesc, prometheus.GaugeValue, float64(inv.Count), cluster)
+	for cluster, e := range c.store.snapshot() {
+		inv := e.inv
+		ch <- prometheus.MustNewConstMetric(c.countDesc, prometheus.GaugeValue, float64(inv.Count), cluster, e.orbID)
 		if inv.Count > 0 && !inv.LatestModified.IsZero() {
-			ch <- prometheus.MustNewConstMetric(c.lastSnapDesc, prometheus.GaugeValue, float64(inv.LatestModified.Unix()), cluster)
-			ch <- prometheus.MustNewConstMetric(c.bytesDesc, prometheus.GaugeValue, float64(inv.LatestBytes), cluster)
+			ch <- prometheus.MustNewConstMetric(c.lastSnapDesc, prometheus.GaugeValue, float64(inv.LatestModified.Unix()), cluster, e.orbID)
+			ch <- prometheus.MustNewConstMetric(c.bytesDesc, prometheus.GaugeValue, float64(inv.LatestBytes), cluster, e.orbID)
 		}
 	}
 }
@@ -231,135 +239,7 @@ func (c *etcdArtifactCollector) Collect(ch chan<- prometheus.Metric) {
 // recordEtcdArtifacts publishes a cluster's observed snapshot inventory to the
 // artifact metrics. removeEtcdArtifacts drops it (BackupConfig deleted, or etcd
 // no longer in spec).
-func recordEtcdArtifacts(cluster string, inv etcdSnapshotInventory) { etcdArtifacts.set(cluster, inv) }
-func removeEtcdArtifacts(cluster string)                            { etcdArtifacts.remove(cluster) }
-
-// -----------------------------------------------------------------------------
-// Observed-config info metrics: the producer config bc reads live each reconcile,
-// surfaced as one info series per managed mechanism — the observed-config surface
-// parallel to serverconfig's status_idracsettings_info. Per DOMAIN-CONTROLLER.md §6:
-// observed managed config (bools+strings) → one status_<domain> info metric
-// (value 1, config in labels); numeric truth → the gauges above.
-//
-//	configbundle_backupconfig_status_etcd_info{cluster,schedule,location,enabled}   1
-//	configbundle_backupconfig_status_velero_info{cluster,schedule,location,enabled} 1
-//
-// Collector-over-snapshot (rebuilt each scrape) so a schedule/location change
-// replaces the series rather than leaving a stale label combination.
-// -----------------------------------------------------------------------------
-
-// blockLabels is one producer block's observed config, pre-rendered as label
-// strings (*bool → "true"/"false"/"unknown"; *string → value or "").
-type blockLabels struct {
-	schedule string
-	location string
-	enabled  string
+func recordEtcdArtifacts(cluster, orbID string, inv etcdSnapshotInventory) {
+	etcdArtifacts.set(cluster, orbID, inv)
 }
-
-type observedConfig struct {
-	etcd   *blockLabels
-	velero *blockLabels
-}
-
-type backupObservedStore struct {
-	mu        sync.RWMutex
-	byCluster map[string]observedConfig
-}
-
-func newBackupObservedStore() *backupObservedStore {
-	return &backupObservedStore{byCluster: map[string]observedConfig{}}
-}
-
-func (s *backupObservedStore) set(cluster string, oc observedConfig) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.byCluster[cluster] = oc
-}
-
-func (s *backupObservedStore) remove(cluster string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.byCluster, cluster)
-}
-
-func (s *backupObservedStore) snapshot() map[string]observedConfig {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make(map[string]observedConfig, len(s.byCluster))
-	for k, v := range s.byCluster {
-		out[k] = v
-	}
-	return out
-}
-
-type backupObservedCollector struct {
-	store      *backupObservedStore
-	etcdDesc   *prometheus.Desc
-	veleroDesc *prometheus.Desc
-}
-
-func newBackupObservedCollector(store *backupObservedStore) *backupObservedCollector {
-	labels := []string{"cluster", "schedule", "location", "enabled"}
-	return &backupObservedCollector{
-		store: store,
-		etcdDesc: prometheus.NewDesc(
-			"configbundle_backupconfig_status_etcd_info",
-			"Observed etcd producer config (schedule/location/enabled) read live from the CronJob. Value always 1 (info metric); one series per managed BackupConfig.",
-			labels, nil),
-		veleroDesc: prometheus.NewDesc(
-			"configbundle_backupconfig_status_velero_info",
-			"Observed Velero producer config (schedule/location/enabled) read live from the Schedule. Value always 1 (info metric); one series per managed BackupConfig.",
-			labels, nil),
-	}
-}
-
-func (c *backupObservedCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- c.etcdDesc
-	ch <- c.veleroDesc
-}
-
-func (c *backupObservedCollector) Collect(ch chan<- prometheus.Metric) {
-	for cluster, oc := range c.store.snapshot() {
-		if b := oc.etcd; b != nil {
-			ch <- prometheus.MustNewConstMetric(c.etcdDesc, prometheus.GaugeValue, 1, cluster, b.schedule, b.location, b.enabled)
-		}
-		if b := oc.velero; b != nil {
-			ch <- prometheus.MustNewConstMetric(c.veleroDesc, prometheus.GaugeValue, 1, cluster, b.schedule, b.location, b.enabled)
-		}
-	}
-}
-
-// recordObservedConfigInfo publishes a cluster's observed producer config to the
-// status_etcd_info / status_velero_info info metrics, from the same live snapshot the
-// other observed surfaces use. A nil block (mechanism not managed) omits that
-// block's series.
-func recordObservedConfigInfo(cluster string, live armadav1.ObservedBackup) {
-	var oc observedConfig
-	if e := live.Etcd; e != nil {
-		oc.etcd = &blockLabels{schedule: strLabel(e.Schedule), location: strLabel(e.Location), enabled: boolLabel(e.Enabled)}
-	}
-	if v := live.Velero; v != nil {
-		oc.velero = &blockLabels{schedule: strLabel(v.Schedule), location: strLabel(v.Location), enabled: boolLabel(v.Enabled)}
-	}
-	backupObservedCfg.set(cluster, oc)
-}
-
-// removeObservedConfigInfo drops a cluster's info series (CR deleted or skipped).
-func removeObservedConfigInfo(cluster string) { backupObservedCfg.remove(cluster) }
-
-func strLabel(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
-}
-
-func boolLabel(b *bool) string {
-	if b == nil {
-		return "unknown"
-	}
-	if *b {
-		return "true"
-	}
-	return "false"
-}
+func removeEtcdArtifacts(cluster string) { etcdArtifacts.remove(cluster) }

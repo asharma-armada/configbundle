@@ -49,7 +49,6 @@ func TestMetricsEndpoint_BackupConfig(t *testing.T) {
 	}
 	defer func() {
 		removeReconcileSuccess("metrics-int")
-		removeObservedConfigInfo("metrics-int")
 		removeEtcdArtifacts("metrics-int")
 	}()
 
@@ -72,11 +71,9 @@ func TestMetricsEndpoint_BackupConfig(t *testing.T) {
 	page := string(body)
 
 	for _, want := range []string{
-		`configbundle_backupconfig_reconcile_success{cluster="metrics-int"} 1`,
-		`configbundle_backupconfig_reconcile_timestamp_seconds{cluster="metrics-int"}`,
-		`configbundle_backupconfig_status_etcd_info{`,
-		`schedule="0 3 * * *"`,
-		`configbundle_backup_etcd_cronjob_present{cluster="metrics-int"}`,
+		`configbundle_backupconfig_reconcile_success{cluster="metrics-int",orb_id="validate:etcd"} 1`,
+		`configbundle_backupconfig_reconcile_timestamp_seconds{cluster="metrics-int",orb_id="validate:etcd"}`,
+		`configbundle_backup_etcd_cronjob_present{cluster="metrics-int",orb_id="validate:etcd"}`,
 	} {
 		if !strings.Contains(page, want) {
 			t.Errorf("/metrics endpoint missing %q", want)

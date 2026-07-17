@@ -213,10 +213,10 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	var sc armadav1.ServerConfig
 	if err := r.Get(ctx, req.NamespacedName, &sc); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Info("serverconfig deleted", "name", req.Name, "namespace", req.Namespace)
-			// Drop the deleted server from the observed-state info metric and the
-			// reconcile-success gauge so it stops appearing.
-			removeObservedIdracInfo(req.Name)
+			logger.Info("serverconfig deleted")
+			// Drop the deleted server from the ssh_enabled and reconcile-success
+			// gauges so it stops appearing.
+			removeSSHEnabled(req.Name)
 			removeReconcileSuccess(req.Name)
 			return reconcile.Result{}, nil
 		}
@@ -226,8 +226,8 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	// No oobIP means nothing actionable — surface the skip on status so
 	// `kubectl describe sc <name>` explains the blank live state.
 	if sc.Spec.OobIP == nil || *sc.Spec.OobIP == "" {
-		logger.Info("no oobIP on serverconfig; skipping",
-			"name", sc.Name, "serviceTag", sc.Spec.ServiceTag)
+		logger.V(1).Info("no oobIP on serverconfig; skipping",
+			"serviceTag", sc.Spec.ServiceTag)
 		r.setStatusSkipped(ctx, &sc, "NoOobIP",
 			"spec.oobIP is empty — no target to reconcile against. Populate spec.oobIP to enable reconciliation.")
 		return reconcile.Result{}, nil
@@ -239,8 +239,8 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	// "controller broken" from "this CR is deliberately not managed by this
 	// controller instance" without reading logs.
 	if !r.AllowedOobIPs[oobIP] {
-		logger.Info("change detected but oobIP not on allowlist, ignoring",
-			"name", sc.Name, "oobIP", oobIP,
+		logger.V(1).Info("change detected but oobIP not on allowlist, ignoring",
+			"oobIP", oobIP,
 			"intent.sshEnabled", boolPtr(sc.Spec.IdracSettings.SSHEnabled),
 			"intent.racadmEnabled", boolPtr(sc.Spec.IdracSettings.RacadmEnabled),
 			"intent.ipmiEnabled", boolPtr(sc.Spec.IdracSettings.IPMIEnabled))
@@ -254,8 +254,8 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	// skip (Phase=Skipped, Reconciled=Unknown), consistent with the other skip
 	// gates above — a benign "nothing to enforce," not a fault.
 	if !hasReconcilableIntent(sc.Spec.IdracSettings, r.AllowedFields) {
-		logger.Info("no reconcilable intent on serverconfig; skipping",
-			"name", sc.Name, "oobIP", oobIP,
+		logger.V(1).Info("no reconcilable intent on serverconfig; skipping",
+			"oobIP", oobIP,
 			"unmanaged", unmanagedFields(sc.Spec.IdracSettings),
 			"policyBlocked", policyBlockedFields(sc.Spec.IdracSettings, r.AllowedFields))
 		r.setStatusSkipped(ctx, &sc, "NoManagedFields",
@@ -272,15 +272,14 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 		// Long requeue lets us recover automatically without the noise.
 		if apierrors.IsNotFound(err) {
 			logger.Info("iDRAC credentials Secret not found; deferring reconcile (create the Secret to proceed)",
-				"name", sc.Name,
 				"secret", r.CredentialsNamespace+"/"+r.CredentialsSecretName)
 			r.setStatusFailed(ctx, &sc, "MissingCredentials", err.Error())
-			recordReconcileError(sc.Name, "MissingCredentials")
+			recordReconcileError(sc.Name, oobIP, sc.Spec.OrbID, "MissingCredentials")
 			return reconcile.Result{RequeueAfter: 1 * time.Minute}, nil
 		}
 		logger.Error(err, "load iDRAC credentials")
 		r.setStatusFailed(ctx, &sc, "CredentialsLoadFailed", err.Error())
-		recordReconcileError(sc.Name, "CredentialsLoadFailed")
+		recordReconcileError(sc.Name, oobIP, sc.Spec.OrbID, "CredentialsLoadFailed")
 		return reconcile.Result{}, fmt.Errorf("load credentials: %w", err)
 	}
 
@@ -290,25 +289,23 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	if err != nil {
 		logger.Error(err, "read iDRAC Attributes", "oobIP", oobIP)
 		r.setStatusFailed(ctx, &sc, "RedfishReadFailed", err.Error())
-		recordReconcileError(sc.Name, "RedfishReadFailed")
+		recordReconcileError(sc.Name, oobIP, sc.Spec.OrbID, "RedfishReadFailed")
 		return reconcile.Result{}, fmt.Errorf("read Attributes from %s: %w", oobIP, err)
 	}
 
-	// Feed the observed-state info metric (configbundle_serverconfig_status_idracsettings_info)
-	// from the live Redfish read. Sourced here, not from the CR status write, so a
-	// status-write conflict can never blank the metric.
-	// Observe: report what this poll actually read off the device — raw, before
-	// any drift correction below. Feeds both the metric (info series) and
-	// .status.observed, so the two surfaces always agree on "what we observed"
-	// rather than "what we asserted." If we correct drift further down, the
-	// corrected value surfaces on the NEXT poll — observed stays an honest
-	// snapshot of the device at poll time.
-	observedFirmware := ""
-	if fv := sc.Status.IdracSettings.FirmwareVersion; fv != nil {
-		observedFirmware = *fv
+	// Promote the observed SSH-enabled state to a metric
+	// (configbundle_serverconfig_ssh_enabled) — SSH is a security-relevant toggle
+	// worth alerting on; the rest of idracSettings stays on .status. Read straight
+	// from the live Redfish attributes, sourced here (not from the CR status
+	// write) so a status-write conflict can never blank the metric. Report what
+	// this poll actually read off the device, raw, before any drift correction
+	// below. If SSH can't be read, drop the series (absent = unknown, never a
+	// false 0).
+	if raw, ok := attrs[attrSSHEnable].(string); ok {
+		recordSSHEnabled(sc.Name, oobIP, sc.Spec.OrbID, enableStrToBool(raw))
+	} else {
+		removeSSHEnabled(sc.Name)
 	}
-	recordObservedIdracInfo(sc.Name, oobIP, sc.Spec.OrbID, observedFirmware,
-		observedFieldsFromAttrs(attrs, r.AllowedFields))
 	r.recordObserved(ctx, &sc, attrs)
 
 	deltas := computeIdracDeltas(sc.Spec.IdracSettings, attrs, r.AllowedFields)
@@ -316,8 +313,8 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	blocked := policyBlockedFields(sc.Spec.IdracSettings, r.AllowedFields)
 
 	if len(deltas) == 0 {
-		logger.Info("reconciled (no PATCH needed)",
-			"name", sc.Name, "oobIP", oobIP,
+		logger.V(1).Info("reconciled (no PATCH needed)",
+			"oobIP", oobIP,
 			"unmanaged", unmanaged,
 			"policyBlocked", blocked)
 		// Steady-state: keep the Reconciled=True condition's LastTransitionTime
@@ -330,18 +327,18 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 		} else {
 			r.markReconcileSuccess(ctx, &sc)
 		}
-		recordReconcileSuccess(sc.Name, time.Now().Unix())
+		recordReconcileSuccess(sc.Name, oobIP, sc.Spec.OrbID, time.Now().Unix())
 		return reconcile.Result{RequeueAfter: r.ObserveInterval}, nil
 	}
 
 	if err := rc.PatchAttributes(ctx, deltas); err != nil {
 		logger.Error(err, "PATCH iDRAC attributes", "oobIP", oobIP, "updates", deltas)
 		r.setStatusFailed(ctx, &sc, "RedfishPatchFailed", err.Error())
-		recordReconcileError(sc.Name, "RedfishPatchFailed")
+		recordReconcileError(sc.Name, oobIP, sc.Spec.OrbID, "RedfishPatchFailed")
 		return reconcile.Result{}, fmt.Errorf("PATCH attributes on %s: %w", oobIP, err)
 	}
 	logger.Info("reconciled (PATCH applied)",
-		"name", sc.Name, "oobIP", oobIP,
+		"oobIP", oobIP,
 		"unmanaged", unmanaged,
 		"policyBlocked", blocked,
 		"updates", deltas)
@@ -353,7 +350,7 @@ func (r *ServerConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	patchMsg := fmt.Sprintf("PATCHed %d attribute(s): %s", len(deltas), formatDeltas(deltas))
 	r.Recorder.Eventf(&sc, corev1.EventTypeNormal, "Applied", patchMsg)
 	r.setStatusApplied(ctx, &sc)
-	recordReconcileSuccess(sc.Name, time.Now().Unix())
+	recordReconcileSuccess(sc.Name, oobIP, sc.Spec.OrbID, time.Now().Unix())
 	return reconcile.Result{RequeueAfter: r.ObserveInterval}, nil
 }
 
@@ -450,7 +447,7 @@ func (r *ServerConfigReconciler) writeStatus(ctx context.Context, sc *armadav1.S
 		return r.Status().Update(ctx, &fresh)
 	})
 	if err != nil {
-		logger.Info("status update failed (will retry next reconcile)", "name", sc.Name, "err", err.Error())
+		logger.Info("status update failed (will retry next reconcile)", "err", err.Error())
 	}
 }
 
@@ -488,7 +485,7 @@ func (r *ServerConfigReconciler) recordObserved(ctx context.Context, sc *armadav
 		return r.Status().Update(ctx, &fresh)
 	})
 	if err != nil {
-		logger.Info("observed status update failed (will retry next reconcile)", "name", sc.Name, "err", err.Error())
+		logger.Info("observed status update failed (will retry next reconcile)", "err", err.Error())
 	}
 }
 
@@ -577,7 +574,7 @@ func (r *ServerConfigReconciler) markReconcileSuccess(ctx context.Context, sc *a
 		return r.Status().Update(ctx, &fresh)
 	})
 	if err != nil {
-		logger.Info("reconcile-marker update failed (will retry next reconcile)", "name", sc.Name, "err", err.Error())
+		logger.Info("reconcile-marker update failed (will retry next reconcile)", "err", err.Error())
 	}
 }
 

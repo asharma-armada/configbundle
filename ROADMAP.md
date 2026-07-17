@@ -2,7 +2,7 @@
 
 ## Recent accomplishments
 
-- **2026-07-13** — Domain-controller template + sc/bc reshaped to it: flat `status.<domain>`, `reconcile_success` gauge, observed-config info metrics, dropped intent/spec drift metrics; Prometheus alerts + Grafana + `METRICS.md`; minikube-validated
+- **2026-07-13** — Domain-controller metrics reshaped to alertable-projection model: info metrics dropped (observed state → `.status`), `ssh_enabled` promoted, `oob_ip`+`orb_id` identity labels, reconcile trio backbone; `ControllerDown` alerts + local `make monitoring-up` Prometheus rig; minikube-validated e2e
 - **2026-07-07** — bc-controller sub-resource hygiene: etcd CronJob renamed `-etcd` (parallel to `-velero`), OwnerReferences on both for cascade GC, reconcile refactored to always-SSA-apply (drop pre-diff-gate anti-pattern); ServiceMonitor overlay for cb + sc under `config/prometheus/`
 - **2026-07-06** — Orbital schema alignment across api/v1 (IdracSettingsSpec / KubernetesClusterSpec / ClusterBackupSpec / VeleroBackupSpec / EtcdBackupSpec / S3SyncSpec; JSON edges mirror orbital verbatim); honest live-observed status (reads Velero Schedule + Redfish, not spec-copy); metrics namespace `armada_*` → `configbundle_*` + pipeline-health gauges
 - **2026-07-06** — Monorepo consolidation: sc-controller + bc-controller folded into configbundle; one Go module, one Dockerfile with 4 targets, one `kubectl apply -k config/default/`; BackupConfig CRD; cluster-api / cert-manager pattern

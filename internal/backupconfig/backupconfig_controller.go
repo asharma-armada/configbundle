@@ -182,12 +182,11 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	var bc armadav1.BackupConfig
 	if err := r.Get(ctx, req.NamespacedName, &bc); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Info("backupconfig deleted", "name", req.Name)
+			logger.Info("backupconfig deleted")
 			// Drop this cluster from the etcd artifact metrics so a deleted
 			// BackupConfig stops appearing in the inventory.
 			removeEtcdArtifacts(req.Name)
 			removeReconcileSuccess(req.Name)
-			removeObservedConfigInfo(req.Name)
 			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, err
@@ -200,15 +199,15 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	// TODO: implement S3Sync reconciler (needs its own actuator design).
 	if bc.Spec.S3Sync != nil {
 		logger.V(1).Info("spec.s3Sync present but S3Sync actuation not implemented; ignoring",
-			"name", bc.Name, "s3SyncOrbId", bc.Spec.S3Sync.OrbID)
+			"s3SyncOrbId", bc.Spec.S3Sync.OrbID)
 	}
 
 	// No reconcilable blocks — deliberately skip. Surface it on status
 	// (Phase=Skipped, Reconciled=Unknown) so `kubectl describe` explains the
 	// no-op, consistent with sc-controller's skip handling.
 	if bc.Spec.Velero == nil && bc.Spec.Etcd == nil {
-		logger.Info("no velero or etcd block on backupconfig; skipping",
-			"name", bc.Name, "orbId", bc.Spec.OrbID)
+		logger.V(1).Info("no velero or etcd block on backupconfig; skipping",
+			"orbId", bc.Spec.OrbID)
 		r.setStatusSkipped(ctx, &bc, "NoBackupBlocks",
 			"neither spec.velero nor spec.etcd is set — nothing to reconcile")
 		return reconcile.Result{}, nil
@@ -219,9 +218,9 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	if bc.Spec.Velero != nil {
 		msg, err := r.reconcileVelero(ctx, &bc)
 		if err != nil {
-			logger.Error(err, "reconcile Velero Schedule", "name", bc.Name)
+			logger.Error(err, "reconcile Velero Schedule")
 			r.setStatusFailed(ctx, &bc, "VeleroPatchFailed", err.Error())
-			recordReconcileError(bc.Name, "VeleroPatchFailed")
+			recordReconcileError(bc.Name, bc.Spec.OrbID, "VeleroPatchFailed")
 			return reconcile.Result{}, fmt.Errorf("reconcile velero: %w", err)
 		}
 		if msg != "" {
@@ -232,9 +231,9 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	if bc.Spec.Etcd != nil {
 		msg, err := r.reconcileEtcd(ctx, &bc)
 		if err != nil {
-			logger.Error(err, "reconcile etcd CronJob", "name", bc.Name)
+			logger.Error(err, "reconcile etcd CronJob")
 			r.setStatusFailed(ctx, &bc, "EtcdPatchFailed", err.Error())
-			recordReconcileError(bc.Name, "EtcdPatchFailed")
+			recordReconcileError(bc.Name, bc.Spec.OrbID, "EtcdPatchFailed")
 			return reconcile.Result{}, fmt.Errorf("reconcile etcd: %w", err)
 		}
 		if msg != "" {
@@ -253,16 +252,15 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	// BackupsFresh verdict. See docs/reference/BACKUP.md.
 	freshVerdict, freshObserved := r.observeEtcdArtifacts(ctx, &bc, &live, logger)
 	recordPresence(bc.Name, &bc, live)
-	recordObservedConfigInfo(bc.Name, live)
 	r.updateObservedStatus(ctx, &bc, live)
 	if freshObserved {
 		r.setBackupsFresh(ctx, &bc, freshVerdict)
 	}
 
-	recordReconcileSuccess(bc.Name, time.Now().Unix())
+	recordReconcileSuccess(bc.Name, bc.Spec.OrbID, time.Now().Unix())
 
 	if len(patchMessages) == 0 {
-		logger.Info("reconciled (no PATCH needed)", "name", bc.Name)
+		logger.V(1).Info("reconciled (no PATCH needed)")
 		// Steady-state: keep the Reconciled=True condition's LastTransitionTime
 		// stable (K8s norm — LTT only moves on Status flip). markReconcileSuccess
 		// bumps ObservedGeneration + LastAppliedAt.
@@ -275,7 +273,7 @@ func (r *BackupConfigReconciler) Reconcile(ctx context.Context, req reconcile.Re
 	}
 
 	patchMsg := strings.Join(patchMessages, "; ")
-	logger.Info("reconciled (PATCH applied)", "name", bc.Name, "actions", patchMsg)
+	logger.Info("reconciled (PATCH applied)", "actions", patchMsg)
 	// K8s Event carries per-PATCH detail; Condition stays generic (see
 	// setStatusApplied). `kubectl describe backupconfig <name>` shows both.
 	r.Recorder.Eventf(&bc, corev1.EventTypeNormal, "Applied", patchMsg)
@@ -312,7 +310,7 @@ func (r *BackupConfigReconciler) updateObservedStatus(ctx context.Context, bc *a
 		return r.Status().Update(ctx, &fresh)
 	})
 	if err != nil {
-		logger.Info("observed status update failed (will retry next reconcile)", "name", bc.Name, "err", err.Error())
+		logger.Info("observed status update failed (will retry next reconcile)", "err", err.Error())
 	}
 }
 
@@ -342,13 +340,13 @@ func (r *BackupConfigReconciler) observeEtcdArtifacts(ctx context.Context, bc *a
 	inv, err := r.EtcdStore.List(ctx, *bc.Spec.Etcd.Location)
 	if err != nil {
 		logger.Info("etcd backup store read failed; artifact freshness unknown this cycle",
-			"name", bc.Name, "err", err.Error())
+			"err", err.Error())
 		r.Recorder.Event(bc, corev1.EventTypeWarning, "StoreReadFailed", err.Error())
 		return backupsFreshVerdict{metav1.ConditionUnknown, "StoreReadFailed",
 			"could not read the etcd backup store: " + err.Error()}, true
 	}
 
-	recordEtcdArtifacts(bc.Name, inv)
+	recordEtcdArtifacts(bc.Name, bc.Spec.OrbID, inv)
 
 	// Fold artifact fields into the observed snapshot. Allocate live.Etcd if the
 	// CronJob is absent (live.Etcd==nil) but snapshots still exist — the
@@ -388,7 +386,7 @@ func (r *BackupConfigReconciler) setBackupsFresh(ctx context.Context, bc *armada
 		return r.Status().Update(ctx, &fresh)
 	})
 	if err != nil {
-		logger.Info("BackupsFresh condition update failed (will retry next reconcile)", "name", bc.Name, "err", err.Error())
+		logger.Info("BackupsFresh condition update failed (will retry next reconcile)", "err", err.Error())
 	}
 }
 
@@ -404,7 +402,7 @@ func (r *BackupConfigReconciler) readLiveObserved(ctx context.Context, bc *armad
 		v, err := observeVelero(ctx, r.Client, r.VeleroNamespace, veleroScheduleName(bc))
 		if err != nil {
 			logger.Info("observe velero live state failed; reporting as absent this reconcile",
-				"name", bc.Name, "err", err.Error())
+				"err", err.Error())
 		}
 		out.Velero = v
 	}
@@ -412,7 +410,7 @@ func (r *BackupConfigReconciler) readLiveObserved(ctx context.Context, bc *armad
 		e, err := observeEtcd(ctx, r.Client, r.EtcdBackupNamespace, etcdCronJobName(bc))
 		if err != nil {
 			logger.Info("observe etcd live state failed; reporting as absent this reconcile",
-				"name", bc.Name, "err", err.Error())
+				"err", err.Error())
 		}
 		out.Etcd = e
 	}
@@ -535,10 +533,9 @@ func (r *BackupConfigReconciler) setStatusFailed(ctx context.Context, bc *armada
 // setStatusSkipped. Does NOT bump LastAppliedAt — no apply happened, and does
 // NOT emit a Warning Event — a skip is not an error.
 func (r *BackupConfigReconciler) setStatusSkipped(ctx context.Context, bc *armadav1.BackupConfig, reason, msg string) {
-	// Skipped ⇒ not managed here ⇒ the reconcile_success + observed-config series
-	// must be ABSENT (absent = skip), not 0/stale.
+	// Skipped ⇒ not managed here ⇒ the reconcile_success series must be ABSENT
+	// (absent = skip), not 0/stale.
 	removeReconcileSuccess(bc.Name)
-	removeObservedConfigInfo(bc.Name)
 	r.writeStatus(ctx, bc, armadav1.BackupConfigPhaseSkipped, metav1.ConditionUnknown, reason, msg, false)
 }
 
@@ -568,7 +565,7 @@ func (r *BackupConfigReconciler) writeStatus(ctx context.Context, bc *armadav1.B
 		return r.Status().Update(ctx, &fresh)
 	})
 	if err != nil {
-		logger.Info("status update failed (will retry next reconcile)", "name", bc.Name, "err", err.Error())
+		logger.Info("status update failed (will retry next reconcile)", "err", err.Error())
 	}
 }
 
@@ -627,7 +624,7 @@ func (r *BackupConfigReconciler) markReconcileSuccess(ctx context.Context, bc *a
 		return r.Status().Update(ctx, &fresh)
 	})
 	if err != nil {
-		logger.Info("reconcile-marker update failed", "name", bc.Name, "err", err.Error())
+		logger.Info("reconcile-marker update failed", "err", err.Error())
 	}
 }
 
