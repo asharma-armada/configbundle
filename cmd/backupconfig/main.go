@@ -58,6 +58,13 @@ type Config struct {
 	// RetainPerDay is how many etcd snapshots to keep per UTC day.
 	RetainPerDay int `envconfig:"ETCD_BACKUP_RETAIN_PER_DAY" default:"5"`
 
+	// RetainDays is how many days of snapshot history to keep. The GC CronJob
+	// drops entire days older than this.
+	RetainDays int `envconfig:"ETCD_BACKUP_RETAIN_DAYS" default:"15"`
+
+	// GCSchedule is the cron expression for the etcd GC CronJob.
+	GCSchedule string `envconfig:"ETCD_GC_SCHEDULE" default:"0 2 * * *"`
+
 	// TimeZone is the IANA tz for the etcd CronJob schedule. Empty = UTC.
 	TimeZone string `envconfig:"ETCD_BACKUP_TIMEZONE" default:""`
 
@@ -168,6 +175,8 @@ func main() {
 		UploadImage:         cfg.UploadImage,
 		CredentialSecret:    cfg.CredentialSecret,
 		EtcdRetainPerDay:    cfg.RetainPerDay,
+		EtcdRetainDays:      cfg.RetainDays,
+		EtcdGCSchedule:      cfg.GCSchedule,
 		EtcdBackupTimeZone:  cfg.TimeZone,
 		ObserveInterval:     cfg.ObserveInterval,
 		Recorder:            mgr.GetEventRecorderFor("backupconfig-controller"),

@@ -72,6 +72,10 @@ spec:
         # disabled (event-driven only). K8s deploy enables it explicitly.
         - name: ETCD_BACKUP_RETAIN_PER_DAY
           value: "5"
+        - name: ETCD_BACKUP_RETAIN_DAYS
+          value: "15"
+        - name: ETCD_GC_SCHEDULE
+          value: "0 2 * * *"
         - name: ETCD_BACKUP_TIMEZONE
           value: "America/Los_Angeles"
         # Observe switch + cadence — ONE knob (mirrors serverconfig's

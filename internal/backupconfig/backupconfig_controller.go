@@ -86,10 +86,19 @@ type BackupConfigReconciler struct {
 	// controller only references it.
 	CredentialSecret string
 
-	// EtcdRetainPerDay is how many snapshots to keep per UTC day per cluster.
-	// The prune step in snapshotWriterScript deletes older snapshots beyond
-	// this count. Zero means no pruning.
+	// EtcdRetainPerDay is how many snapshots to keep per UTC day. The per-day
+	// prune in snapshotWriterScript trims older snapshots inline after each
+	// upload. Zero means no per-day pruning.
 	EtcdRetainPerDay int
+
+	// EtcdRetainDays is how many days of snapshot history to keep. The GC
+	// CronJob (snapshotGCScript) drops entire days older than this. Zero means
+	// keep forever.
+	EtcdRetainDays int
+
+	// EtcdGCSchedule is the cron expression for the etcd GC CronJob (e.g.
+	// "0 2 * * *" for nightly at 02:00).
+	EtcdGCSchedule string
 
 	// EtcdBackupTimeZone is the IANA timezone for the etcd CronJob schedule
 	// (e.g. "America/Los_Angeles"). Empty string uses the cluster default (UTC).

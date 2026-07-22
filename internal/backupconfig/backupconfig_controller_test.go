@@ -751,7 +751,7 @@ func TestBuildEtcdCronJob_PruneAndConcurrency(t *testing.T) {
 	writer := cj.Spec.JobTemplate.Spec.Template.Spec.Containers[0]
 	script := writer.Command[2]
 	if !strings.Contains(script, "storage blob delete") {
-		t.Error("writer script missing prune (blob delete) logic")
+		t.Error("writer script missing per-day prune (blob delete) logic")
 	}
 	if !strings.Contains(script, "$BLOB_PREFIX") {
 		t.Error("prune must be scoped to $BLOB_PREFIX (this cluster's folder only)")
@@ -759,7 +759,65 @@ func TestBuildEtcdCronJob_PruneAndConcurrency(t *testing.T) {
 	if strings.Contains(script, "houston-stage") || strings.Contains(script, "g2-w2") {
 		t.Error("script must not hardcode galleon/cluster names")
 	}
+	if strings.Contains(script, "RETAIN_DAYS") {
+		t.Error("snapshot writer must not reference RETAIN_DAYS — day-level GC belongs in the etcd-gc CronJob")
+	}
 	if got := envValue(writer.Env, "RETAIN_PER_DAY"); got != "5" {
 		t.Errorf("RETAIN_PER_DAY env = %q, want 5", got)
+	}
+	if got := envValue(writer.Env, "RETAIN_DAYS"); got != "" {
+		t.Errorf("RETAIN_DAYS env = %q in snapshot writer, want empty (belongs to GC CronJob)", got)
+	}
+}
+
+func TestBuildEtcdGCCronJob(t *testing.T) {
+	enabled := true
+	gcSchedule := "0 2 * * *"
+	p := etcdGCCronJobParams{
+		Name:             "colo-dev-main-backup-etcd-gc",
+		Namespace:        "kube-system",
+		StorageAccount:   "stgalbackupsdevccwus01",
+		StorageContainer: "etcd",
+		BlobPrefix:       "colo/dev-main",
+		UploadImage:      "azure-cli:2.67.0",
+		CredentialSecret: "az-storage-creds",
+		RetainDays:       15,
+		GCSchedule:       gcSchedule,
+		TimeZone:         "America/Los_Angeles",
+		Block:            &armadav1.EtcdBackupSpec{Enabled: &enabled},
+	}
+	cj := buildEtcdGCCronJob(p)
+
+	if cj.Spec.Schedule != "0 2 * * *" {
+		t.Errorf("Schedule = %q, want 0 2 * * *", cj.Spec.Schedule)
+	}
+	if cj.Spec.ConcurrencyPolicy != batchv1.ForbidConcurrent {
+		t.Errorf("ConcurrencyPolicy = %q, want Forbid", cj.Spec.ConcurrencyPolicy)
+	}
+	if cj.Spec.TimeZone == nil || *cj.Spec.TimeZone != "America/Los_Angeles" {
+		t.Errorf("TimeZone = %v, want America/Los_Angeles", cj.Spec.TimeZone)
+	}
+	if len(cj.Spec.JobTemplate.Spec.Template.Spec.InitContainers) != 0 {
+		t.Error("GC CronJob must have no init containers (no etcd access needed)")
+	}
+	if cj.Spec.JobTemplate.Spec.Template.Spec.HostNetwork {
+		t.Error("GC CronJob must not use hostNetwork (only talks to Azure Blob)")
+	}
+	gc := cj.Spec.JobTemplate.Spec.Template.Spec.Containers[0]
+	script := gc.Command[2]
+	if !strings.Contains(script, "RETAIN_DAYS") {
+		t.Error("GC script must use RETAIN_DAYS for day-level cutoff")
+	}
+	if strings.Contains(script, "RETAIN_PER_DAY") {
+		t.Error("GC script must not reference RETAIN_PER_DAY — per-day prune belongs in the snapshot CronJob")
+	}
+	if !strings.Contains(script, "$BLOB_PREFIX") {
+		t.Error("GC script must scope deletes to $BLOB_PREFIX")
+	}
+	if got := envValue(gc.Env, "RETAIN_DAYS"); got != "15" {
+		t.Errorf("RETAIN_DAYS env = %q, want 15", got)
+	}
+	if got := envValue(gc.Env, "RETAIN_PER_DAY"); got != "" {
+		t.Errorf("RETAIN_PER_DAY env = %q in GC CronJob, want empty (belongs to snapshot CronJob)", got)
 	}
 }
